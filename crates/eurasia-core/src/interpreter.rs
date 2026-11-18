@@ -1059,10 +1059,20 @@ impl Vm {
                 Ok(None)
             }
             Outcome::FinishTurn(wakeup) => {
-                // The turn's frames unwind; the event loop takes over.
-                let frames = core::mem::take(&mut self.frames);
-                for f in &frames {
-                    self.retire(f);
+                // The turn's frames leave the stack; the event loop takes
+                // over. If something holds an activation of the turn (a
+                // debugger's broken thread, from the handler of last resort),
+                // the frames become a stack image of detached activations,
+                // as psoup's heap activations outlive their turn (decided
+                // 2026-11-18: the actor carries on; M6 design section 9).
+                // Otherwise they die.
+                if self.frames.iter().any(|f| f.activation.is_some()) {
+                    self.detach_all_frames();
+                } else {
+                    let frames = core::mem::take(&mut self.frames);
+                    for f in &frames {
+                        self.retire(f);
+                    }
                 }
                 self.stack.clear();
                 self.finished_turn = Some(wakeup);
@@ -1509,15 +1519,30 @@ impl Vm {
         Ok(())
     }
 
+    /// Takes every frame off the stack, each becoming a detached activation
+    /// (see [`Vm::detach_frames_above`]); the bottom one has no sender.
+    fn detach_all_frames(&mut self) {
+        if self.frames.is_empty() {
+            return;
+        }
+        let nil = self.nil();
+        self.detach_frames_from(0, nil);
+    }
+
     /// Takes the frames above frame `k` off the stack, each becoming a
     /// detached activation (its handle made if it had none) with its temps
     /// and operands, its bci and its sender's handle.
     fn detach_frames_above(&mut self, k: usize) {
-        for i in k..self.frames.len() {
+        let below = self.ensure_activation(k);
+        self.detach_frames_from(k + 1, below);
+    }
+
+    /// Detaches frames `from` and up, the lowest one's sender `below`.
+    fn detach_frames_from(&mut self, from: usize, below: Value) {
+        for i in from..self.frames.len() {
             self.ensure_activation(i);
         }
-        let below = self.frames[k].activation.expect("made above");
-        let popped = self.frames.split_off(k + 1);
+        let popped = self.frames.split_off(from);
         let tops: Vec<usize> = popped
             .iter()
             .skip(1)
