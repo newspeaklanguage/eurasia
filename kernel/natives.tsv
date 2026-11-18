@@ -187,3 +187,21 @@ VMMirror	instance	subclassesOf:	VmSubclassesOf	160
 VMMirror	instance	programVersion	VmProgramVersion	161
 EurasiaMirrors	instance	subclassesOf:	VmSubclassesOf	160
 EurasiaMirrors	instance	commit:	VmCommit	158
+# Activations and the Simulator (M6 step 4).
+Activation	instance	method:	ActivationMethodPut	163
+Activation	instance	closure:	ActivationClosurePut	164
+Activation	instance	receiver:	ActivationReceiverPut	165
+Activation	instance	bci:	ActivationBciPut	166
+Activation	instance	size:	ActivationSizePut	167
+Activation	class	new	ActivationNew	162
+VMMirror	instance	markSimulationRoot:	VmMarkSimulationRoot	168
+VMMirror	instance	isSimulationRoot:	VmIsSimulationRoot	169
+VMMirror	instance	continueAt:with:	VmContinueAt	170
+VMMirror	instance	resumeActivation:	VmResumeActivation	171
+VMMirror	instance	runNative:receiver:arguments:	VmRunNative	172
+EurasiaMirrors	instance	currentMessageLoop	VmCurrentMessageLoop	131
+EurasiaMirrors	instance	isSimulationRoot:	VmIsSimulationRoot	169
+EurasiaMirrors	instance	markSimulationRoot:	VmMarkSimulationRoot	168
+EurasiaMirrors	instance	runNative:receiver:arguments:	VmRunNative	172
+Thread	instance	jumpTo:	VmResumeActivation	171
+Simulator	instance	newClosureIn:initialBCI:numArgs:numCopied:	ClosureIn	173

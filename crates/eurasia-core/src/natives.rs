@@ -186,7 +186,7 @@ natives! {
     AlienApply = 146 / 1: "`Alien>>callWithArguments:`: the alien is a function; `this(...)`.",
     AlienNew = 147 / 1: "`Alien>>newWithArguments:`: `new this(...)`.",
     AlienInstanceOf = 148 / 1: "`Alien>>isInstanceOf:` (psoup's `instanceOf:`): `this instanceof constructor`.",
-    MethodHeader = 149 / 0: "`Method>>header`: psoup's header word: access << 28, primitive << 16, temps << 8, arguments; primitive 256 + i is a getter of the mixin's slot i, 512 + i its setter, 1024 answers the receiver, any other nonzero one a Eurasia native.",
+    MethodHeader = 149 / 0: "`Method>>header`: psoup's header word: access << 28, primitive << 16, temps << 8, arguments; primitive 256 + i is a getter of the mixin's slot i, 512 + i its setter, 1023 answers the receiver, any other nonzero one a Eurasia native.",
     MethodHeaderPut = 150 / 1: "`Method>>header:` on an unfrozen method: sets its kind, access, argument and local counts from psoup's header word (see `Method>>header`).",
     MethodBytecode = 151 / 0: "`Method>>bytecode`: a copy of its V5 bytecode, a ByteArray.",
     MethodBytecodePut = 152 / 1: "`Method>>bytecode:` on an unfrozen method: a ByteArray of well-formed V5 instructions.",
@@ -199,6 +199,18 @@ natives! {
     VmMixinApplicationsOf = 159 / 1: "`vm mixinApplicationsOf: m`: an Array of the live classes whose mixin is `m`, cohort-wide, in allocation order (after a full collection).",
     VmSubclassesOf = 160 / 1: "`vm subclassesOf: c`: an Array of the live classes whose superclass is `c`, cohort-wide, in allocation order (after a full collection).",
     VmProgramVersion = 161 / 0: "`vm programVersion`: the number of commits so far.",
+    ActivationNew = 162 / 0: "`Activation class>>new`: a detached activation (M6 design 4.4), with nil method, receiver, closure, sender and bci, and no temps.",
+    ActivationMethodPut = 163 / 1: "`Activation>>method:`, on a detached activation.",
+    ActivationClosurePut = 164 / 1: "`Activation>>closure:`, on a detached activation.",
+    ActivationReceiverPut = 165 / 1: "`Activation>>receiver:`, on a detached activation.",
+    ActivationBciPut = 166 / 1: "`Activation>>bci:`, on a detached activation.",
+    ActivationSizePut = 167 / 1: "`Activation>>size:`, on a detached activation: new temps are nil.",
+    VmMarkSimulationRoot = 168 / 1: "`vm markSimulationRoot: method`: marks a simulation root (psoup's primitive 142): a non-local return stops at it.",
+    VmIsSimulationRoot = 169 / 1: "`vm isSimulationRoot: method`.",
+    VmContinueAt = 170 / 2: "`vm continueAt: a with: v`: discards the frames above the live activation `a`, whose pending send answers `v` (psoup's jump to a live activation).",
+    VmResumeActivation = 171 / 1: "`vm resumeActivation: top`: turns the chain of detached activations from `top` down to the sender, which must be the current frame, into frames, and continues at `top` (psoup's jump to a simulated activation). The handles keep their identity and become live.",
+    VmRunNative = 172 / 3: "`vm runNative: method receiver: r arguments: args`, for the Simulator: runs a native or accessor method and answers {0. result}, {1. the failure to signal}, {2. receiver. selector. arguments} (a send to make instead) or {3. closure. arguments} (a closure to activate).",
+    ClosureIn = 173 / 4: "`newClosureIn: activation initialBCI: bci numArgs: n numCopied: c`, for the Simulator (psoup's primitive 69): a closure defined by the activation, its body at bytecode position `bci` (from 1), with `c` copied values, nil until set.",
     VmSpawn = 139 / 1: "`vm spawn: mixin`: a new actor running a clone of the platform template, with the mixin applied to Object (role 37) in its heap, enclosing object nil; answers a far reference to the new class (`actor-semantics.tex`, eq. `create-actor`).",
     VmPromiseSend = 138 / 2: "`vm promise: record send: {selector. resultRecord. arguments...}`: an eventual send to the promise (Route-Pending): queued in the record, at the end of its chain, until it settles; delivered at once if it has.",
     VmIsValue = 125 / 1: "`vm isValue:`: whether the object is a value (immediates, nil, booleans, strings, numbers, instances of value classes, classes with a value enclosing object).",
@@ -375,7 +387,7 @@ fn host_call(
 /// A method's header as psoup's header word: access << 28, primitive << 16,
 /// temps (arguments and locals) << 8, arguments. The primitive encodes the
 /// kind: 0 ordinary, 256 + i a getter and 512 + i a setter of the method's
-/// own mixin's slot i, 1024 answers the receiver, anything else a native.
+/// own mixin's slot i, 1023 answers the receiver, anything else a native.
 pub fn psoup_header(h: &MethodHeader) -> i64 {
     let access = match h.access {
         Access::Public => 0,
@@ -387,7 +399,7 @@ pub fn psoup_header(h: &MethodHeader) -> i64 {
         MethodKind::Native => i64::from(h.native),
         MethodKind::Getter => 256 + i64::from(h.slot),
         MethodKind::Setter => 512 + i64::from(h.slot),
-        MethodKind::ReturnSelf => 1024,
+        MethodKind::ReturnSelf => 1023,
     };
     let temps = i64::from(h.arg_count + h.local_count);
     (access << 28) | (primitive << 16) | (temps << 8) | i64::from(h.arg_count)
@@ -429,11 +441,11 @@ pub fn header_from_psoup(word: i64) -> Option<MethodHeader> {
             header.kind = MethodKind::Getter;
             header.slot = primitive - 256;
         }
-        512..=1023 if arg_count == 1 => {
+        512..=1022 if arg_count == 1 => {
             header.kind = MethodKind::Setter;
             header.slot = primitive - 512;
         }
-        1024 => header.kind = MethodKind::ReturnSelf,
+        1023 => header.kind = MethodKind::ReturnSelf,
         n => {
             let native = Native::from_id(n)?;
             if native.arity() != arg_count as usize {
@@ -665,6 +677,25 @@ pub enum Outcome {
     },
     /// `vm programVersion`.
     ProgramVersion,
+    /// `vm continueAt:with:`: the interpreter cuts back to the activation.
+    ContinueAt {
+        /// A live activation.
+        activation: Value,
+        /// What its pending send answers.
+        value: Value,
+    },
+    /// `vm resumeActivation:`: the interpreter makes frames of a detached
+    /// chain.
+    ResumeActivation(Value),
+    /// `vm runNative:receiver:arguments:`: the interpreter runs the method.
+    RunNative {
+        /// A native or accessor method.
+        method: Value,
+        /// The receiver.
+        receiver: Value,
+        /// An Array of the arguments.
+        arguments: Value,
+    },
     /// `vm resolvePromise:with:` and `vm breakPromise:with:`: the
     /// interpreter settles the record and notifies its waiters.
     Settle {
@@ -1766,12 +1797,86 @@ pub fn invoke(
         | Native::ActivationTempAt
         | Native::ActivationTempAtPut
         | Native::ActivationSize
-        | Native::ActivationBci => Outcome::Frame(native),
+        | Native::ActivationBci
+        | Native::ActivationMethodPut
+        | Native::ActivationClosurePut
+        | Native::ActivationReceiverPut
+        | Native::ActivationBciPut
+        | Native::ActivationSizePut => Outcome::Frame(native),
+        Native::ActivationNew => {
+            let class = ctx.roles.get(Role::ActivationClass);
+            let nil = ctx.nil();
+            let space = ctx.space;
+            Outcome::Answer(ctx.heap.allocate(
+                class,
+                space,
+                Body::Activation(crate::object::Activation {
+                    frame: None,
+                    method: nil,
+                    receiver: nil,
+                    closure: nil,
+                    detached: Some(crate::object::Detached {
+                        sender: nil,
+                        bci: nil,
+                        temps: Vec::new(),
+                    }),
+                }),
+            ))
+        }
+        Native::VmMarkSimulationRoot => match ctx.heap.get_mut(arg(0)) {
+            Some(o) if matches!(o.body, Body::Method(_)) => {
+                o.header.flags |= crate::object::SIMULATION_ROOT;
+                Outcome::Answer(arg(0))
+            }
+            _ => Outcome::Fail(Reason::WrongKind(1)),
+        },
+        Native::VmIsSimulationRoot => Outcome::Answer(
+            ctx.boolean(
+                ctx.heap
+                    .get(arg(0))
+                    .is_some_and(|o| o.header.flags & crate::object::SIMULATION_ROOT != 0),
+            ),
+        ),
+        Native::VmContinueAt => Outcome::ContinueAt {
+            activation: arg(0),
+            value: arg(1),
+        },
+        Native::VmResumeActivation => Outcome::ResumeActivation(arg(0)),
+        Native::VmRunNative => Outcome::RunNative {
+            method: arg(0),
+            receiver: arg(1),
+            arguments: arg(2),
+        },
         Native::DefiningActivationOf => match ctx.heap.closure(arg(0)) {
             Some(c) => Outcome::Answer(c.defining),
             None => Outcome::Fail(Reason::WrongKind(1)),
         },
         Native::VmAllInstancesOf => Outcome::AllInstances(arg(0)),
+        Native::ClosureIn => {
+            if ctx.heap.activation(arg(0)).is_none() {
+                return Outcome::Fail(Reason::WrongKind(1));
+            }
+            let (Some(bci), Some(n), Some(c)) = (
+                small_index(arg(1)).filter(|&b| b >= 1),
+                small_index(arg(2)).filter(|&n| (0..=15).contains(&n)),
+                small_index(arg(3)).filter(|&c| (0..=15).contains(&c)),
+            ) else {
+                return Outcome::Fail(Reason::OutOfRange(2));
+            };
+            let class = ctx.roles.get(Role::ClosureClass);
+            let nil = ctx.nil();
+            let space = ctx.space;
+            Outcome::Answer(ctx.heap.allocate(
+                class,
+                space,
+                Body::Closure(crate::object::Closure {
+                    defining: arg(0),
+                    initial_ip: (bci - 1) as u32,
+                    num_args: n as u32,
+                    copied: alloc::vec![nil; c as usize],
+                }),
+            ))
+        }
         Native::VmCommit => Outcome::Commit(arg(0)),
         Native::VmProgramVersion => Outcome::ProgramVersion,
         Native::VmMixinApplicationsOf => Outcome::ClassQuery {

@@ -37,8 +37,12 @@ pub const VALUE_CLASS: u8 = 4;
 /// Object flag: shared by every actor of the cohort, though mutable (the
 /// kernel module and the VM mirror). Cloning a platform does not copy it.
 pub const SHARED: u8 = 8;
+/// On a method: a simulation root (psoup's primitive 142). A non-local
+/// return stops at it, and an exception in a simulated thread is routed to
+/// it (M6 design 4.4).
+pub const SIMULATION_ROOT: u8 = 16;
 /// Every defined flag (snapshot format, section 5).
-pub const FLAGS: u8 = FROZEN | VALUE | VALUE_CLASS | SHARED;
+pub const FLAGS: u8 = FROZEN | VALUE | VALUE_CLASS | SHARED | SIMULATION_ROOT;
 
 /// The fields every object has.
 #[derive(Clone, Debug)]
@@ -168,7 +172,10 @@ pub struct Closure {
 
 /// An activation handle (hidden layout). A frame's handle is created when
 /// something needs it (a closure, reflection, a VM upcall) and is marked dead
-/// when the frame returns or is unwound.
+/// when the frame returns or is unwound. A *detached* activation (M6 design
+/// 4.4) holds its own state instead of naming a frame: the debugger's
+/// Simulator makes and runs them (`Activation new`), and
+/// `vm resumeActivation:` turns a chain of them into frames.
 #[derive(Clone, Debug)]
 pub struct Activation {
     /// The live frame's serial number, or `None` once the frame is gone.
@@ -179,6 +186,19 @@ pub struct Activation {
     pub receiver: Value,
     /// For a closure frame, the closure; nil for a method frame.
     pub closure: Value,
+    /// A detached activation's own state; `None` for a frame's handle.
+    pub detached: Option<Detached>,
+}
+
+/// The state of a detached activation, as psoup's heap activations hold it.
+#[derive(Clone, Debug)]
+pub struct Detached {
+    /// The sender (an activation) or nil.
+    pub sender: Value,
+    /// The bytecode position of the next instruction, from 1, or nil.
+    pub bci: Value,
+    /// Its temps: the arguments, then the locals, then the operand stack.
+    pub temps: Vec<Value>,
 }
 
 /// A promise record (hidden layout; `actor-semantics.tex`, the table Π): the

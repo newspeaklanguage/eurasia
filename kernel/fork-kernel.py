@@ -65,7 +65,7 @@ def main():
 
     # 4. Marker primitives become method identity.
     t = replace(t, "^113 = method primitive", "^ensureMethod == method")
-    t = replace(t, "activation method primitive = 142 ifTrue:", "simulationRootMethod == activation method ifTrue:")
+    t = replace(t, "activation method primitive = 142 ifTrue:", "(vm isSimulationRoot: activation method) ifTrue:")
     t = replace(t, "activation method primitive = 168 ifTrue:", "dispatchMethod == activation method ifTrue:")
     t = replace(t, "activation method primitive = 116 ifTrue:", "onDoMethod == activation method ifTrue:")
 
@@ -225,6 +225,16 @@ def main():
 		)
 		public hostGlobal = (
 		)
+		public markSimulationRoot: method = (
+		)
+		public isSimulationRoot: method = (
+		)
+		public continueAt: activation with: value = (
+		)
+		public resumeActivation: top = (
+		)
+		public runNative: method receiver: receiver arguments: arguments = (
+		)
 		public commit: changeSet = (
 		)
 		public mixinApplicationsOf: mixin = (
@@ -316,7 +326,7 @@ def main():
 		|
 	) (
 		public header ^<Integer> = (
-			(* Eurasia keeps method headers in the VM; a native (MethodHeader) answers psoup's header word: access << 28, primitive << 16, temps << 8, arguments. Primitive 256 + i is a getter of the mixin's own slot i, 512 + i its setter, 1024 answers the receiver, any other nonzero one is a Eurasia native. *)
+			(* Eurasia keeps method headers in the VM; a native (MethodHeader) answers psoup's header word: access << 28, primitive << 16, temps << 8, arguments. Primitive 256 + i is a getter of the mixin's own slot i, 512 + i its setter, 1023 answers the receiver, any other nonzero one is a Eurasia native. *)
 
 			halt
 		)
@@ -354,7 +364,10 @@ def main():
 			^nil = _library ifTrue: [ nil ] ifFalse: [ _library at: 1 ]
 		)
 		public _instanceMixin: m <InstanceMixin> = (
-			_library: {m. }
+			(* Eurasia: the class-side mixin's name is a contract field; psoup derives it, as 'X class'. *)
+
+			_library: {m. }.
+			(nil = _name and: [ nil = m _name ]) ifFalse: [ _name: m _name , ' class' ]
 		)""")
     t = replace(t, """			public _slots <Array[{Symbol. Boolean. Symbol}]>
 			public _nestedMixins <Array[InstanceMixin]>
@@ -565,6 +578,12 @@ def main():
 		)
 		public ensure: onUnwind <[]> = (
 """)
+
+    # 18. Returning to a simulation root (M6 design 4.4): psoup pushes the
+    #     exception on the root and jumps to it; Eurasia's root is a live
+    #     frame, whose pending send answers the exception.
+    t = replace(t, """			simulationRoot push: self.
+			jumpTo: simulationRoot""", """			vm continueAt: simulationRoot with: self""")
 
     # 15. Far references (role 35): opaque VM objects (Φ). An ordinary send
     #     to one fails as an immediate send to psoup's eventual refs does.

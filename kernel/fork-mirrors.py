@@ -18,10 +18,14 @@ psoup's mixin fields (kernel/fork-kernel.py), so the changes are few:
 - an instance's size is the slots its class's mixins declare;
 - the compiler is the V5 one (Newspeak2V5BytecodeCompilation over
   NewspeakBytecodeCompilation, which the namespace provides composed);
-- the primitives become natives, by the natives table.
+- the primitives become natives, by the natives table;
+- installing is vm commit:, with layout maps;
+- the V4 Simulator becomes the V5 one: V5BytecodeSimulation's decoder and
+  upstream's Simulator (rmacnak/primordialsoup Mirrors.ns at 338f0bb3).
 
 Every edit is checked: the script fails if psoup's source has changed under
-it. Usage: fork-mirrors.py <MirrorsForPrimordialSoup.ns> <output>.
+it. Usage: fork-mirrors.py <MirrorsForPrimordialSoup.ns>
+<V5BytecodeSimulation.ns> <upstream-V5Simulator-338f0bb3.ns.txt> <output>.
 """
 
 import re
@@ -41,7 +45,7 @@ def replace(text, old, new, count=1):
 
 
 def main():
-    source, output = sys.argv[1], sys.argv[2]
+    source, v5_source, upstream_source, output = sys.argv[1:5]
     t = open(source).read()
 
     # 1. The module's name.
@@ -214,6 +218,171 @@ def main():
 
 		halt
 	)""")
+
+    # 5. The V5 Simulator (M6 design 4.2, decision 7.2): the decoder is
+    #    V5BytecodeSimulation's InstructionStream (upstream's, with the
+    #    short popJumpFalse: fixed); the Simulator is upstream's
+    #    (rmacnak/primordialsoup Mirrors.ns at 338f0bb3, kept as
+    #    newspeak/upstream-V5Simulator-338f0bb3.ns.txt), adapted to Eurasia's
+    #    natives and markers. It replaces psoup's V4 Simulator.
+    v5 = open(v5_source).read()
+    instruction_stream = v5[v5.index("\tpublic class InstructionStream new = ("):v5.index("\tpublic class SelectorCollector overBytecode: b literals: l = InstructionStream new (")]
+    selector_collector = v5[v5.index("\tpublic class SelectorCollector overBytecode: b literals: l = InstructionStream new ("):]
+    selector_collector = selector_collector[:selector_collector.index("\n\t) : ()\n") + len("\n\t) : ()\n")]
+    instruction_stream = instruction_stream.replace("\tpublic class InstructionStream new = (", "\tprivate class InstructionStream new = (", 1)
+    selector_collector = selector_collector.replace("\tpublic class SelectorCollector", "\tprivate class SelectorCollector", 1)
+    up = open(upstream_source).read()
+    simulator = up[up.index("private class Simulator = InstructionStream ("):up.index("private class SlotDeclarationMirror")]
+    simulator = replace(simulator, "private class Simulator = InstructionStream (", "private class Simulator new = InstructionStream new (")
+    simulator = simulator.replace("panic", "halt")
+    simulator = replace(simulator, "(tryPrimitive: newMethod primitive receiver: newReceiver arguments: arguments)",
+                        "(tryPrimitive: newMethod receiver: newReceiver arguments: arguments)")
+    simulator = replace(simulator, "	loop:: internalKernel messageLoop.", "	loop:: currentMessageLoop.")
+    simulator = replace(simulator, "		unwind method primitive = 162 ifTrue:", "		(isEnsureMethod: unwind method) ifTrue:")
+    simulator = replace(simulator, "		unwind method primitive = 163 ifTrue:", "		(isSimulationBoundary: unwind method) ifTrue:")
+    simulator = replace(simulator, "	error: 'Recursive doesNotUnderstand:'", "	Error signal: 'Recursive doesNotUnderstand:'")
+    start = simulator.index("tryPrimitive: primitive receiver: newReceiver arguments: arguments = (")
+    end = simulator.index(") : (\n", start)
+    simulator = simulator[:start] + """tryPrimitive: newMethod receiver: newReceiver arguments: arguments = (
+	(* Eurasia: a method whose header names no primitive runs as bytecode. A few natives are simulated, as upstream simulates its primitives: the current activation (native 100), jumps (170, 171), closure activation (30-34) and perform (89, 119). Any other native or accessor runs in the VM (vm runNative:receiver:arguments:): its result is pushed; its failure is signalled, as the VM signals it; a tail send or closure activation it asks for is simulated. *)
+	| primitive result |
+	primitive:: newMethod primitive.
+	0 = primitive ifTrue: [^false].
+	100 = primitive ifTrue: [activation push: activation. ^true].
+	(* Jumps: continuing at an activation (vm continueAt:with:, 170) or resuming a chain (vm resumeActivation:, 171) switches the simulated activation, as upstream's jump (165). *)
+	170 = primitive ifTrue:
+		[(arguments at: 1) push: (arguments at: 2).
+		 activation:: arguments at: 1.
+		 ^true].
+	171 = primitive ifTrue: [activation:: arguments at: 1. ^true].
+	(30 <= primitive and: [primitive <= 33]) ifTrue:
+		[newReceiver numArgs = arguments size ifFalse: [^false].
+		 activateClosure: newReceiver arguments: arguments.
+		 ^true].
+	34 = primitive ifTrue:
+		[ | closureArgs = arguments at: 1. |
+		 Array = (classOf: closureArgs) ifFalse: [^false].
+		 closureArgs size = newReceiver numArgs ifFalse: [^false].
+		 activateClosure: newReceiver arguments: closureArgs.
+		 ^true].
+	89 = primitive ifTrue:
+		[ | selector = arguments at: 1. performArguments = arguments at: 2. |
+		 (String = (classOf: selector)) ifFalse: [^false].
+		 (Array = (classOf: performArguments)) ifFalse: [^false].
+		 activation push: newReceiver.
+		 performArguments do: [:arg | activation push: arg].
+		 ordinarySend: selector numArgs: performArguments size.
+		 ^true].
+	119 = primitive ifTrue:
+		[ | object = arguments at: 1. selector = arguments at: 2. performArguments = arguments at: 3. |
+		 (String = (classOf: selector)) ifFalse: [^false].
+		 (Array = (classOf: performArguments)) ifFalse: [^false].
+		 activation push: object.
+		 performArguments do: [:arg | activation push: arg].
+		 ordinarySend: selector numArgs: performArguments size.
+		 ^true].
+	result:: runNative: newMethod receiver: newReceiver arguments: arguments.
+	0 = (result at: 1) ifTrue: [activation push: (result at: 2). ^true].
+	1 = (result at: 1) ifTrue:
+		[activation push: (result at: 2).
+		 ordinarySend: #signal numArgs: 0.
+		 ^true].
+	2 = (result at: 1) ifTrue:
+		[activation push: (result at: 2).
+		 (result at: 4) do: [:arg | activation push: arg].
+		 ordinarySend: (result at: 3) numArgs: (result at: 4) size.
+		 ^true].
+	activateClosure: (result at: 2) arguments: (result at: 3).
+	^true
+)
+""" + simulator[end:]
+    # V5 instruction sizes on the class side, as the VM decodes them.
+    simulator = replace(simulator, """sizeOf: bytecode = (
+	bytecode <= 215 ifTrue: [^1].
+	bytecode <= 237 ifTrue: [^2].
+	bytecode <= 253 ifTrue: [^3].
+	^4
+)""", """sizeOf: bytecode = (
+	bytecode <= 215 ifTrue: [^1].
+	bytecode <= 237 ifTrue: [^2].
+	bytecode <= 253 ifTrue: [^3].
+	^4
+)""")
+    start = t.index("\tprivate class Simulator new = (")
+    end = t.index("\tprivate class SlotDeclarationMirror")
+    t = t[:start] + instruction_stream + selector_collector + "\t" + simulator.rstrip() + "\n" + t[end:]
+
+    # The V4 selector scan of a method becomes the V5 one.
+    start = t.index("\t\tpublic selectors ^<List[Symbol]> = (\n\t\t\t| pc ::= 1. extA ::= 0.")
+    end = t.index("\t\tpublic source ^<String> = (", start)
+    t = t[:start] + """		public selectors ^<List[Symbol]> = (
+			(* Eurasia: the V5 instruction set, by V5BytecodeSimulation's SelectorCollector. *)
+
+			^(SelectorCollector overBytecode: method bytecode literals: method literals) selectors
+		)
+""" + t[end:]
+
+    # 6. Threads: simulation roots are marked methods (psoup's primitive
+    #    142); the bottom of a turn has no sender on Eurasia; resuming makes
+    #    frames of the suspended chain (vm resumeActivation:).
+    t = replace(t, """			nil = activation sender ifTrue: [ ^true ].
+			142 = activation sender method primitive ifTrue: [ ^true ].
+			^168 = activation sender method primitive""", """			nil = activation sender ifTrue: [ ^true ].
+			^isSimulationRoot: activation sender method""")
+    t = replace(t, """			nil = suspendedActivation ifTrue: [ ^Error signal: 'Nothing to resume' ].
+			^resumeImpl""", """			nil = suspendedActivation ifTrue: [ ^Error signal: 'Nothing to resume' ].
+			markSimulationRoots.
+			^resumeImpl""")
+    t = replace(t, """		private simulatorRootMethod = (
+			| methods = methodsOf: self class. |""", """		private markSimulationRoots = (
+			(* Eurasia: resumeImpl and simulatorRoot are simulation roots (psoup marks them with primitive 142): a non-local return stops at them, and the kernel routes a simulated thread's exceptions to them. *)
+
+			(methodsOf: (classOf: self)) do: [:m |
+					(#resumeImpl = m selector or: [ #simulatorRoot = m selector ]) ifTrue: [
+							markSimulationRoot: m
+						]
+				]
+		)
+		private simulatorRootMethod = (
+			| methods = methodsOf: (classOf: self). |
+			markSimulationRoots.""")
+
+    t = replace(t, "			rawSender method primitive = 142 ifTrue: [ ^nil ].",
+                "			(isSimulationRoot: rawSender method) ifTrue: [ ^nil ].")
+
+    # 7. The module-level natives and helpers these use.
+    t = replace(t, """	private commit: changeSet = (""", """	private currentMessageLoop = (
+		(* Eurasia: a native (VmCurrentMessageLoop). *)
+
+		halt
+	)
+	private isEnsureMethod: m = (
+		(* Eurasia: whether m is the kernel's Closure>>ensure: (psoup's primitive 162). *)
+
+		^#ensure: = m selector and: [ (mixinOf: Closure) = m mixin ]
+	)
+	private isSimulationBoundary: m = (
+		(* Eurasia: a simulation root, or the callback boundary (psoup's primitive 163), which a non-local return may not cross. *)
+
+		(isSimulationRoot: m) ifTrue: [ ^true ].
+		^#dispatchCallbackWith: = m selector and: [ (mixinOf: Closure) = m mixin ]
+	)
+	private isSimulationRoot: m = (
+		(* Eurasia: a native (VmIsSimulationRoot). *)
+
+		halt
+	)
+	private markSimulationRoot: m = (
+		(* Eurasia: a native (VmMarkSimulationRoot). *)
+
+		halt
+	)
+	private runNative: method receiver: receiver arguments: arguments = (
+		(* Eurasia: a native (VmRunNative). *)
+
+		halt
+	)
+	private commit: changeSet = (""")
 
     open(output, "w").write(t)
     print(f"fork-mirrors: wrote {output}")

@@ -8,7 +8,8 @@ else is a bug.
 ## Per-test differences
 
 `scripts/kernel-tests.sh` runs psoup's `KernelTests`, `AccessModifierTesting`,
-`KernelWeakTests` and `ActorsTesting` on both VMs, asynchronously as psoup's
+`KernelWeakTests`, `ActorsTesting`, `MirrorTesting`, `MirrorBuilderTesting` and
+`ActivationMirrorTesting` on both VMs, asynchronously as psoup's
 `TestRunner` does, and compares each test's outcome
 (success, failure or error). A test whose outcome may differ is listed here
 as a line `- `Context>>selector`: reason`; the script fails on any other
@@ -16,16 +17,11 @@ difference, and also reports listed tests that agree again.
 
 - `TwoActorTests>>testPipelining`: the test sends its `Promise` (the actors module's `PromiseFactories` instance) to another actor, which immediate-sends `when:fulfilled:` to it. psoup's library treats `Promise` as a value object, so it crosses as itself; on Eurasia every actor has its own platform, `Promise` is a mutable object of the sender's, and it crosses as a far reference, which refuses the immediate send. Decided 2026-11-18 (`newspeak/EURASIA_ACTORS_DESIGN_2026-11-17.md` section 8); platform correspondence (an object of the platform template crossing as the receiver's clone of it) would remove it.
 
-- `ObjectMirrorTests>>testObjectMirrorEvaluate`: until M6 step 4. `ObjectMirror>>evaluate:` runs the expression in the mirrors' Simulator, which needs psoup's activation factory (`Activation class>>sender:…`) and, on Eurasia, the V5 Simulator (`newspeak/EURASIA_M6_REFLECTION_DESIGN_2026-11-18.md`).
-- `ObjectMirrorTests>>testObjectMirrorEvaluateEmpty`: the same.
-- `ObjectMirrorTests>>testObjectMirrorEvaluateWithScope`: the same.
-- `ClassDeclarationBuilderTests>>testEvaluateEmptyString`: the same (MirrorBuilderTesting).
-- `ClassDeclarationBuilderTests>>testEvaluateWithScope`: the same.
-- `ClassDeclarationBuilderTests>>testIncrementalScopeBuilding`: the same (it evaluates in each scope it builds).
-
-The other 541 tests have the same outcome on both VMs (2026-11-18), including
-the 48 others of psoup's `MirrorTesting` and the 51 others of
-`MirrorBuilderTesting`, also under GC stress (`GC_STRESS=50`). Of the 444 outside `MirrorTesting`, 428 succeed on both; the 16 that
+The other 619 tests have the same outcome on both VMs (2026-11-18), including
+all of psoup's `MirrorTesting`, `MirrorBuilderTesting` and
+`ActivationMirrorTesting`; four of `ActivationMirrorTesting`'s fail on both,
+because they expect `[^2]` where the pretty-printed test source now has
+`[ ^2 ]`. Of the 444 outside the mirror suites, 428 succeed on both; the 16 that
 do not fail identically on both, with the same message:
 `FloatTests>>testFloatRaisedTo` (the test computes `8 ** 1 / 3`, which is
 `(8 ** 1) / 3`) and 15 `SingleActorTests`, which immediate-send `isPromise`
@@ -34,9 +30,9 @@ Both runners install a handler of last resort, so a turn's unhandled
 exception (`TimerTests>>testOneShotTimerInvalidCallback` causes one) is
 reported and the suite goes on, as on psoup.
 
-Not yet compared: ports and spawning another VM (no suite uses them), the mirror suites and `MinitestTests` (mirrors, M6; Minitest's own
-discovery and runner use mirrors and promises, so on Eurasia the runner
-finds tests from the packager's catalog). psoup's `CollectionsTesting` does
+Not yet compared: ports and spawning another VM (no suite uses them), and
+`MinitestTests` (Minitest's own discovery and runner use mirrors and
+promises; on Eurasia the runner finds tests from the packager's catalog). psoup's `CollectionsTesting` does
 not run on psoup itself (it imports an `OrderedMap` that
 `CollectionsForPrimordialSoup` lacks).
 

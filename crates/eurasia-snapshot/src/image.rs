@@ -604,6 +604,7 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
             method: p,
             receiver: p,
             closure: p,
+            detached: None,
         }),
         KIND_FAR_REFERENCE => Body::FarRef {
             actor: u32::try_from(r.uv()?).map_err(|_| LoadError::UnknownKind { node, kind })?,
@@ -711,6 +712,7 @@ fn fill_body(
             method: resolve(e[0])?,
             receiver: resolve(e[1])?,
             closure: resolve(e[2])?,
+            detached: None,
         }),
         Body::FarRef { actor, .. } => Body::FarRef {
             actor,

@@ -752,50 +752,8 @@ impl Vm {
                     let signal = self.symbol("signal");
                     return self.ordinary_send(signal, 0, host);
                 }
-                match self.heap.get_mut(receiver).map(|o| &mut o.body) {
-                    Some(Body::Regular(slots)) if index < slots.len() => {
-                        slots[index] = value;
-                    }
-                    // The kernel's Ephemeron declares key, value, finalizer.
-                    Some(Body::Ephemeron {
-                        key,
-                        value: v,
-                        finalizer,
-                    }) if index < 3 => {
-                        *[key, v, finalizer][index] = value;
-                    }
-                    // An unfrozen method or mixin built in Newspeak (M6
-                    // design 4.1): its setters write its contract fields, in
-                    // `vm slotOf:at:`'s order. A mixin's slot count follows
-                    // its slot names.
-                    Some(Body::Method(m)) if index < 5 => {
-                        *[
-                            &mut m.literals,
-                            &mut m.mixin,
-                            &mut m.selector,
-                            &mut m.source,
-                            &mut m.library,
-                        ][index] = value;
-                    }
-                    Some(Body::Mixin(_)) if index < 6 => {
-                        let count = self.heap.array_elements(value).map(<[Value]>::len);
-                        let Some(Body::Mixin(m)) = self.heap.get_mut(receiver).map(|o| &mut o.body)
-                        else {
-                            unreachable!("matched above")
-                        };
-                        if index == 3 {
-                            m.slot_count = count.unwrap_or(0) as u32;
-                        }
-                        *[
-                            &mut m.name,
-                            &mut m.methods,
-                            &mut m.enclosing_mixin,
-                            &mut m.slot_names,
-                            &mut m.class_mixin,
-                            &mut m.library,
-                        ][index] = value;
-                    }
-                    _ => return Err(self.bad_slot_access(method, receiver)),
+                if !self.store_slot(receiver, index, value) {
+                    return Err(self.bad_slot_access(method, receiver));
                 }
                 self.stack.truncate(base + 1);
                 Ok(None)
@@ -1110,6 +1068,27 @@ impl Vm {
                 self.finished_turn = Some(wakeup);
                 Ok(None)
             }
+            Outcome::ContinueAt { activation, value } => {
+                match self.continue_at(activation, value) {
+                    Ok(()) => Ok(None),
+                    Err(reason) => self.native_failure(native, receiver, args, reason, host),
+                }
+            }
+            Outcome::ResumeActivation(top) => match self.resume_activation(top) {
+                Ok(()) => Ok(None),
+                Err(reason) => self.native_failure(native, receiver, args, reason, host),
+            },
+            Outcome::RunNative {
+                method,
+                receiver: r,
+                arguments,
+            } => match self.run_native_for_simulator(method, r, arguments, host) {
+                Ok(v) => {
+                    self.stack.push(v);
+                    Ok(None)
+                }
+                Err(reason) => self.native_failure(native, receiver, args, reason, host),
+            },
             Outcome::ProgramVersion => {
                 let v = Value::small_integer(self.program_version as i64).expect("small");
                 self.stack.push(v);
@@ -1287,6 +1266,7 @@ impl Vm {
             method: f.method,
             receiver: f.receiver,
             closure: f.closure.unwrap_or(nil),
+            detached: None,
         };
         let class = self.roles.get(Role::ActivationClass);
         let a = self.heap.allocate(
@@ -1332,6 +1312,9 @@ impl Vm {
             Native::ActivationReceiver => return Outcome::Answer(record.receiver),
             Native::ActivationClosure => return Outcome::Answer(record.closure),
             _ => {}
+        }
+        if record.detached.is_some() {
+            return self.detached_native(native, receiver, args);
         }
         let Some(k) = self.frame_index(receiver) else {
             // A dead activation: no sender, no bci, no temps.
@@ -1383,6 +1366,382 @@ impl Vm {
             },
             _ => Outcome::Fail(Reason::Unsupported),
         }
+    }
+
+    /// An activation native on a detached activation (M6 design 4.4): its
+    /// fields are the Simulator's to read and write.
+    fn detached_native(&mut self, native: Native, receiver: Value, args: &[Value]) -> Outcome {
+        let nil = self.nil();
+        let is_activation = |vm: &Vm, v: Value| v == nil || vm.heap.activation(v).is_some();
+        let arg_ok = match native {
+            Native::ActivationSetSender => is_activation(self, args[0]),
+            Native::ActivationBciPut => args[0] == nil || args[0].as_small_integer().is_some(),
+            Native::ActivationSizePut => args[0]
+                .as_small_integer()
+                .is_some_and(|n| (0..1 << 16).contains(&n)),
+            _ => true,
+        };
+        if !arg_ok {
+            return Outcome::Fail(Reason::WrongKind(1));
+        }
+        let Some(Body::Activation(record)) = self.heap.get_mut(receiver).map(|o| &mut o.body)
+        else {
+            unreachable!("checked by the caller")
+        };
+        let d = record.detached.as_mut().expect("detached");
+        let index = |v: Value, len: usize| -> Result<usize, Reason> {
+            match v.as_small_integer() {
+                Some(i) if i >= 1 && i as usize <= len => Ok(i as usize - 1),
+                Some(_) => Err(Reason::OutOfRange(1)),
+                None => Err(Reason::WrongKind(1)),
+            }
+        };
+        match native {
+            Native::ActivationSender => Outcome::Answer(d.sender),
+            Native::ActivationBci => Outcome::Answer(d.bci),
+            Native::ActivationSize => {
+                Outcome::Answer(Value::small_integer(d.temps.len() as i64).expect("small"))
+            }
+            Native::ActivationTempAt => match index(args[0], d.temps.len()) {
+                Ok(i) => Outcome::Answer(d.temps[i]),
+                Err(r) => Outcome::Fail(r),
+            },
+            Native::ActivationTempAtPut => match index(args[0], d.temps.len()) {
+                Ok(i) => {
+                    d.temps[i] = args[1];
+                    Outcome::Answer(args[1])
+                }
+                Err(r) => Outcome::Fail(r),
+            },
+            Native::ActivationSetSender => {
+                d.sender = args[0];
+                Outcome::Answer(receiver)
+            }
+            Native::ActivationBciPut => {
+                d.bci = args[0];
+                Outcome::Answer(receiver)
+            }
+            Native::ActivationSizePut => {
+                let n = args[0].as_small_integer().expect("checked") as usize;
+                d.temps.resize(n, nil);
+                Outcome::Answer(receiver)
+            }
+            Native::ActivationMethodPut => {
+                record.method = args[0];
+                Outcome::Answer(receiver)
+            }
+            Native::ActivationClosurePut => {
+                record.closure = args[0];
+                Outcome::Answer(receiver)
+            }
+            Native::ActivationReceiverPut => {
+                record.receiver = args[0];
+                Outcome::Answer(receiver)
+            }
+            _ => Outcome::Fail(Reason::Unsupported),
+        }
+    }
+
+    /// Stores `value` in slot `index` (absolute) of `receiver`: a regular
+    /// object's slot, an ephemeron's key, value or finalizer, or an unfrozen
+    /// method's or mixin's contract field. Answers whether there was one.
+    fn store_slot(&mut self, receiver: Value, index: usize, value: Value) -> bool {
+        match self.heap.get_mut(receiver).map(|o| &mut o.body) {
+            Some(Body::Regular(slots)) if index < slots.len() => {
+                slots[index] = value;
+            }
+            // The kernel's Ephemeron declares key, value, finalizer.
+            Some(Body::Ephemeron {
+                key,
+                value: v,
+                finalizer,
+            }) if index < 3 => {
+                *[key, v, finalizer][index] = value;
+            }
+            // An unfrozen method or mixin built in Newspeak (M6
+            // design 4.1): its setters write its contract fields, in
+            // `vm slotOf:at:`'s order. A mixin's slot count follows
+            // its slot names.
+            Some(Body::Method(m)) if index < 5 => {
+                *[
+                    &mut m.literals,
+                    &mut m.mixin,
+                    &mut m.selector,
+                    &mut m.source,
+                    &mut m.library,
+                ][index] = value;
+            }
+            Some(Body::Mixin(_)) if index < 6 => {
+                let count = self.heap.array_elements(value).map(<[Value]>::len);
+                let Some(Body::Mixin(m)) = self.heap.get_mut(receiver).map(|o| &mut o.body) else {
+                    unreachable!("matched above")
+                };
+                if index == 3 {
+                    m.slot_count = count.unwrap_or(0) as u32;
+                }
+                *[
+                    &mut m.name,
+                    &mut m.methods,
+                    &mut m.enclosing_mixin,
+                    &mut m.slot_names,
+                    &mut m.class_mixin,
+                    &mut m.library,
+                ][index] = value;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// `vm continueAt: a with: v` (M6 design 4.4): the frames above the live
+    /// activation `a` leave the stack without unwinding (the library has
+    /// unwound), and `a`'s pending send answers `v`. Those frames are not
+    /// dead: each becomes a detached activation with its state, the bottom
+    /// one's sender `a`, as psoup's heap activations survive a jump, so that
+    /// a debugger can still inspect, step or resume the thread they were.
+    /// Fails unless `a` is live.
+    fn continue_at(&mut self, activation: Value, value: Value) -> Result<(), Reason> {
+        let k = self.frame_index(activation).ok_or(Reason::WrongKind(1))?;
+        if k + 1 < self.frames.len() {
+            self.detach_frames_above(k);
+        }
+        self.stack.push(value);
+        Ok(())
+    }
+
+    /// Takes the frames above frame `k` off the stack, each becoming a
+    /// detached activation (its handle made if it had none) with its temps
+    /// and operands, its bci and its sender's handle.
+    fn detach_frames_above(&mut self, k: usize) {
+        for i in k..self.frames.len() {
+            self.ensure_activation(i);
+        }
+        let below = self.frames[k].activation.expect("made above");
+        let popped = self.frames.split_off(k + 1);
+        let tops: Vec<usize> = popped
+            .iter()
+            .skip(1)
+            .map(|f| f.bp)
+            .chain(core::iter::once(self.stack.len()))
+            .collect();
+        let mut sender = below;
+        for (f, top) in popped.iter().zip(tops) {
+            let temps = self.stack[f.bp + 1..top].to_vec();
+            let handle = f.activation.expect("made above");
+            let bci = Value::small_integer(f.ip as i64 + 1).expect("small");
+            if let Some(Body::Activation(record)) = self.heap.get_mut(handle).map(|o| &mut o.body) {
+                record.frame = None;
+                record.detached = Some(crate::object::Detached { sender, bci, temps });
+            }
+            sender = handle;
+        }
+        self.stack.truncate(popped[0].bp);
+    }
+
+    /// `vm resumeActivation: top` (M6 design 4.4): the chain of detached
+    /// activations from `top` down to the current frame becomes frames, the
+    /// bottom one called from the current frame's pending send, and the run
+    /// continues at `top`. Each handle keeps its identity and becomes live.
+    /// Checked before anything changes; fails if the chain does not end at
+    /// the current frame or an activation in it is not runnable.
+    fn resume_activation(&mut self, top: Value) -> Result<(), Reason> {
+        let current = self
+            .frames
+            .last()
+            .and_then(|f| f.activation)
+            .ok_or(Reason::WrongKind(1))?;
+        let mut chain = Vec::new();
+        let mut a = top;
+        loop {
+            let record = self.heap.activation(a).ok_or(Reason::WrongKind(1))?;
+            let Some(d) = &record.detached else {
+                break;
+            };
+            if chain.len() > MAX_FRAMES {
+                return Err(Reason::WrongKind(1));
+            }
+            let method = self
+                .heap
+                .method(record.method)
+                .ok_or(Reason::WrongKind(1))?;
+            let bci = d.bci.as_small_integer().ok_or(Reason::WrongKind(1))?;
+            if bci < 1 || bci as usize > method.bytecode.len() {
+                return Err(Reason::WrongKind(1));
+            }
+            let arity = match self.heap.closure(record.closure) {
+                Some(c) => c.num_args as usize,
+                None => method.header.arg_count as usize,
+            };
+            if d.temps.len() < arity {
+                return Err(Reason::WrongKind(1));
+            }
+            chain.push(a);
+            a = d.sender;
+        }
+        if a != current || chain.is_empty() {
+            return Err(Reason::WrongKind(1));
+        }
+        if self.frames.len() + chain.len() > MAX_FRAMES {
+            return Err(Reason::Exhausted(natives::Resource::Stack));
+        }
+        for &handle in chain.iter().rev() {
+            let Some(Body::Activation(record)) = self.heap.get_mut(handle).map(|o| &mut o.body)
+            else {
+                unreachable!("checked above")
+            };
+            let d = record.detached.take().expect("checked above");
+            let serial = self.next_serial;
+            self.next_serial += 1;
+            record.frame = Some(serial);
+            let (method, receiver, closure) = (record.method, record.receiver, record.closure);
+            let nil = self.nil();
+            let closure = (closure != nil).then_some(closure);
+            let arity = match closure.and_then(|c| self.heap.closure(c)) {
+                Some(c) => c.num_args as usize,
+                None => self.heap.method(method).expect("checked").header.arg_count as usize,
+            };
+            let bp = self.stack.len();
+            self.stack.push(closure.unwrap_or(receiver));
+            self.stack.extend(d.temps.iter().copied());
+            self.frames.push(Frame {
+                serial,
+                method,
+                receiver,
+                bp,
+                arg_count: arity,
+                lp: bp + 1 + arity,
+                ip: d.bci.as_small_integer().expect("checked") as usize - 1,
+                activation: Some(handle),
+                closure,
+            });
+        }
+        Ok(())
+    }
+
+    /// `vm runNative:receiver:arguments:` (M6 design 4.4): runs a native or
+    /// accessor method for the Simulator, which has no frame for it, and
+    /// answers what it did: {0. result}, {1. the failure to signal}, {2.
+    /// receiver. selector. arguments} or {3. closure. arguments}.
+    fn run_native_for_simulator(
+        &mut self,
+        method: Value,
+        receiver: Value,
+        arguments: Value,
+        host: &mut dyn Host,
+    ) -> Result<Value, Reason> {
+        let header = self
+            .heap
+            .method(method)
+            .ok_or(Reason::WrongKind(1))?
+            .header
+            .clone();
+        let args = self
+            .heap
+            .array_elements(arguments)
+            .ok_or(Reason::WrongKind(3))?
+            .to_vec();
+        if args.len() != header.arg_count as usize {
+            return Err(Reason::WrongKind(3));
+        }
+        let small = |n: i64| Value::small_integer(n).expect("small");
+        let parts: Vec<Value> = match header.kind {
+            MethodKind::Ordinary => return Err(Reason::WrongKind(1)),
+            MethodKind::ReturnSelf => alloc::vec![small(0), receiver],
+            MethodKind::Getter => {
+                let index = self
+                    .slot_index(method, receiver, header.slot)
+                    .map_err(|_| Reason::WrongKind(2))?;
+                let value = match self.heap.get(receiver).map(|o| &o.body) {
+                    Some(Body::Regular(slots)) => slots.get(index).copied(),
+                    Some(body) => {
+                        natives::readable_fields(body).and_then(|f| f.get(index).copied())
+                    }
+                    None => None,
+                }
+                .ok_or(Reason::WrongKind(2))?;
+                alloc::vec![small(0), value]
+            }
+            MethodKind::Setter => {
+                let index = self
+                    .slot_index(method, receiver, header.slot)
+                    .map_err(|_| Reason::WrongKind(2))?;
+                let flags = self.heap.get(receiver).map_or(0, |o| o.header.flags);
+                if flags & FROZEN != 0 || (flags & VALUE != 0 && !self.is_value(args[0])) {
+                    let failure = self.new_failure(
+                        Native::SlotStore,
+                        receiver,
+                        args,
+                        Reason::WrongKind(0),
+                        host,
+                    );
+                    alloc::vec![small(1), failure]
+                } else {
+                    if !self.store_slot(receiver, index, args[0]) {
+                        return Err(Reason::WrongKind(2));
+                    }
+                    alloc::vec![small(0), receiver]
+                }
+            }
+            MethodKind::Native => {
+                let native = Native::from_id(header.native).ok_or(Reason::WrongKind(1))?;
+                let outcome = {
+                    let mut ctx = NativeContext {
+                        heap: &mut self.heap,
+                        roles: &self.roles,
+                        host,
+                        space: Space::Actor(self.current as u32),
+                    };
+                    natives::invoke(native, receiver, &args, &mut ctx)
+                };
+                let outcome = match outcome {
+                    Outcome::Frame(op) => self.frame_native(op, receiver, &args),
+                    other => other,
+                };
+                match outcome {
+                    Outcome::Answer(v) => alloc::vec![small(0), v],
+                    Outcome::Fail(reason) => {
+                        let failure = self.new_failure(native, receiver, args, reason, host);
+                        alloc::vec![small(1), failure]
+                    }
+                    Outcome::TailSend {
+                        receiver: r,
+                        selector,
+                        args: a,
+                    } => {
+                        let selector = self.symbol(selector);
+                        let array_class = self.roles.get(Role::ArrayClass);
+                        let a = self.heap.allocate(
+                            array_class,
+                            Space::Actor(self.current as u32),
+                            Body::Array(a),
+                        );
+                        alloc::vec![small(2), r, selector, a]
+                    }
+                    Outcome::ActivateClosure { closure, args: a } => {
+                        let array_class = self.roles.get(Role::ArrayClass);
+                        let a = self.heap.allocate(
+                            array_class,
+                            Space::Actor(self.current as u32),
+                            Body::Array(a),
+                        );
+                        alloc::vec![small(3), closure, a]
+                    }
+                    // A native that changes the VM's own state (turns,
+                    // actors, the heap, the program) is not simulated.
+                    _ => {
+                        let failure =
+                            self.new_failure(native, receiver, args, Reason::Unsupported, host);
+                        alloc::vec![small(1), failure]
+                    }
+                }
+            }
+        };
+        let array_class = self.roles.get(Role::ArrayClass);
+        Ok(self.heap.allocate(
+            array_class,
+            Space::Actor(self.current as u32),
+            Body::Array(parts),
+        ))
     }
 
     /// Makes frame `j` the sender of frame `k` (j < k): the frames in between
@@ -1994,8 +2353,9 @@ impl Vm {
 
     /// `^result` inside a closure: return from the home method, following
     /// psoup's protocol. An intervening ensure: frame gets
-    /// #aboutToReturn:through:; a dead home, or a simulation-root or
-    /// callback-dispatch frame in between, gets #cannotReturn:.
+    /// #aboutToReturn:through:; a dead home, or a simulation-root (role 27,
+    /// or a method marked by `vm markSimulationRoot:`) or callback-dispatch
+    /// frame in between, gets #cannotReturn:.
     fn non_local_return(
         &mut self,
         result: Value,
@@ -2034,7 +2394,11 @@ impl Vm {
                 let unwind = self.ensure_activation(i);
                 return self.upcall(Role::AboutToReturnThroughSelector, &[result, unwind], host);
             }
-            if blockers.iter().any(|&b| b == method && b != nil) {
+            let marked = self
+                .heap
+                .get(method)
+                .is_some_and(|o| o.header.flags & crate::object::SIMULATION_ROOT != 0);
+            if marked || blockers.iter().any(|&b| b == method && b != nil) {
                 break;
             }
         }

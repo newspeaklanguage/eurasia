@@ -592,7 +592,7 @@ fn psoup_header_words_round_trip() {
         (MethodKind::Setter, 4, 1)
     );
     assert_eq!(
-        header_from_psoup(1024 << 16).expect("return self").kind,
+        header_from_psoup(1023 << 16).expect("return self").kind,
         MethodKind::ReturnSelf
     );
     // Refused: fewer temps than arguments, a native of the wrong arity, an

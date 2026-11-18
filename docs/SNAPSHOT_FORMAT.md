@@ -1,6 +1,6 @@
 # Eurasia snapshot format
 
-**Status:** Draft, format version 4. Written before the code (implementation
+**Status:** Draft, format version 5. Written before the code (implementation
 plan M0); the packager (Newspeak) and `eurasia-snapshot` (Rust) are tested
 against each other.
 
@@ -32,7 +32,7 @@ psoup groups objects by class instead, which loses that order.
 | Field | Type | Meaning |
 |---|---|---|
 | magic | `bytes(4)` | `EURA` (0x45 0x55 0x52 0x41) |
-| format version | `u16` | This document: 4 (2026-11-17: version 2 gave mixins the class-side mixin field, version 3 the value flag bits and the Value role; 2026-11-18: version 4 far references, promise records, the shared bit and roles 35–37) |
+| format version | `u16` | This document: 4 (2026-11-17: version 2 gave mixins the class-side mixin field, version 3 the value flag bits and the Value role; 2026-11-18: version 4 far references, promise records, the shared bit and roles 35–37; version 5 the simulation-root bit and roles 38–39) |
 | kernel version | `u16` | Must equal the VM's `KERNEL_VERSION` |
 | bytecode version | `u16` | Must equal the VM's `BYTECODE_VERSION` |
 | word size | `u8` | Always 64 |
@@ -85,7 +85,7 @@ cycles need no special handling.
 |---|---|---|
 | sequence delta | `uv` | Sequence number minus the previous node's in the same section (the section's first node's is absolute). Gaps are objects in other spaces, or collected before the save. |
 | kind | `u8` | Below |
-| flags | `u8` | Bit 0: frozen (installed or canonical). Bit 1: a value (deeply immutable; actors may share it). Bit 2: on a class, a value class (its instances are values). Bit 3: shared by every actor though mutable (the kernel module, the VM mirror): cloning a platform does not copy it. Others reserved. |
+| flags | `u8` | Bit 0: frozen (installed or canonical). Bit 1: a value (deeply immutable; actors may share it). Bit 2: on a class, a value class (its instances are values). Bit 3: shared by every actor though mutable (the kernel module, the VM mirror): cloning a platform does not copy it. Bit 4: on a method, a simulation root (psoup's primitive 142): a non-local return stops at it, and an exception in a simulated thread is routed to it. Others reserved. |
 | shape | depends on kind | Below |
 
 | Kind | Name | Shape in the node record | Edge record |
@@ -114,6 +114,10 @@ nothing in any actor's terms: values, far references and records only. Both
 use the FarReference class (role 35). A snapshot saves only what the roles
 reach, so today only the actor whose message loop is the role is saved;
 saving every actor of a cohort is open.
+
+A detached activation (one the debugger's Simulator made, `Activation
+new`) is saved like any other activation: dead, without its state. Saving
+paused and simulated stacks comes with M7.
 
 Kinds 13 and 14 are hidden layouts: their encoding belongs to the format,
 not to a layout the image may read. A saved activation is always **dead**:
@@ -167,6 +171,8 @@ Role ids for kernel version 1 (the operation list, section 2):
 | | | 35 | FarReference class (of far references and promise records) |
 | | | 36 | platform template: the message loop a new actor's platform is cloned from |
 | | | 37 | Object class (`vm spawn:` applies its mixin to it) |
+| | | 38 | InstanceMixin class (`basicNew` of it answers an unfrozen mixin) |
+| | | 39 | ClassMixin class (likewise, a class-side mixin) |
 
 Every role must be present. Unknown role ids are an error.
 

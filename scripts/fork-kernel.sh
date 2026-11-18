@@ -37,7 +37,8 @@ cp "$TMP/actors-printed.ns" "$NEWSPEAK/EurasiaActors.ns"
 echo "fork-kernel: wrote $NEWSPEAK/EurasiaActors.ns"
 
 # The mirrors module (kernel/fork-mirrors.py), the same way.
-python3 "$EURASIA/kernel/fork-mirrors.py" "$PRIMORDIALSOUP/newspeak/MirrorsForPrimordialSoup.ns" "$TMP/mirrors-raw.ns"
+python3 "$EURASIA/kernel/fork-mirrors.py" "$PRIMORDIALSOUP/newspeak/MirrorsForPrimordialSoup.ns" \
+  "$NEWSPEAK/V5BytecodeSimulation.ns" "$NEWSPEAK/upstream-V5Simulator-338f0bb3.ns.txt" "$TMP/mirrors-raw.ns"
 ./parse-validate.sh "$TMP/mirrors-raw.ns" | grep -q "is syntactically valid" \
   || { echo "the mirrors fork does not parse"; ./parse-validate.sh "$TMP/mirrors-raw.ns"; exit 1; }
 ./pretty-print.sh "$TMP/mirrors-raw.ns" "$TMP/mirrors-printed.ns" > /dev/null

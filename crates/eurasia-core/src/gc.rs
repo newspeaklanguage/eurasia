@@ -102,7 +102,16 @@ fn for_each_strong(body: &Body, mut f: impl FnMut(Value)) {
             f(c.defining);
             c.copied.iter().copied().for_each(f);
         }
-        Body::Activation(a) => [a.method, a.receiver, a.closure].into_iter().for_each(f),
+        Body::Activation(a) => {
+            [a.method, a.receiver, a.closure]
+                .into_iter()
+                .for_each(&mut f);
+            if let Some(d) = &a.detached {
+                f(d.sender);
+                f(d.bci);
+                d.temps.iter().copied().for_each(f);
+            }
+        }
         Body::FarRef { target, .. } => f(*target),
         Body::Promise(p) => {
             f(p.value);
@@ -126,6 +135,10 @@ impl Heap {
                 Body::Activation(a) => {
                     a.receiver = forward(a.receiver);
                     a.closure = forward(a.closure);
+                    if let Some(d) = &mut a.detached {
+                        d.sender = forward(d.sender);
+                        d.temps.iter_mut().for_each(|v| *v = forward(*v));
+                    }
                 }
                 body => map_all(body, forward),
             }
@@ -191,6 +204,11 @@ fn map_all(body: &mut Body, f: &impl Fn(Value) -> Value) {
             a.method = f(a.method);
             a.receiver = f(a.receiver);
             a.closure = f(a.closure);
+            if let Some(d) = &mut a.detached {
+                d.sender = f(d.sender);
+                d.bci = f(d.bci);
+                each(&mut d.temps);
+            }
         }
         Body::FarRef { target, .. } => *target = f(*target),
         Body::Promise(p) => {

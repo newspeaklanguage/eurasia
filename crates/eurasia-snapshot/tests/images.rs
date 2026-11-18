@@ -131,6 +131,7 @@ fn closures_and_dead_activations_round_trip() {
             method: nil,
             receiver: nil,
             closure: nil,
+            detached: None,
         }),
     );
     let closure = b.heap.allocate(
