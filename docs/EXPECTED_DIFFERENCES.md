@@ -32,6 +32,15 @@ finds tests from the packager's catalog). psoup's `CollectionsTesting` does
 not run on psoup itself (it imports an `OrderedMap` that
 `CollectionsForPrimordialSoup` lacks).
 
+## JS tests on wasm
+
+`scripts/web-tests.sh` runs psoup's `JSTesting` on the wasm32 VM under
+Node. psoup's native VM cannot run them (a failing JS primitive halts it),
+so they are not compared with psoup: every JS test must succeed, except
+those listed here as `- `JSTests>>selector`: reason`.
+
+- `JSTests>>testRawPushRejectsNonBilingualReceiver`: the test checks that passing a non-bilingual object to JavaScript raises an Error whose text mentions `rawPush:`, the name of psoup's internal marshalling primitive. Eurasia refuses the argument too, but as a native failure of the operation: `AlienCall failed: wrongKind 2` (operation list, section 10).
+
 ## Semantic and representation differences
 
 | Area | psoup | Eurasia | Why |
@@ -41,6 +50,8 @@ not run on psoup itself (it imports an `OrderedMap` that
 | Comparisons with a Fraction argument | **psoup bug**: `a < b` answers `b >= a` (and likewise for the others), which is wrong when the values are equal | correct reversal | `KernelForPrimordialSoup.ns`, `Number>><` and siblings. |
 | `Integer>>/` | primitive, then Fraction in the fallback | an ordinary Newspeak method | The fallback was real code (operation list, section 3.1). |
 | A closure called with the wrong number of arguments | `ArgumentError` (the primitive fails and `Closure>>value` reports it) | `NativeFailure`, `#arity` | No fallback bodies: a failing native signals (operation list, section 0). Both are Errors, so `on: Error` catches either; printed messages differ. |
+| JavaScript `undefined` | an Alien (`isUndefined`) | the same: an Alien for reference 0; `null` arrives as nil | psoup's API, which `JSTesting` and Hopscotch use (operation list, section 10; decided 2026-11-18). |
+| Host aliens and identity | a new Alien (and table entry) for every host object answered | the same | The host table only grows on both; reclaiming entries is open. |
 | Callback arguments | extra JS arguments raise `ArgumentError` | dropped; missing ones are nil | Decided 2026-11-10. |
 | Float printing | double-conversion's shortest form | the same digits and spelling (`3.0`, `1.7976931348623157e+308`, `1.5e-7`), from Rust's shortest round-trip digits | Aligned 2026-11-17 by the kernel tests. |
 | `asStringFixed:`, `asStringExponential:`, `asStringPrecision:` | JavaScript's `toFixed`, `toExponential`, `toPrecision` | the same (`e+` exponents, digit ranges 0-20, 0-20 and 1-21) | Aligned 2026-11-17; any unusable digit count fails with `#outOfRange: 1` (operation list 3.1). |

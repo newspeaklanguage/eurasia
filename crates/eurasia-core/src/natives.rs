@@ -17,7 +17,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use crate::bigint::BigInt;
-use crate::host::Host;
+use crate::host::{HOST_GLOBAL, Host, HostError, HostOp, HostValue};
 use crate::object::{Behavior, Body, FROZEN, Heap, PromiseRecord, Space, VALUE, VALUE_CLASS};
 use crate::roles::{Role, Roles};
 use crate::value::{SmallInteger, Value};
@@ -174,6 +174,15 @@ natives! {
     VmPromiseState = 135 / 1: "`vm promiseState: record`: `{state. payload}` at the end of its forwarding chain, in the running actor's terms: 0 and the owner's promise if that is in the running actor, else the last record; 1 and the resolution; 2 and the problem.",
     VmPromiseAddWaiter = 136 / 2: "`vm promise: record addWaiter: localPromise`: the argument is sent resolveRemotely: or breakRemotely: (in a packet) when the record, at the end of its chain, settles; at once if it has.",
     VmIsPromise = 137 / 1: "`vm isPromise:`: whether the object is a promise record.",
+    VmHostGlobal = 140 / 0: "`vm hostGlobal`: an Alien for the host's global object (operation list, section 10).",
+    AlienAt = 141 / 1: "`Alien>>at:`: `this[key]`.",
+    AlienAtPut = 142 / 2: "`Alien>>at:put:`: `this[key] = value`; answers the value.",
+    AlienRemoveKey = 143 / 1: "`Alien>>removeKey:`: `delete this[key]`.",
+    AlienIncludesKey = 144 / 1: "`Alien>>includesKey:`: `key in this`.",
+    AlienCall = 145 / 2: "`Alien>>call:withArguments:` (psoup's `perform:withArguments:`): `this[key](...)`.",
+    AlienApply = 146 / 1: "`Alien>>callWithArguments:`: the alien is a function; `this(...)`.",
+    AlienNew = 147 / 1: "`Alien>>newWithArguments:`: `new this(...)`.",
+    AlienInstanceOf = 148 / 1: "`Alien>>isInstanceOf:` (psoup's `instanceOf:`): `this instanceof constructor`.",
     VmSpawn = 139 / 1: "`vm spawn: mixin`: a new actor running a clone of the platform template, with the mixin applied to Object (role 37) in its heap, enclosing object nil; answers a far reference to the new class (`actor-semantics.tex`, eq. `create-actor`).",
     VmPromiseSend = 138 / 2: "`vm promise: record send: {selector. resultRecord. arguments...}`: an eventual send to the promise (Route-Pending): queued in the record, at the end of its chain, until it settles; delivered at once if it has.",
     VmIsValue = 125 / 1: "`vm isValue:`: whether the object is a value (immediates, nil, booleans, strings, numbers, instances of value classes, classes with a value enclosing object).",
@@ -271,6 +280,132 @@ pub fn new_far_reference(ctx: &mut NativeContext<'_>, actor: u32, target: Value)
         .allocate(class, space, Body::FarRef { actor, target });
     ctx.heap.get_mut(r).expect("new").header.flags |= VALUE;
     r
+}
+
+/// The largest magnitude a host number holds exactly (2^53).
+const HOST_EXACT: i64 = 1 << 53;
+
+/// An Alien (role 33: one slot, the host reference) for host reference `r`.
+pub fn new_alien(ctx: &mut NativeContext<'_>, r: u32) -> Value {
+    let class = ctx.roles.get(Role::AlienClass);
+    let space = ctx.space;
+    ctx.heap.allocate(
+        class,
+        space,
+        Body::Regular(alloc::vec![small(i64::from(r))]),
+    )
+}
+
+/// The host reference of an Alien.
+fn alien_reference(ctx: &NativeContext<'_>, v: Value) -> Option<u32> {
+    let o = ctx.heap.get(v)?;
+    if o.header.class != ctx.roles.get(Role::AlienClass) {
+        return None;
+    }
+    match &o.body {
+        Body::Regular(slots) if slots.len() == 1 => slots[0]
+            .as_small_integer()
+            .and_then(|r| u32::try_from(r).ok()),
+        _ => None,
+    }
+}
+
+/// `v` as it crosses to the host (operation list, section 10, marshalling):
+/// nil, Booleans, Integers within 2^53, Floats and Strings by value, Aliens
+/// as their references; anything else fails with `#wrongKind: index`.
+fn to_host(ctx: &NativeContext<'_>, v: Value, index: u32) -> Result<HostValue, Reason> {
+    if v == ctx.nil() {
+        return Ok(HostValue::Null);
+    }
+    if v == ctx.roles.get(Role::True) {
+        return Ok(HostValue::Bool(true));
+    }
+    if v == ctx.roles.get(Role::False) {
+        return Ok(HostValue::Bool(false));
+    }
+    if let Some(n) = v.as_small_integer() {
+        if n.abs() > HOST_EXACT {
+            return Err(Reason::OutOfRange(index));
+        }
+        return Ok(HostValue::Number(n as f64));
+    }
+    if let Some(r) = alien_reference(ctx, v) {
+        return Ok(if r == 0 {
+            HostValue::Undefined
+        } else {
+            HostValue::Ref(r)
+        });
+    }
+    match ctx.heap.get(v).map(|o| &o.body) {
+        Some(Body::Float(f)) => Ok(HostValue::Number(*f)),
+        Some(Body::String(b)) => match core::str::from_utf8(b) {
+            Ok(s) => Ok(HostValue::String(String::from(s))),
+            Err(_) => Err(Reason::WrongKind(index)),
+        },
+        Some(Body::LargeInteger { .. }) => Err(Reason::OutOfRange(index)),
+        _ => Err(Reason::WrongKind(index)),
+    }
+}
+
+/// A host value as it arrives in Newspeak: `null` as nil, `undefined` and
+/// host objects as Aliens, integral numbers within 2^53 as Integers.
+fn from_host(ctx: &mut NativeContext<'_>, v: HostValue) -> Value {
+    match v {
+        HostValue::Undefined => new_alien(ctx, 0),
+        HostValue::Null => ctx.nil(),
+        HostValue::Bool(b) => ctx.boolean(b),
+        HostValue::Number(x) => {
+            if libm::trunc(x) == x && x.abs() <= HOST_EXACT as f64 {
+                small(x as i64)
+            } else {
+                ctx.float(x)
+            }
+        }
+        HostValue::String(s) => ctx.new_string(&s),
+        HostValue::Ref(r) => new_alien(ctx, r),
+    }
+}
+
+/// A host operation on the Alien `receiver`, with `fixed` arguments (indices
+/// 1, 2, ...) and then, if given, the elements of an Array argument at that
+/// index.
+fn host_operation(
+    ctx: &mut NativeContext<'_>,
+    op: HostOp,
+    receiver: Value,
+    fixed: &[Value],
+    spread: Option<(Value, u32)>,
+) -> Outcome {
+    let Some(r) = alien_reference(ctx, receiver) else {
+        return Outcome::Fail(Reason::WrongKind(0));
+    };
+    let mut args = Vec::with_capacity(fixed.len());
+    for (i, &v) in fixed.iter().enumerate() {
+        match to_host(ctx, v, i as u32 + 1) {
+            Ok(h) => args.push(h),
+            Err(reason) => return Outcome::Fail(reason),
+        }
+    }
+    if let Some((array, index)) = spread {
+        let Some(elements) = ctx.heap.array_elements(array).map(<[Value]>::to_vec) else {
+            return Outcome::Fail(Reason::WrongKind(index));
+        };
+        for v in elements {
+            match to_host(ctx, v, index) {
+                Ok(h) => args.push(h),
+                Err(reason) => return Outcome::Fail(reason),
+            }
+        }
+    }
+    match ctx.host.host_operation(op, r, &args) {
+        Ok(v) => Outcome::Answer(from_host(ctx, v)),
+        Err(HostError::Unsupported) => Outcome::Fail(Reason::Unsupported),
+        Err(HostError::Dead) => Outcome::Fail(Reason::Dead),
+        Err(HostError::Raised(message)) => {
+            let m = ctx.new_string(&message);
+            Outcome::Fail(Reason::Host(m))
+        }
+    }
 }
 
 /// Whether `v` is a promise record.
@@ -1635,6 +1770,24 @@ pub fn invoke(
         }
         Native::VmNewActor => Outcome::NewActor,
         Native::VmSpawn => Outcome::Spawn(arg(0)),
+        Native::VmHostGlobal => Outcome::Answer(new_alien(ctx, HOST_GLOBAL)),
+        Native::AlienAt => host_operation(ctx, HostOp::Get, receiver, &[arg(0)], None),
+        Native::AlienAtPut => {
+            match host_operation(ctx, HostOp::Set, receiver, &[arg(0), arg(1)], None) {
+                Outcome::Answer(_) => Outcome::Answer(arg(1)),
+                other => other,
+            }
+        }
+        Native::AlienRemoveKey => host_operation(ctx, HostOp::Delete, receiver, &[arg(0)], None),
+        Native::AlienIncludesKey => host_operation(ctx, HostOp::Has, receiver, &[arg(0)], None),
+        Native::AlienCall => {
+            host_operation(ctx, HostOp::Call, receiver, &[arg(0)], Some((arg(1), 2)))
+        }
+        Native::AlienApply => host_operation(ctx, HostOp::Apply, receiver, &[], Some((arg(0), 1))),
+        Native::AlienNew => host_operation(ctx, HostOp::New, receiver, &[], Some((arg(0), 1))),
+        Native::AlienInstanceOf => {
+            host_operation(ctx, HostOp::InstanceOf, receiver, &[arg(0)], None)
+        }
         Native::VmFarReferenceTo => {
             let Some(Body::FarRef { actor, .. }) = ctx.heap.get(arg(0)).map(|o| &o.body) else {
                 return Outcome::Fail(Reason::WrongKind(1));

@@ -54,7 +54,7 @@ echo "psoup:   $(wc -l < "$OUT/psoup-outcomes.txt") tests, $(grep -c ' success$'
 echo "Eurasia: $(wc -l < "$OUT/eurasia-outcomes.txt") tests, $(grep -c ' success$' "$OUT/eurasia-outcomes.txt" || true) successes"
 diff "$OUT/psoup-outcomes.txt" "$OUT/eurasia-outcomes.txt" > "$OUT/differences.txt" || true
 # Expected differences: lines '- `Context>>selector`' in the document.
-grep -o '^- `[^`]*>>[^`]*`' "$EURASIA/docs/EXPECTED_DIFFERENCES.md" 2>/dev/null | tr -d '`-' | tr -d ' ' | sort -u > "$OUT/expected.txt" || true
+sed -n '/^## Per-test differences/,/^## JS tests/p' "$EURASIA/docs/EXPECTED_DIFFERENCES.md" | grep -o '^- `[^`]*>>[^`]*`' | tr -d '`-' | tr -d ' ' | sort -u > "$OUT/expected.txt" || true
 grep '^[<>]' "$OUT/differences.txt" | awk '{ print $2 }' | sort -u > "$OUT/differing.txt" || true
 unexpected=$(comm -23 "$OUT/differing.txt" "$OUT/expected.txt")
 stale=$(comm -13 "$OUT/differing.txt" "$OUT/expected.txt")

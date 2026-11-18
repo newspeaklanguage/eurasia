@@ -10,6 +10,62 @@
 //! live in `eurasia-native` and `eurasia-web`. Calls, callbacks and expats
 //! (operation list, section 10) come with the web host in M5.
 
+/// A value crossing to or from the host (operation list, section 10): the
+/// bilingual values by value, anything else as a host reference, an index
+/// into the host's table of objects. Reference 0 is the host's `undefined`
+/// and 1 its global object.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HostValue {
+    /// JavaScript `undefined`, which arrives in Newspeak as an Alien.
+    Undefined,
+    /// `null`, which arrives as nil.
+    Null,
+    /// A Boolean.
+    Bool(bool),
+    /// A number. Integral numbers of magnitude at most 2^53 arrive as
+    /// Integers, others as Floats.
+    Number(f64),
+    /// A string.
+    String(alloc::string::String),
+    /// Any other host object: an index into the host's table.
+    Ref(u32),
+}
+
+/// The reference to the host's global object.
+pub const HOST_GLOBAL: u32 = 1;
+
+/// A host-object operation (operation list, section 10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostOp {
+    /// `receiver[args[0]]`.
+    Get,
+    /// `receiver[args[0]] = args[1]`.
+    Set,
+    /// `delete receiver[args[0]]`.
+    Delete,
+    /// `args[0] in receiver`.
+    Has,
+    /// `receiver[args[0]](args[1..])`, with `this` the receiver.
+    Call,
+    /// `receiver(args..)`: the receiver is a function.
+    Apply,
+    /// `new receiver(args..)`.
+    New,
+    /// `receiver instanceof args[0]`.
+    InstanceOf,
+}
+
+/// Why a host operation failed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HostError {
+    /// This host has no host objects (the command line, before a native FFI).
+    Unsupported,
+    /// The host raised; its description of the exception.
+    Raised(alloc::string::String),
+    /// The reference names no host object.
+    Dead,
+}
+
 /// The services a host provides to the VM.
 pub trait Host {
     /// Output (`vm print:`): send a line of text to the host's console.
@@ -36,6 +92,19 @@ pub trait Host {
     /// then returns [`crate::Completion::Waiting`] instead of waiting.
     fn blocks(&self) -> bool {
         true
+    }
+
+    /// Input and output (operation list, section 10): a host-object
+    /// operation on the object `receiver` refers to. The default host has
+    /// none.
+    fn host_operation(
+        &mut self,
+        op: HostOp,
+        receiver: u32,
+        args: &[HostValue],
+    ) -> Result<HostValue, HostError> {
+        let _ = (op, receiver, args);
+        Err(HostError::Unsupported)
     }
 
     /// Input (`vm hostDescription`): a short description of the host.

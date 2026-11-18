@@ -223,6 +223,8 @@ def main():
 		)
 		public spawn: mixin = (
 		)
+		public hostGlobal = (
+		)
 		public classOf: object = (
 		)
 		public currentActivation = (
@@ -409,6 +411,96 @@ def main():
 			^left asFloat / self
 		)
 """)
+
+    # 16. Host objects (role 33; operation list, section 10): the call-based
+    #     FFI. The VM makes an Alien for each host value that is not
+    #     bilingual; its operations are natives, and the messages it does not
+    #     understand go to the host object as psoup's Aliens' do.
+    anchor = "\tpublic class ArgumentError value: v = Exception new ("
+    t = replace(t, anchor, """	public class Alien _cannotInstantiate = (
+		(* A host object (Eurasia; operation list, section 10). The VM makes one for each host value that is not bilingual; it holds a reference into the host's table, 0 for the host's undefined. Its operations are natives. A message it does not understand goes to the host object, as with psoup's Aliens: a keyword selector names the method by its first keyword, and new constructs. *)
+
+		|
+			private reference
+		|
+	) (
+		private asJSSelector: nsSelector <String> ^<String> = (
+			| position = nsSelector indexOf: ':'. |
+			0 = position ifTrue: [ ^nsSelector ].
+			^nsSelector copyFrom: 1 to: position - 1
+		)
+		public at: key = (
+			halt
+		)
+		public at: key put: value = (
+			halt
+		)
+		public call: key withArguments: arguments <Array> = (
+			halt
+		)
+		public callWithArguments: arguments <Array> = (
+			halt
+		)
+		doesNotUnderstand: message = (
+			| jsSelector |
+			0 = message arguments size ifTrue: [
+					(message selector startsWith: 'isKindOf') ifTrue: [ ^false ]
+				].
+			jsSelector:: asJSSelector: message selector.
+			^'new' = jsSelector ifTrue: [ self newWithArguments: message arguments ]
+				ifFalse: [ self perform: jsSelector withArguments: message arguments ]
+		)
+		public includesKey: key ^<Boolean> = (
+			halt
+		)
+		public instanceOf: constructor ^<Boolean> = (
+			halt
+		)
+		public isInstanceOf: constructor ^<Boolean> = (
+			halt
+		)
+		public isKindOfClosure ^<Boolean> = (
+			^false
+		)
+		public isKindOfDOMNode ^<Boolean> = (
+			^instanceOf: (vm hostGlobal at: 'Node')
+		)
+		public isKindOfImage ^<Boolean> = (
+			^instanceOf: (vm hostGlobal at: 'HTMLImageElement')
+		)
+		public isKindOfJSAlien ^<Boolean> = (
+			^true
+		)
+		public isUndefined ^<Boolean> = (
+			^0 = reference
+		)
+		public newWithArguments: arguments <Array> = (
+			halt
+		)
+		public perform: selector <String> withArguments: arguments <Array> = (
+			halt
+		)
+		public printString ^<String> = (
+			self isUndefined ifTrue: [ ^'undefined' ].
+			^self perform: 'toString' withArguments: {}
+		)
+		public propertyAt: key = (
+			^at: key
+		)
+		public propertyAt: key put: value = (
+			^at: key put: value
+		)
+		public removeKey: key = (
+			halt
+		)
+	) : (
+		public global = (
+			(* The host's global object. *)
+
+			^vm hostGlobal
+		)
+	)
+""" + anchor)
 
     # 15. Far references (role 35): opaque VM objects (Φ). An ordinary send
     #     to one fails as an immediate send to psoup's eventual refs does.

@@ -146,3 +146,15 @@ EurasiaActors	instance	promiseState:	VmPromiseState	135
 EurasiaActors	instance	promise:addWaiter:	VmPromiseAddWaiter	136
 EurasiaActors	instance	isVMPromise:	VmIsPromise	137
 EurasiaActors	instance	promise:send:	VmPromiseSend	138
+# Host objects (operation list, section 10): the kernel's Alien class.
+VMMirror	instance	hostGlobal	VmHostGlobal	140
+Alien	instance	at:	AlienAt	141
+Alien	instance	at:put:	AlienAtPut	142
+Alien	instance	removeKey:	AlienRemoveKey	143
+Alien	instance	includesKey:	AlienIncludesKey	144
+Alien	instance	call:withArguments:	AlienCall	145
+Alien	instance	perform:withArguments:	AlienCall	145
+Alien	instance	callWithArguments:	AlienApply	146
+Alien	instance	newWithArguments:	AlienNew	147
+Alien	instance	isInstanceOf:	AlienInstanceOf	148
+Alien	instance	instanceOf:	AlienInstanceOf	148

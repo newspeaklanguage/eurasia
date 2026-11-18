@@ -12,6 +12,63 @@ const EXITED = 1;
 const WAITING = 2;
 const FAILED = -1;
 
+// The host-object imports of the call-based FFI (operation list, section 10;
+// crates/eurasia-web). The VM names host objects by references, indices into
+// `refs`: 0 is undefined and 1 the global object. An operation's arguments
+// are staged one by one, then ffi_perform does it and answers the result's
+// tag, whose payload ffi_result_number and ffi_result_string_copy read:
+// 0 undefined, 1 null, 2 Boolean, 3 number, 4 string, 5 reference, 6 the
+// host raised (the payload describes the exception), 7 a dead reference.
+// The table only grows, as psoup's does; reclaiming it is open.
+function hostObjects(bytesAt, decoder, encoder) {
+  const refs = [undefined, globalThis];
+  let staged = [];
+  let number = 0;
+  let string = new Uint8Array(0);
+  const answer = (v) => {
+    if (v === undefined) return 0;
+    if (v === null) return 1;
+    switch (typeof v) {
+      case 'boolean': number = v ? 1 : 0; return 2;
+      case 'number': number = v; return 3;
+      case 'string': string = encoder.encode(v); return 4;
+      default: refs.push(v); number = refs.length - 1; return 5;
+    }
+  };
+  const operations = [
+    (o, [k]) => o[k],
+    (o, [k, v]) => { o[k] = v; },
+    (o, [k]) => delete o[k],
+    (o, [k]) => k in o,
+    (o, [k, ...a]) => o[k](...a),
+    (f, a) => f(...a),
+    (c, a) => new c(...a),
+    (o, [c]) => o instanceof c,
+  ];
+  return {
+    ffi_arg_undefined: () => { staged.push(undefined); },
+    ffi_arg_null: () => { staged.push(null); },
+    ffi_arg_bool: (b) => { staged.push(b !== 0); },
+    ffi_arg_number: (x) => { staged.push(x); },
+    ffi_arg_string: (ptr, len) => { staged.push(decoder.decode(bytesAt(ptr, len))); },
+    ffi_arg_ref: (r) => { staged.push(refs[r]); },
+    ffi_perform: (op, receiver) => {
+      const args = staged;
+      staged = [];
+      if (receiver >= refs.length) return 7;
+      try {
+        return answer(operations[op](refs[receiver], args));
+      } catch (e) {
+        string = encoder.encode(String(e));
+        return 6;
+      }
+    },
+    ffi_result_number: () => number,
+    ffi_result_string_length: () => string.length,
+    ffi_result_string_copy: (ptr) => { bytesAt(ptr, string.length).set(string); },
+  };
+}
+
 // Runs `snapshot` (bytes) on the VM in `wasm` (bytes or a compiled
 // WebAssembly.Module). `print` receives each line the program prints.
 // Answers a promise of {status: 'returned', resumes} or {status: 'exited',
@@ -20,6 +77,7 @@ const FAILED = -1;
 export async function run(wasm, snapshot, { print = console.log } = {}) {
   let memory = null;
   const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
   const bytesAt = (ptr, len) => new Uint8Array(memory.buffer, ptr, len);
   const imports = {
     eurasia: {
@@ -27,6 +85,7 @@ export async function run(wasm, snapshot, { print = console.log } = {}) {
       monotonic_nanos: () => Math.floor(performance.now() * 1e6),
       utc_nanos: () => Date.now() * 1e6,
       random_bytes: (ptr, len) => crypto.getRandomValues(bytesAt(ptr, len)),
+      ...hostObjects(bytesAt, decoder, encoder),
     },
   };
   const module = wasm instanceof WebAssembly.Module ? wasm : await WebAssembly.compile(wasm);

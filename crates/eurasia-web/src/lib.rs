@@ -13,17 +13,20 @@
 //! 3. while it answers [`WAITING`], the loader waits (without blocking the
 //!    browser) until `eurasia_wakeup_nanos()` and calls `eurasia_resume()`.
 //!
-//! The VM reaches the host through four imports from the module `eurasia`:
-//! `print(ptr, len)`, `monotonic_nanos()`, `utc_nanos()` and
-//! `random_bytes(ptr, len)`. The call-based alien interface, expats and
-//! callbacks come next in M5.
+//! The VM reaches the host through imports from the module `eurasia`:
+//! `print(ptr, len)`, `monotonic_nanos()`, `utc_nanos()`,
+//! `random_bytes(ptr, len)`, and the host-object operations of the
+//! call-based FFI (operation list, section 10): each operation's arguments
+//! are staged one by one (`ffi_arg_*`), `ffi_perform(op, receiver)` performs
+//! it and answers the result's tag, and `ffi_result_*` read the result.
+//! Expats and callbacks come next in M5.
 
 // `no_mangle` exports and the host imports are the unsafe constructs here.
 #![allow(unsafe_code)]
 
 use std::cell::RefCell;
 
-use eurasia_core::host::Host;
+use eurasia_core::host::{Host, HostError, HostOp, HostValue};
 use eurasia_core::{BYTECODE_VERSION, Completion, KERNEL_VERSION, Vm, VmError};
 use eurasia_snapshot::{FORMAT_VERSION, read_image, write_image};
 
@@ -177,6 +180,40 @@ impl Host for WebHost {
         false
     }
 
+    fn host_operation(
+        &mut self,
+        op: HostOp,
+        receiver: u32,
+        args: &[HostValue],
+    ) -> Result<HostValue, HostError> {
+        for a in args {
+            imports::stage(a);
+        }
+        let op = match op {
+            HostOp::Get => 0,
+            HostOp::Set => 1,
+            HostOp::Delete => 2,
+            HostOp::Has => 3,
+            HostOp::Call => 4,
+            HostOp::Apply => 5,
+            HostOp::New => 6,
+            HostOp::InstanceOf => 7,
+        };
+        match imports::perform(op, receiver) {
+            0 => Ok(HostValue::Undefined),
+            1 => Ok(HostValue::Null),
+            2 => Ok(HostValue::Bool(imports::result_number() != 0.0)),
+            3 => Ok(HostValue::Number(imports::result_number())),
+            4 => Ok(HostValue::String(imports::result_string())),
+            5 => Ok(HostValue::Ref(imports::result_number() as u32)),
+            6 => Err(HostError::Raised(imports::result_string())),
+            7 => Err(HostError::Dead),
+            _ => Err(HostError::Raised(String::from(
+                "the host answered an unknown tag",
+            ))),
+        }
+    }
+
     fn description(&self) -> &str {
         "web"
     }
@@ -196,6 +233,58 @@ mod imports {
         fn host_utc_nanos() -> f64;
         #[link_name = "random_bytes"]
         fn host_random_bytes(ptr: *mut u8, len: usize);
+        fn ffi_arg_undefined();
+        fn ffi_arg_null();
+        fn ffi_arg_bool(b: i32);
+        fn ffi_arg_number(x: f64);
+        fn ffi_arg_string(ptr: *const u8, len: usize);
+        fn ffi_arg_ref(r: u32);
+        fn ffi_perform(op: i32, receiver: u32) -> i32;
+        fn ffi_result_number() -> f64;
+        fn ffi_result_string_length() -> usize;
+        fn ffi_result_string_copy(ptr: *mut u8);
+    }
+
+    use eurasia_core::host::HostValue;
+
+    /// Stages one argument of the next operation.
+    pub fn stage(v: &HostValue) {
+        // SAFETY: plain values; for a string the host reads `len` bytes at
+        // `ptr` during the call.
+        unsafe {
+            match v {
+                HostValue::Undefined => ffi_arg_undefined(),
+                HostValue::Null => ffi_arg_null(),
+                HostValue::Bool(b) => ffi_arg_bool(i32::from(*b)),
+                HostValue::Number(x) => ffi_arg_number(*x),
+                HostValue::String(s) => ffi_arg_string(s.as_ptr(), s.len()),
+                HostValue::Ref(r) => ffi_arg_ref(*r),
+            }
+        }
+    }
+
+    /// Performs operation `op` on the object `receiver` refers to, with the
+    /// staged arguments; answers the result's tag.
+    pub fn perform(op: i32, receiver: u32) -> i32 {
+        // SAFETY: plain values.
+        unsafe { ffi_perform(op, receiver) }
+    }
+
+    /// The result, when it is a number, Boolean or reference.
+    pub fn result_number() -> f64 {
+        // SAFETY: no arguments.
+        unsafe { ffi_result_number() }
+    }
+
+    /// The result, when it is a string (or an exception's description).
+    pub fn result_string() -> String {
+        // SAFETY: the host writes exactly ffi_result_string_length() bytes,
+        // the UTF-8 of the result, into the buffer.
+        unsafe {
+            let mut buffer = vec![0u8; ffi_result_string_length()];
+            ffi_result_string_copy(buffer.as_mut_ptr());
+            String::from_utf8(buffer).unwrap_or_default()
+        }
     }
 
     pub fn print(bytes: &[u8]) {
@@ -235,6 +324,24 @@ mod imports {
 
     pub fn random_bytes(buffer: &mut [u8]) {
         buffer.fill(0);
+    }
+
+    pub fn stage(v: &eurasia_core::host::HostValue) {
+        let _ = v;
+    }
+
+    /// Without a JavaScript host every operation raises.
+    pub fn perform(op: i32, receiver: u32) -> i32 {
+        let _ = (op, receiver);
+        6
+    }
+
+    pub fn result_number() -> f64 {
+        0.0
+    }
+
+    pub fn result_string() -> String {
+        String::from("no JavaScript host")
     }
 }
 
