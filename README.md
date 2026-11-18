@@ -82,7 +82,8 @@ and packager, and differential tests against psoup
 
 Copyright 2026-2027, Gilad Bracha. Eurasia is licensed under the same
 BSD-style license as the Primordial Soup VM; see [LICENSE](LICENSE). It is a
-new implementation and contains no psoup VM code. The kernel and actors fork
-scripts (`kernel/fork-kernel.py`, `kernel/fork-actors.py`) contain excerpts
+new implementation and contains no psoup VM code. The kernel, actors and
+mirrors fork scripts (`kernel/fork-kernel.py`, `kernel/fork-actors.py`,
+`kernel/fork-mirrors.py`) contain excerpts
 of psoup's Newspeak sources, which are under the Apache License 2.0; the
 LICENSE file acknowledges them.

@@ -163,3 +163,20 @@ Method	instance	header	MethodHeader	149
 Method	instance	header:	MethodHeaderPut	150
 Method	instance	bytecode	MethodBytecode	151
 Method	instance	bytecode:	MethodBytecodePut	152
+# The mirrors module (newspeak/EurasiaMirrors.ns, derived from psoup's by
+# kernel/fork-mirrors.py): its primitive methods.
+EurasiaMirrors	instance	allInstancesOf:	VmAllInstancesOf	153
+EurasiaMirrors	instance	allocate:	VmInstantiate	116
+EurasiaMirrors	instance	classOf:	VmClassOf	113
+EurasiaMirrors	instance	copiedOf:at:	ClosureCopiedAt	154
+EurasiaMirrors	instance	copiedOf:at:put:	ClosureCopiedAtPut	155
+EurasiaMirrors	instance	currentActivation	CurrentActivation	100
+EurasiaMirrors	instance	definingActivationOf:	DefiningActivationOf	110
+EurasiaMirrors	instance	identityHashOf:	VmIdentityHashOf	115
+EurasiaMirrors	instance	initialBCIOf:	ClosureInitialPc	156
+EurasiaMirrors	instance	is:identicalTo:	VmIsIdenticalTo	114
+EurasiaMirrors	instance	isCanonical:	VmIsCanonical	117
+EurasiaMirrors	instance	numCopiedOf:	ClosureNumCopied	157
+EurasiaMirrors	instance	slotOf:at:	VmSlotOfAt	111
+EurasiaMirrors	instance	slotOf:at:put:	VmSlotOfAtPut	112
+ClassMirror	class	allInstancesOf:	VmAllInstancesOf	153

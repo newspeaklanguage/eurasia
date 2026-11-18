@@ -16,8 +16,13 @@ difference, and also reports listed tests that agree again.
 
 - `TwoActorTests>>testPipelining`: the test sends its `Promise` (the actors module's `PromiseFactories` instance) to another actor, which immediate-sends `when:fulfilled:` to it. psoup's library treats `Promise` as a value object, so it crosses as itself; on Eurasia every actor has its own platform, `Promise` is a mutable object of the sender's, and it crosses as a far reference, which refuses the immediate send. Decided 2026-11-18 (`newspeak/EURASIA_ACTORS_DESIGN_2026-11-17.md` section 8); platform correspondence (an object of the platform template crossing as the receiver's clone of it) would remove it.
 
-The other 444 tests have the same outcome on both VMs (2026-11-18), also
-under GC stress (`GC_STRESS=50`). 428 succeed on both; the 16 that
+- `ObjectMirrorTests>>testObjectMirrorEvaluate`: until M6 step 4. `ObjectMirror>>evaluate:` runs the expression in the mirrors' Simulator, which needs psoup's activation factory (`Activation class>>sender:…`) and, on Eurasia, the V5 Simulator (`newspeak/EURASIA_M6_REFLECTION_DESIGN_2026-11-18.md`).
+- `ObjectMirrorTests>>testObjectMirrorEvaluateEmpty`: the same.
+- `ObjectMirrorTests>>testObjectMirrorEvaluateWithScope`: the same.
+
+The other 492 tests have the same outcome on both VMs (2026-11-18), including
+the 48 others of psoup's `MirrorTesting`, also under GC stress
+(`GC_STRESS=50`). Of the 444 outside `MirrorTesting`, 428 succeed on both; the 16 that
 do not fail identically on both, with the same message:
 `FloatTests>>testFloatRaisedTo` (the test computes `8 ** 1 / 3`, which is
 `(8 ** 1) / 3`) and 15 `SingleActorTests`, which immediate-send `isPromise`

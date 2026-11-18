@@ -190,6 +190,11 @@ natives! {
     MethodHeaderPut = 150 / 1: "`Method>>header:` on an unfrozen method: sets its kind, access, argument and local counts from psoup's header word (see `Method>>header`).",
     MethodBytecode = 151 / 0: "`Method>>bytecode`: a copy of its V5 bytecode, a ByteArray.",
     MethodBytecodePut = 152 / 1: "`Method>>bytecode:` on an unfrozen method: a ByteArray of well-formed V5 instructions.",
+    VmAllInstancesOf = 153 / 1: "`vm allInstancesOf: c`: an Array of the live instances of exactly `c`, cohort-wide, in allocation order (after a full collection).",
+    ClosureCopiedAt = 154 / 2: "`copiedOf: closure at: i`: its ith copied value, from 1.",
+    ClosureCopiedAtPut = 155 / 3: "`copiedOf: closure at: i put: v`.",
+    ClosureInitialPc = 156 / 1: "`initialBCIOf: closure`: the bytecode position of its body, from 1.",
+    ClosureNumCopied = 157 / 1: "`numCopiedOf: closure`: the number of its copied values.",
     VmSpawn = 139 / 1: "`vm spawn: mixin`: a new actor running a clone of the platform template, with the mixin applied to Object (role 37) in its heap, enclosing object nil; answers a far reference to the new class (`actor-semantics.tex`, eq. `create-actor`).",
     VmPromiseSend = 138 / 2: "`vm promise: record send: {selector. resultRecord. arguments...}`: an eventual send to the promise (Route-Pending): queued in the record, at the end of its chain, until it settles; delivered at once if it has.",
     VmIsValue = 125 / 1: "`vm isValue:`: whether the object is a value (immediates, nil, booleans, strings, numbers, instances of value classes, classes with a value enclosing object).",
@@ -634,6 +639,8 @@ pub enum Outcome {
     /// `vm spawn:`: the interpreter creates the actor and applies the mixin
     /// in its heap.
     Spawn(Value),
+    /// `vm allInstancesOf:`: the interpreter collects, then answers them.
+    AllInstances(Value),
     /// `vm resolvePromise:with:` and `vm breakPromise:with:`: the
     /// interpreter settles the record and notifies its waiters.
     Settle {
@@ -1740,6 +1747,37 @@ pub fn invoke(
             Some(c) => Outcome::Answer(c.defining),
             None => Outcome::Fail(Reason::WrongKind(1)),
         },
+        Native::VmAllInstancesOf => Outcome::AllInstances(arg(0)),
+        Native::ClosureNumCopied => match ctx.heap.closure(arg(0)) {
+            Some(c) => Outcome::Answer(small(c.copied.len() as i64)),
+            None => Outcome::Fail(Reason::WrongKind(1)),
+        },
+        Native::ClosureInitialPc => match ctx.heap.closure(arg(0)) {
+            Some(c) => Outcome::Answer(small(i64::from(c.initial_ip) + 1)),
+            None => Outcome::Fail(Reason::WrongKind(1)),
+        },
+        Native::ClosureCopiedAt => {
+            let Some(c) = ctx.heap.closure(arg(0)) else {
+                return Outcome::Fail(Reason::WrongKind(1));
+            };
+            match small_index(arg(1)).filter(|&i| i >= 1 && i as usize <= c.copied.len()) {
+                Some(i) => Outcome::Answer(c.copied[i as usize - 1]),
+                None => Outcome::Fail(Reason::OutOfRange(2)),
+            }
+        }
+        Native::ClosureCopiedAtPut => {
+            let value = arg(2);
+            let Some(Body::Closure(c)) = ctx.heap.get_mut(arg(0)).map(|o| &mut o.body) else {
+                return Outcome::Fail(Reason::WrongKind(1));
+            };
+            match small_index(arg(1)).filter(|&i| i >= 1 && i as usize <= c.copied.len()) {
+                Some(i) => {
+                    c.copied[i as usize - 1] = value;
+                    Outcome::Answer(value)
+                }
+                None => Outcome::Fail(Reason::OutOfRange(2)),
+            }
+        }
         Native::VmWriteFile => {
             let (Some(bytes), Some(path)) =
                 (bytes_of(ctx.heap, arg(0)), ctx.heap.string_bytes(arg(1)))

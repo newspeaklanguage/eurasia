@@ -31,10 +31,11 @@ Eurasia is a new implementation, written in Rust; it contains no code from
 the Primordial Soup VM (psoup). Where it matches psoup's behaviour, it was
 written to match, not copied.
 
-The exception is the kernel and actors forks. kernel/fork-kernel.py and
-kernel/fork-actors.py derive Eurasia's kernel and actors modules from
-psoup's Newspeak sources, KernelForPrimordialSoup.ns and
-ActorsForPrimordialSoup.ns. To do that, they contain excerpts of those files
+The exception is the kernel, actors and mirrors forks. kernel/fork-kernel.py,
+kernel/fork-actors.py and kernel/fork-mirrors.py derive Eurasia's kernel,
+actors and mirrors modules from psoup's Newspeak sources,
+KernelForPrimordialSoup.ns, ActorsForPrimordialSoup.ns and
+MirrorsForPrimordialSoup.ns. To do that, they contain excerpts of those files
 verbatim (the text each edit matches) and in edited form (its
 replacement), and their output is a derivative of those files. That
 material is covered by psoup's license for its Newspeak sources:

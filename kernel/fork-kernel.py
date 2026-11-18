@@ -339,9 +339,15 @@ def main():
 			public _enclosingMixin <InstanceMixin | nil> (* Eurasia contract field 3. *)
 			public _slotNames (* Eurasia contract field 4. *)
 			public _classMixin (* Eurasia contract field 5: nil, this being a class-side mixin. *)
-			public _library (* Eurasia contract field 6: the mirror library's. *)
+			public _library (* Eurasia contract field 6: the mirror library's, here {the instance-side mixin}. *)
 		|
-	) (""")
+	) (
+		public _instanceMixin ^<InstanceMixin> = (
+			^nil = _library ifTrue: [ nil ] ifFalse: [ _library at: 1 ]
+		)
+		public _instanceMixin: m <InstanceMixin> = (
+			_library: {m. }
+		)""")
     t = replace(t, """			public _slots <Array[{Symbol. Boolean. Symbol}]>
 			public _nestedMixins <Array[InstanceMixin]>
 			public _applications <WeakArray>
@@ -350,25 +356,43 @@ def main():
 			public _primaryFactorySelector <Symbol>
 			public _headerSource <String>
 		|
-	) (""", """			public _slots (* Eurasia contract field 4: slot names. *)
+	) (""", """			public _slots <Array[{Symbol. Boolean. Symbol}]> (* Eurasia contract field 4: psoup's slot descriptions {name. isMutable. accessModifier}; the VM only counts them. *)
 			public _classMixin <ClassMixin> (* Eurasia contract field 5: the paired class-side mixin. *)
-			public _library (* Eurasia contract field 6: the mirror library's. *)
+			public _library (* Eurasia contract field 6: the mirror library's, here {nested mixins. access modifier. primary factory selector. header source}. *)
 		|
 	) (
 		public _accessModifier = (
 			^nil = _library ifTrue: [ #public ] ifFalse: [ _library at: 2 ]
 		)
+		public _accessModifier: a <Symbol> = (
+			library at: 2 put: a
+		)
 		public _applications = (
 			^nil
 		)
 		public _headerSource = (
-			^nil
+			^(nil = _library or: [ _library size < 4 ]) ifTrue: [ nil ] ifFalse: [ _library at: 4 ]
+		)
+		public _headerSource: s <String> = (
+			library at: 4 put: s
 		)
 		public _nestedMixins = (
 			^nil = _library ifTrue: [ {} ] ifFalse: [ _library at: 1 ]
 		)
+		public _nestedMixins: mixins <Array[InstanceMixin]> = (
+			library at: 1 put: mixins
+		)
 		public _primaryFactorySelector = (
 			^nil = _library ifTrue: [ nil ] ifFalse: [ _library at: 3 ]
+		)
+		public _primaryFactorySelector: s <Symbol> = (
+			library at: 3 put: s
+		)
+		library = (
+			(* Eurasia: the library field of a mixin being built, made on first use. *)
+
+			nil = _library ifTrue: [ _library: {{}. #public. nil. nil. } ].
+			^_library
 		)""")
 
     # 12. Runtime class creation (nested-class accessors, mixin

@@ -1107,6 +1107,27 @@ impl Vm {
                 self.finished_turn = Some(wakeup);
                 Ok(None)
             }
+            Outcome::AllInstances(class) => {
+                // Only live instances: a collection first, at this safepoint,
+                // with the class rooted on the stack.
+                self.stack.push(class);
+                self.collect_garbage();
+                let class = self.stack.pop().expect("pushed");
+                let instances: Vec<Value> = self
+                    .heap
+                    .iter()
+                    .filter(|(_, o)| o.header.class == class)
+                    .map(|(v, _)| v)
+                    .collect();
+                let array_class = self.roles.get(Role::ArrayClass);
+                let answer = self.heap.allocate(
+                    array_class,
+                    Space::Actor(self.current as u32),
+                    Body::Array(instances),
+                );
+                self.stack.push(answer);
+                Ok(None)
+            }
             Outcome::Collect => {
                 // A safepoint: the receiver is back on the stack first.
                 self.stack.push(receiver);
