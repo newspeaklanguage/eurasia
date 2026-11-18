@@ -18,7 +18,7 @@ use core::cmp::Ordering;
 
 use crate::bigint::BigInt;
 use crate::host::Host;
-use crate::object::{Body, FROZEN, Heap, Space};
+use crate::object::{Behavior, Body, FROZEN, Heap, Space};
 use crate::roles::{Role, Roles};
 use crate::value::{SmallInteger, Value};
 
@@ -97,7 +97,7 @@ natives! {
     FloatAdd = 40 / 1: "`Float>>+`; otherwise `addFromFloat:`.",
     FloatSubtract = 41 / 1: "`Float>>-`; otherwise `subtractFromFloat:`.",
     FloatMultiply = 42 / 1: "`Float>>*`; otherwise `multiplyFromFloat:`.",
-    FloatDivide = 43 / 1: "`Float>>/`; otherwise `divideFromFloat:`.",
+    FloatDivide = 43 / 1: "`Float>>/`; otherwise `divideFromNumber:`, as psoup's `Number>>/`.",
     FloatFloor = 44 / 0: "`Float>>floor`.",
     FloatCeiling = 45 / 0: "`Float>>ceiling`.",
     FloatRounded = 46 / 0: "`Float>>rounded`: half away from zero.",
@@ -162,6 +162,65 @@ natives! {
     VmPerformWith = 119 / 3: "`vm object:perform:with:`: an ordinary send, whatever the receiver overrides.",
     VmGarbageCollect = 120 / 0: "`vm garbageCollect`: nothing until the collector (M3).",
     VmMonotonicNanos = 121 / 0: "`vm monotonicNanos` (input).",
+    VmApplyMixin = 122 / 4: "`vm applyMixin:classMixin:superclass:enclosingObject:`: a new class and its metaclass.",
+}
+
+/// `vm applyMixin: m classMixin: cm superclass: s enclosingObject: eo`
+/// (operation list, section 6; formal semantics, mixin application): a new
+/// class applying `m` to `s`, named after `m`, and its metaclass applying
+/// `cm`. The metaclass's superclass is that of `s`'s metaclass and its class
+/// is `s`'s metaclass's class, so the new pair follows the image's own
+/// convention (in the genesis kernel, every metaclass's superclass is
+/// `Class`). Nothing is installed: the pair is ordinary heap objects, and
+/// instances get their layout from the mixins along the chain.
+fn apply_mixin(m: Value, cm: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Outcome {
+    let Some(name) = ctx.heap.mixin(m).map(|x| x.name) else {
+        return Outcome::Fail(Reason::WrongKind(1));
+    };
+    if ctx.heap.mixin(cm).is_none() {
+        return Outcome::Fail(Reason::WrongKind(2));
+    }
+    let Some(Body::Class(_)) = ctx.heap.get(s).map(|o| &o.body) else {
+        return Outcome::Fail(Reason::WrongKind(3));
+    };
+    let super_meta = ctx.heap.get(s).expect("class").header.class;
+    let Some(super_meta_object) = ctx.heap.get(super_meta) else {
+        return Outcome::Fail(Reason::WrongKind(3));
+    };
+    let metaclass_class = super_meta_object.header.class;
+    let Body::Metaclass(meta_behavior) = &super_meta_object.body else {
+        return Outcome::Fail(Reason::WrongKind(3));
+    };
+    let meta_super = meta_behavior.superclass;
+    let nil = ctx.nil();
+    let metaclass = ctx.heap.allocate(
+        metaclass_class,
+        Space::Actor(0),
+        Body::Metaclass(Behavior {
+            mixin: cm,
+            superclass: meta_super,
+            enclosing_object: eo,
+            name: nil,
+            this_class: nil,
+            library: nil,
+        }),
+    );
+    let class = ctx.heap.allocate(
+        metaclass,
+        Space::Actor(0),
+        Body::Class(Behavior {
+            mixin: m,
+            superclass: s,
+            enclosing_object: eo,
+            name,
+            this_class: nil,
+            library: nil,
+        }),
+    );
+    if let Some(Body::Metaclass(b)) = ctx.heap.get_mut(metaclass).map(|o| &mut o.body) {
+        b.this_class = class;
+    }
+    Outcome::Answer(class)
 }
 
 /// The largest shift `<<` performs; beyond it the result would exhaust
@@ -422,18 +481,14 @@ fn float_arithmetic(
     arg: Value,
     op: fn(f64, f64) -> f64,
     tail: &'static str,
-    divides: bool,
 ) -> Outcome {
     let Some(a) = float_of(ctx.heap, receiver) else {
         return Outcome::Fail(Reason::WrongKind(0));
     };
     match number_of(ctx.heap, arg) {
         Some(b) => {
-            let b = as_f64(&b);
-            if divides && b == 0.0 {
-                return Outcome::Fail(Reason::ZeroDivide);
-            }
-            Outcome::Answer(ctx.float(op(a, b)))
+            // IEEE 754: a zero divisor gives an infinity or NaN, as in psoup.
+            Outcome::Answer(ctx.float(op(a, as_f64(&b))))
         }
         None => Outcome::TailSend {
             receiver: arg,
@@ -537,8 +592,15 @@ fn shift(ctx: &mut NativeContext<'_>, receiver: Value, arg: Value, left: bool) -
     let Some(a) = integer_of(ctx.heap, receiver) else {
         return Outcome::Fail(Reason::WrongKind(0));
     };
-    let Some(k) = arg.as_small_integer() else {
-        return Outcome::Fail(Reason::WrongKind(1));
+    let k = match arg.as_small_integer() {
+        Some(k) => k,
+        // A LargeInteger count: every bit shifts out to the right; to the
+        // left the result could not be represented.
+        None => match integer_of(ctx.heap, arg) {
+            Some(big) if big.is_negative() => return Outcome::Fail(Reason::OutOfRange(1)),
+            Some(_) => i64::MAX,
+            None => return Outcome::Fail(Reason::WrongKind(1)),
+        },
     };
     if k < 0 {
         return Outcome::Fail(Reason::OutOfRange(1));
@@ -556,8 +618,11 @@ fn shift(ctx: &mut NativeContext<'_>, receiver: Value, arg: Value, left: bool) -
     }
 }
 
-/// The shortest decimal that reads back as the same Float, with `.0` on
-/// integral values, and `NaN`, `Infinity`, `-Infinity`.
+/// The shortest decimal that reads back as the same Float, printed as psoup
+/// prints it (double-conversion's shortest form with JavaScript's limits):
+/// decimal notation, with `.0` on integral values, when the decimal
+/// exponent is from -6 to 20, otherwise `d.ddde+X`; and `NaN`, `Infinity`,
+/// `-Infinity`.
 pub fn float_to_string(f: f64) -> String {
     if f.is_nan() {
         return String::from("NaN");
@@ -565,7 +630,51 @@ pub fn float_to_string(f: f64) -> String {
     if f.is_infinite() {
         return String::from(if f > 0.0 { "Infinity" } else { "-Infinity" });
     }
-    format!("{f:?}")
+    let sign = if f.is_sign_negative() { "-" } else { "" };
+    // Rust's exponential form has the shortest round-tripping digits.
+    let e = format!("{:e}", f.abs());
+    let (mantissa, exponent) = e.split_once('e').expect("exponential form");
+    let exponent: i32 = exponent.parse().expect("exponent");
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let n = digits.len() as i32;
+    if (-6..21).contains(&exponent) {
+        if exponent < 0 {
+            let zeros = "0".repeat((-exponent - 1) as usize);
+            format!("{sign}0.{zeros}{digits}")
+        } else if n <= exponent + 1 {
+            let zeros = "0".repeat((exponent + 1 - n) as usize);
+            format!("{sign}{digits}{zeros}.0")
+        } else {
+            let (int, frac) = digits.split_at(exponent as usize + 1);
+            format!("{sign}{int}.{frac}")
+        }
+    } else {
+        let (first, rest) = digits.split_at(1);
+        let point = if rest.is_empty() { "" } else { "." };
+        let exponent_sign = if exponent < 0 { "-" } else { "+" };
+        format!(
+            "{sign}{first}{point}{rest}e{exponent_sign}{}",
+            exponent.abs()
+        )
+    }
+}
+
+/// `Float parse:`: decimal and exponential notation, `NaN`, `Infinity` and
+/// `-Infinity`, as psoup accepts them; not Rust's other spellings
+/// (`inf`, `nan`, any case).
+fn parse_float(s: &str) -> Option<f64> {
+    match s {
+        "NaN" => return Some(f64::NAN),
+        "Infinity" | "+Infinity" => return Some(f64::INFINITY),
+        "-Infinity" => return Some(f64::NEG_INFINITY),
+        _ => {}
+    }
+    if s.bytes()
+        .any(|b| !(b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E')))
+    {
+        return None;
+    }
+    s.parse().ok()
 }
 
 fn float_unary(ctx: &mut NativeContext<'_>, receiver: Value, f: fn(f64) -> f64) -> Outcome {
@@ -585,24 +694,40 @@ fn float_to_integer(ctx: &mut NativeContext<'_>, receiver: Value, f: fn(f64) -> 
     }
 }
 
+/// `asStringFixed:`, `asStringExponential:` and `asStringPrecision:`, as
+/// JavaScript's `toFixed`, `toExponential` and `toPrecision` (psoup's
+/// behaviour): the digit count must be in `range`.
 fn float_format(
     ctx: &mut NativeContext<'_>,
     receiver: Value,
     arg: Value,
+    range: core::ops::RangeInclusive<i64>,
+    large_is_shortest: bool,
     format: fn(f64, usize) -> String,
 ) -> Outcome {
     let Some(x) = float_of(ctx.heap, receiver) else {
         return Outcome::Fail(Reason::WrongKind(0));
     };
-    let Some(digits) = arg.as_small_integer().filter(|d| (0..=100).contains(d)) else {
+    // Operation list 3.1: any unusable digit count is #outOfRange: 1.
+    let Some(digits) = arg.as_small_integer().filter(|d| range.contains(d)) else {
         return Outcome::Fail(Reason::OutOfRange(1));
     };
-    if !x.is_finite() {
+    // JavaScript prints non-finite values, and toFixed values of 1e21 and
+    // beyond, as their shortest form.
+    if !x.is_finite() || (large_is_shortest && x.abs() >= 1e21) {
         let s = float_to_string(x);
         return Outcome::Answer(ctx.new_string(&s));
     }
     let s = format(x, digits as usize);
     Outcome::Answer(ctx.new_string(&s))
+}
+
+/// JavaScript's exponent: `3e0` becomes `3e+0`; `3e-1` stays.
+fn signed_exponent(s: String) -> String {
+    match s.find('e') {
+        Some(i) if !s[i + 1..].starts_with('-') => format!("{}e+{}", &s[..i], &s[i + 1..]),
+        _ => s,
+    }
 }
 
 /// The bytes of a String or ByteArray.
@@ -692,8 +817,14 @@ fn range(
     Ok(a as usize - 1..b as usize)
 }
 
+/// The one-based position of `needle` in `haystack`, searching forward from,
+/// or (`last`) backward from, the zero-based position `from`; 0 when absent.
+/// An empty needle is found at `from` itself, as in psoup.
 fn find(haystack: &[u8], needle: &[u8], from: usize, last: bool) -> usize {
-    if needle.is_empty() || needle.len() > haystack.len() {
+    if needle.is_empty() {
+        return from + 1;
+    }
+    if needle.len() > haystack.len() {
         return 0;
     }
     let positions = 0..=haystack.len() - needle.len();
@@ -843,33 +974,16 @@ pub fn invoke(
             Some(c) => Outcome::Answer(small(i64::from(c.num_args))),
             None => Outcome::Fail(Reason::WrongKind(0)),
         },
-        Native::FloatAdd => {
-            float_arithmetic(ctx, receiver, arg(0), |a, b| a + b, "addFromFloat:", false)
+        Native::FloatAdd => float_arithmetic(ctx, receiver, arg(0), |a, b| a + b, "addFromFloat:"),
+        Native::FloatSubtract => {
+            float_arithmetic(ctx, receiver, arg(0), |a, b| a - b, "subtractFromFloat:")
         }
-        Native::FloatSubtract => float_arithmetic(
-            ctx,
-            receiver,
-            arg(0),
-            |a, b| a - b,
-            "subtractFromFloat:",
-            false,
-        ),
-        Native::FloatMultiply => float_arithmetic(
-            ctx,
-            receiver,
-            arg(0),
-            |a, b| a * b,
-            "multiplyFromFloat:",
-            false,
-        ),
-        Native::FloatDivide => float_arithmetic(
-            ctx,
-            receiver,
-            arg(0),
-            |a, b| a / b,
-            "divideFromFloat:",
-            true,
-        ),
+        Native::FloatMultiply => {
+            float_arithmetic(ctx, receiver, arg(0), |a, b| a * b, "multiplyFromFloat:")
+        }
+        Native::FloatDivide => {
+            float_arithmetic(ctx, receiver, arg(0), |a, b| a / b, "divideFromNumber:")
+        }
         Native::FloatFloor => float_to_integer(ctx, receiver, libm::floor),
         Native::FloatCeiling => float_to_integer(ctx, receiver, libm::ceil),
         Native::FloatRounded => float_to_integer(ctx, receiver, libm::round),
@@ -897,34 +1011,38 @@ pub fn invoke(
             };
             Outcome::Answer(ctx.float(r))
         }
-        Native::FloatAsStringFixed => {
-            float_format(ctx, receiver, arg(0), |x, d| format!("{x:.d$}"))
-        }
-        Native::FloatAsStringExponential => {
-            float_format(ctx, receiver, arg(0), |x, d| format!("{x:.d$e}"))
-        }
-        Native::FloatAsStringPrecision => float_format(ctx, receiver, arg(0), |x, d| {
-            let d = d.max(1);
-            let e = format!("{x:.p$e}", p = d - 1);
-            let exponent: i32 = e
-                .rsplit('e')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            if exponent < -6 || exponent >= d as i32 {
-                e
-            } else {
-                let decimals = (d as i32 - 1 - exponent).max(0) as usize;
-                format!("{x:.decimals$}")
-            }
+        Native::FloatAsStringFixed => float_format(ctx, receiver, arg(0), 0..=20, true, |x, d| {
+            format!("{x:.d$}")
         }),
+        Native::FloatAsStringExponential => {
+            float_format(ctx, receiver, arg(0), 0..=20, false, |x, d| {
+                signed_exponent(format!("{x:.d$e}"))
+            })
+        }
+        Native::FloatAsStringPrecision => {
+            float_format(ctx, receiver, arg(0), 1..=21, false, |x, d| {
+                let d = d.max(1);
+                let e = format!("{x:.p$e}", p = d - 1);
+                let exponent: i32 = e
+                    .rsplit('e')
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if exponent < -6 || exponent >= d as i32 {
+                    signed_exponent(e)
+                } else {
+                    let decimals = (d as i32 - 1 - exponent).max(0) as usize;
+                    format!("{x:.decimals$}")
+                }
+            })
+        }
         Native::FloatParse => {
             let Some(b) = ctx.heap.string_bytes(arg(0)) else {
                 return Outcome::Fail(Reason::WrongKind(1));
             };
             match core::str::from_utf8(b)
                 .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok())
+                .and_then(|s| parse_float(s.trim()))
             {
                 Some(f) => Outcome::Answer(ctx.float(f)),
                 None => Outcome::Fail(Reason::WrongKind(1)),
@@ -1309,6 +1427,7 @@ pub fn invoke(
             None => Outcome::Answer(arg(0)),
         },
         Native::VmInstantiate => invoke(Native::ClassBasicNew, arg(0), &[], ctx),
+        Native::VmApplyMixin => apply_mixin(arg(0), arg(1), arg(2), arg(3), ctx),
         Native::VmIsCanonical => {
             let frozen = match ctx.heap.get(arg(0)) {
                 Some(o) => o.header.flags & FROZEN != 0,

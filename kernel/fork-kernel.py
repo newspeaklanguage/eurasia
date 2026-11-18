@@ -60,6 +60,7 @@ def main():
 		private simulationRootMethod
 		private dispatchMethod
 		private application
+		private reportingUnhandled
 	|""")
 
     # 4. Marker primitives become method identity.
@@ -140,6 +141,11 @@ def main():
 		(* Until actors (M4): print the exception and a stack trace, then exit. *)
 
 		| a |
+		nil = reportingUnhandled ifFalse: [
+				vm print: 'Unhandled exception while reporting an unhandled exception'.
+				vm exit: 2
+			].
+		reportingUnhandled:: true.
 		vm print: 'Unhandled exception: ' , exception printString.
 		a:: activation.
 		[ nil = a ] whileFalse: [
@@ -149,10 +155,16 @@ def main():
 		vm exit: 1
 	)
 	traceLineFor: activation = (
-		| method |
+		(* Contract field 4 is a class's name, or a metaclass's class. *)
+
+		| method name |
 		method:: activation method.
 		nil = method ifTrue: [ ^'?' ].
-		^(nameOrQuestionMark: (vm slotOf: (vm classOf: activation receiver) at: 4)) , '>>' , (vm slotOf: method at: 3)
+		name:: vm slotOf: (vm classOf: activation receiver) at: 4.
+		(nil = name or: [ name isKindOfString ]) ifFalse: [
+				name:: (nameOrQuestionMark: (vm slotOf: name at: 4)) , ' class'
+			].
+		^(nameOrQuestionMark: name) , '>>' , (vm slotOf: method at: 3)
 	)
 	nameOrQuestionMark: name = (
 		^nil = name ifTrue: [ '?' ] ifFalse: [ name ]
@@ -184,6 +196,8 @@ def main():
 		(* The VM mirror. Every method here is replaced by a native from the genesis packager's table; the bodies are never run. *)
 
 	) (
+		public applyMixin: mixin classMixin: classMixin superclass: superclass enclosingObject: enclosingObject = (
+		)
 		public classOf: object = (
 		)
 		public currentActivation = (
@@ -301,23 +315,75 @@ def main():
 		|
 	) (
 		public _accessModifier = (
-			^#public
+			^nil = _library ifTrue: [ #public ] ifFalse: [ _library at: 3 ]
 		)
 		public _applications = (
 			^nil
 		)
 		public _classMixin = (
-			^nil
+			^nil = _library ifTrue: [ nil ] ifFalse: [ _library at: 1 ]
 		)
 		public _headerSource = (
 			^nil
 		)
 		public _nestedMixins = (
-			^{}
+			^nil = _library ifTrue: [ {} ] ifFalse: [ _library at: 2 ]
 		)
 		public _primaryFactorySelector = (
-			^nil
+			^nil = _library ifTrue: [ nil ] ifFalse: [ _library at: 4 ]
 		)""")
+
+    # 12. Runtime class creation (nested-class accessors, mixin
+    #     applications): the VM creates the class and its metaclass from the
+    #     two mixins (`vm applyMixin:classMixin:superclass:enclosingObject:`).
+    #     The genesis packager keeps the class mixin, the nested mixins, the
+    #     access modifier and the factory selector in the instance mixin's
+    #     library field ({class mixin. nested. access. factory}). Accessors
+    #     need no per-application copies: their slot indices are relative to
+    #     their mixin. psoup's bookkeeping of applications and subclasses
+    #     (weak sets) is dropped until the mirrors (M6). As in psoup, the
+    #     classes whose instances are not regular objects cannot be
+    #     subclassed. Natives go only on the `...Again:` methods that psoup
+    #     keeps for the primitive alone, since a failing Eurasia native
+    #     signals instead of running the method body.
+    start = t.index("\t\tpublic apply: superclass <Class> format: f withName: name <Symbol> enclosingObject: eo <Object> = (")
+    end = t.index("\n\t\t)\n", start) + len("\n\t\t)\n")
+    t = t[:start] + """		public apply: superclass <Class> format: f withName: name <Symbol> enclosingObject: eo <Object> = (
+			^vm applyMixin: self classMixin: _classMixin superclass: superclass enclosingObject: eo
+		)
+""" + t[end:]
+    t = replace(t, """			cid:: slotOf: object at: 5.
+			nil = cid ifTrue: [ ^true ].
+			^(cid between: 3 and: 13) not""", """			(* Eurasia: psoup's class ids 3-13, the classes whose instances are not regular objects. *)
+			^({_Array. ByteArray. String. WeakArray. Ephemeron. Float. SmallInteger. MediumInteger. LargeInteger. Closure. Activation. } includes: object) not""")
+    t = replace(t, """			^self apply: superclass
+				format: (formatOf: superclass)""", """			^self apply: superclass
+				format: 0""")
+    t = replace(t, """	public main: v args: args = (""", """	public eurasiaInternalKernel = (
+		(* The kernel module, for the application, which is packaged as if nested here: it builds the platform's public modules over it. *)
+
+		^self
+	)
+	public main: v args: args = (""")
+
+    # 13. Float division. psoup's Number>>/ primitive divided floats, so its
+    #     Float has no / and no divideFromNumber:. Eurasia's FloatDivide
+    #     native goes on a Float>>/ that, like Number>>/, falls back to the
+    #     argument's divideFromNumber:; an Integer divided by a Float reaches
+    #     Float>>divideFromNumber: through Integer>>/.
+    t = replace(t, """			^x subtractFromFloat: self
+		)
+""", """			^x subtractFromFloat: self
+		)
+		public / other <Number> ^<Number> = (
+			(* Eurasia: the FloatDivide native; this body is not run. *)
+
+			^other divideFromNumber: self
+		)
+		public divideFromNumber: left <Number> ^<Float> = (
+			^left asFloat / self
+		)
+""")
 
     open(output, "w").write(t)
     print(f"fork-kernel: wrote {output}")

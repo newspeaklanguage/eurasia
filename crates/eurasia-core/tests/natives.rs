@@ -287,11 +287,20 @@ fn floats_are_libm_and_print_shortest() {
             "{x} rounded"
         );
     }
+    // IEEE division (operation list 3.1; psoup agrees): no failure on zero.
     let zero = w.float(0.0);
-    assert_eq!(
-        w.fails(Native::FloatDivide, one, &[zero]),
-        Reason::ZeroDivide
-    );
+    let infinity = w.answer(Native::FloatDivide, one, &[zero]);
+    assert_eq!(w.show(infinity), "Infinity");
+    let big = w.float(f64::MAX);
+    assert_eq!(w.show(big), "1.7976931348623157e+308");
+    let small = w.float(1.5e-7);
+    assert_eq!(w.show(small), "1.5e-7");
+    let tiny = w.float(1.5e-6);
+    assert_eq!(w.show(tiny), "0.0000015");
+    let e20 = w.float(1e20);
+    assert_eq!(w.show(e20), "100000000000000000000.0");
+    let e21 = w.float(1e21);
+    assert_eq!(w.show(e21), "1e+21");
     let huge = w.float(1e20);
     let n = w.answer(Native::NumberAsInteger, huge, &[]);
     assert_eq!(w.show(n), "100000000000000000000");
