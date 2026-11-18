@@ -112,6 +112,7 @@ VMMirror	instance	object:perform:with:	VmPerformWith	119
 VMMirror	instance	garbageCollect	VmGarbageCollect	120
 VMMirror	instance	monotonicNanos	VmMonotonicNanos	121
 VMMirror	instance	applyMixin:superclass:enclosingObject:	VmApplyMixin	122
+VMMirror	instance	isValue:	VmIsValue	125
 VMMirror	instance	currentActivation	CurrentActivation	100
 VMMirror	instance	definingActivationOf:	DefiningActivationOf	110
 VMMirror	instance	print:	VmPrint	20

@@ -1,6 +1,6 @@
 # Eurasia snapshot format
 
-**Status:** Draft, format version 2. Written before the code (implementation
+**Status:** Draft, format version 3. Written before the code (implementation
 plan M0); the packager (Newspeak) and `eurasia-snapshot` (Rust) are tested
 against each other.
 
@@ -32,7 +32,7 @@ psoup groups objects by class instead, which loses that order.
 | Field | Type | Meaning |
 |---|---|---|
 | magic | `bytes(4)` | `EURA` (0x45 0x55 0x52 0x41) |
-| format version | `u16` | This document: 2 (2026-11-17: mixins gained the class-side mixin field) |
+| format version | `u16` | This document: 3 (2026-11-17: version 2 gave mixins the class-side mixin field, version 3 the value flag bits and the Value role) |
 | kernel version | `u16` | Must equal the VM's `KERNEL_VERSION` |
 | bytecode version | `u16` | Must equal the VM's `BYTECODE_VERSION` |
 | word size | `u8` | Always 64 |
@@ -85,7 +85,7 @@ cycles need no special handling.
 |---|---|---|
 | sequence delta | `uv` | Sequence number minus the previous node's in the same section (the section's first node's is absolute). Gaps are objects in other spaces, or collected before the save. |
 | kind | `u8` | Below |
-| flags | `u8` | Bit 0: frozen (installed or canonical). Others reserved. |
+| flags | `u8` | Bit 0: frozen (installed or canonical). Bit 1: a value (deeply immutable; actors may share it). Bit 2: on a class, a value class (its instances are values). Others reserved. |
 | shape | depends on kind | Below |
 
 | Kind | Name | Shape in the node record | Edge record |
@@ -151,9 +151,9 @@ Role ids for kernel version 1 (the operation list, section 2):
 | 12 | Ephemeron class | 29 | common-selector array (V5 opcodes 176–207) |
 | 13 | Closure class | 30 | Message class |
 | 14 | Activation class | 31 | VM mirror (its class carries the kernel operations) |
-| 15 | Method class | 32 | entry object (M1: sent `main:args:` with the VM mirror and an Array of argument Strings; the message loop replaces it in M4) |
+| 15 | Method class | 32 | entry object (sent `main:args:` with the VM mirror and an Array of argument Strings when the message loop is nil) |
 | 16 | Expat class | 33 | Alien class |
-| 17 | message loop | | |
+| 17 | message loop (when not nil, the VM starts the image by sending it `dispatchMessage:port:`) | 34 | Value class (its subclasses are value classes) |
 
 Every role must be present. Unknown role ids are an error.
 

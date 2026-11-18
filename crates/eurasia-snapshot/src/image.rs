@@ -9,7 +9,7 @@ use core::fmt;
 
 use eurasia_core::Value;
 use eurasia_core::object::{
-    Access, Activation, Behavior, Body, Closure, FROZEN, Heap, HeapError, Method, MethodHeader,
+    Access, Activation, Behavior, Body, Closure, FLAGS, Heap, HeapError, Method, MethodHeader,
     MethodKind, Mixin, Object, Space,
 };
 use eurasia_core::roles::{Role, Roles, RolesError};
@@ -454,7 +454,7 @@ pub fn read_image(bytes: &[u8]) -> Result<(Heap, Roles), LoadError> {
 fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, Body), LoadError> {
     let kind = r.u8()?;
     let flags = r.u8()?;
-    if flags & !FROZEN != 0 {
+    if flags & !FLAGS != 0 {
         return Err(LoadError::UnknownFlags { node, flags });
     }
     let len = |r: &mut Reader<'_>| -> Result<usize, LoadError> {

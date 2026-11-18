@@ -25,6 +25,17 @@ pub enum Space {
 
 /// Object flag: frozen (installed, or canonical). Writes to it fail.
 pub const FROZEN: u8 = 1;
+/// Object flag: a value (`actor-semantics.tex`, the value predicate): deeply
+/// immutable, so actors may share it. Strings, floats and large integers
+/// are values from allocation; so are nil, true and false, an instance of a
+/// value class, and a class whose enclosing object is a value.
+pub const VALUE: u8 = 2;
+/// Class flag: a value class, one whose superclass chain includes the Value
+/// role (decided 2026-11-17, `EURASIA_ACTORS_DESIGN_2026-11-17.md` section
+/// 5). Its instances are values.
+pub const VALUE_CLASS: u8 = 4;
+/// Every defined flag (snapshot format, section 5).
+pub const FLAGS: u8 = FROZEN | VALUE | VALUE_CLASS;
 
 /// The fields every object has.
 #[derive(Clone, Debug)]
@@ -264,11 +275,24 @@ impl Heap {
         self.next_seq
     }
 
-    /// Allocates an object with the next sequence number.
+    /// Allocates an object with the next sequence number. Strings, floats
+    /// and large integers are values from the start.
     pub fn allocate(&mut self, class: Value, space: Space, body: Body) -> Value {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.push(seq, class, 0, space, body)
+        let flags = match body {
+            Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => VALUE,
+            _ => 0,
+        };
+        self.push(seq, class, flags, space, body)
+    }
+
+    /// Whether `v` is a value: an immediate, or an object with [`VALUE`].
+    pub fn is_value(&self, v: Value) -> bool {
+        match self.get(v) {
+            Some(o) => o.header.flags & VALUE != 0,
+            None => true,
+        }
     }
 
     /// Adds an object with a given sequence number, as a snapshot loader does.

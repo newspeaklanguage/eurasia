@@ -205,6 +205,8 @@ def main():
 	) (
 		public applyMixin: mixin superclass: superclass enclosingObject: enclosingObject = (
 		)
+		public isValue: object = (
+		)
 		public classOf: object = (
 		)
 		public currentActivation = (
@@ -389,6 +391,26 @@ def main():
 		)
 		public divideFromNumber: left <Number> ^<Float> = (
 			^left asFloat / self
+		)
+""")
+
+    # 14. Values (EURASIA_ACTORS_DESIGN_2026-11-17.md section 5): the Value
+    #     class of the language spec, the superclass of all values, which the
+    #     VM knows as a role; and an accessor on _Object so that any code can
+    #     name it, as psoup's kernel exposes Array.
+    anchor = "\tpublic class WeakArray _cannotInstantiate = Collection new ("
+    t = replace(t, anchor, """	public class Value new = (
+		(* The superclass of all values (language spec): a class whose superclass chain includes Value is a value class, whose instances the VM keeps deeply immutable (Eurasia, EURASIA_ACTORS_DESIGN_2026-11-17.md section 5). *)
+
+	) (
+	) : ()
+""" + anchor)
+    t = replace(t, """			^outer EurasiaKernel _Array
+		)
+""", """			^outer EurasiaKernel _Array
+		)
+		Value ^<Value class> = (
+			^outer EurasiaKernel Value
 		)
 """)
 

@@ -18,7 +18,7 @@ use core::cmp::Ordering;
 
 use crate::bigint::BigInt;
 use crate::host::Host;
-use crate::object::{Behavior, Body, FROZEN, Heap, Space};
+use crate::object::{Behavior, Body, FROZEN, Heap, Space, VALUE, VALUE_CLASS};
 use crate::roles::{Role, Roles};
 use crate::value::{SmallInteger, Value};
 
@@ -162,6 +162,8 @@ natives! {
     VmPerformWith = 119 / 3: "`vm object:perform:with:`: an ordinary send, whatever the receiver overrides.",
     VmGarbageCollect = 120 / 0: "`vm garbageCollect`: a full collection; answers the receiver.",
     VmMonotonicNanos = 121 / 0: "`vm monotonicNanos` (input).",
+    VmIsValue = 125 / 1: "`vm isValue:`: whether the object is a value (immediates, nil, booleans, strings, numbers, instances of value classes, classes with a value enclosing object).",
+    SlotStore = 124 / 1: "Not a native: the failure of a slot setter, for a frozen receiver or a non-value stored into a value.",
     VmFinishTurn = 123 / 1: "`MessageLoop>>finish:`: ends the turn; the argument is the next timer's monotonic time in nanoseconds, or 0 for none.",
     VmApplyMixin = 122 / 3: "`vm applyMixin:superclass:enclosingObject:`: a new class and its metaclass.",
 }
@@ -194,6 +196,23 @@ fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Outcom
         return Outcome::Fail(Reason::WrongKind(2));
     };
     let meta_super = meta_behavior.superclass;
+    // A value class: the superclass is one (its chain includes Value). Its
+    // enclosing object must be a value, and its mixin may declare no mutable
+    // slot (a setter other than the private init` ones) (design doc section
+    // 5: the checks happen at mixin application until the spec lets the
+    // compiler know value classes).
+    let value_class = ctx.heap.get(s).expect("class").header.flags & VALUE_CLASS != 0
+        || s == ctx.roles.get(Role::ValueClass);
+    if value_class {
+        if !ctx.is_value(eo) {
+            return Outcome::Fail(Reason::WrongKind(3));
+        }
+        if has_mutable_slot(ctx.heap, m) {
+            return Outcome::Fail(Reason::WrongKind(1));
+        }
+    }
+    let class_flags =
+        (if ctx.is_value(eo) { VALUE } else { 0 }) | (if value_class { VALUE_CLASS } else { 0 });
     let nil = ctx.nil();
     let metaclass = ctx.heap.allocate(
         metaclass_class,
@@ -222,7 +241,28 @@ fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Outcom
     if let Some(Body::Metaclass(b)) = ctx.heap.get_mut(metaclass).map(|o| &mut o.body) {
         b.this_class = class;
     }
+    // A class (and its metaclass) whose enclosing object is a value is one.
+    ctx.heap.get_mut(class).expect("class").header.flags |= class_flags;
+    ctx.heap.get_mut(metaclass).expect("metaclass").header.flags |= class_flags & VALUE;
     Outcome::Answer(class)
+}
+
+/// Whether mixin `m` declares a mutable slot: it has a setter other than the
+/// private `init` ones that initializers use, and the nested-class cache
+/// setters (`` X`slot: ``), which memoize a class; that class is a value when
+/// its enclosing object, the value being checked, is one.
+fn has_mutable_slot(heap: &Heap, m: Value) -> bool {
+    let Some(methods) = heap.mixin(m).and_then(|x| heap.array_elements(x.methods)) else {
+        return false;
+    };
+    methods.iter().any(|&method| {
+        heap.method(method).is_some_and(|record| {
+            record.header.kind == crate::object::MethodKind::Setter
+                && !heap
+                    .string_bytes(record.selector)
+                    .is_some_and(|s| s.starts_with(b"init`") || s.ends_with(b"`slot:"))
+        })
+    })
 }
 
 /// The largest shift `<<` performs; beyond it the result would exhaust
@@ -379,6 +419,15 @@ impl NativeContext<'_> {
 
     fn boolean(&self, b: bool) -> Value {
         self.roles.get(if b { Role::True } else { Role::False })
+    }
+
+    /// Whether `v` is a value: an immediate, nil, true, false, or an object
+    /// with the value bit.
+    pub fn is_value(&self, v: Value) -> bool {
+        v == self.nil()
+            || v == self.roles.get(Role::True)
+            || v == self.roles.get(Role::False)
+            || self.heap.is_value(v)
     }
 
     fn nil(&self) -> Value {
@@ -1087,11 +1136,23 @@ pub fn invoke(
             match instance_slots(ctx.heap, ctx.roles, receiver) {
                 Some(n) => {
                     let nil = ctx.nil();
-                    Outcome::Answer(ctx.heap.allocate(
+                    let instance = ctx.heap.allocate(
                         receiver,
                         Space::Actor(0),
                         Body::Regular(alloc::vec![nil; n]),
-                    ))
+                    );
+                    // An instance of a value class is a value from allocation;
+                    // its init setters check what it is given (the end of
+                    // construction is not marked yet: design doc section 5).
+                    if ctx
+                        .heap
+                        .get(receiver)
+                        .map(|o| o.header.flags & VALUE_CLASS != 0)
+                        == Some(true)
+                    {
+                        ctx.heap.get_mut(instance).expect("new").header.flags |= VALUE;
+                    }
+                    Outcome::Answer(instance)
                 }
                 None => Outcome::Fail(Reason::NotInstantiable),
             }
@@ -1409,7 +1470,7 @@ pub fn invoke(
             let Some(o) = ctx.heap.get_mut(object) else {
                 return Outcome::Fail(Reason::WrongKind(1));
             };
-            if o.header.flags & FROZEN != 0 {
+            if o.header.flags & (FROZEN | VALUE) != 0 {
                 return Outcome::Fail(Reason::WrongKind(1));
             }
             let slot = match &mut o.body {
@@ -1475,6 +1536,9 @@ pub fn invoke(
             }
         }
         Native::VmGarbageCollect => Outcome::Collect,
+        Native::VmIsValue => Outcome::Answer(ctx.boolean(ctx.is_value(arg(0)))),
+        // Never installed: the interpreter reports refused slot stores with it.
+        Native::SlotStore => Outcome::Fail(Reason::WrongKind(0)),
         Native::VmFinishTurn => match arg(0).as_small_integer() {
             Some(t) if t >= 0 => Outcome::FinishTurn(t as u64),
             Some(_) => Outcome::Fail(Reason::OutOfRange(1)),

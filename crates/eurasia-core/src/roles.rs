@@ -72,6 +72,7 @@ roles! {
     VmMirror = 31: "The VM mirror: its class carries the kernel operations.",
     Entry = 32: "The entry object; M1 sends it main:args: (until the message loop, M4).",
     AlienClass = 33: "The Alien class.",
+    ValueClass = 34: "The Value class: classes whose chain includes it are value classes.",
 }
 
 /// A complete assignment of values to roles.

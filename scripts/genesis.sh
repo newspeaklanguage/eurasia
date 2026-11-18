@@ -16,7 +16,7 @@ OUT=$EURASIA/target/genesis
 mkdir -p "$OUT"
 # The application's modules: psoup's public kernel, collections and actors,
 # and the platform over them.
-MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $PRIMORDIALSOUP/newspeak/ActorsForPrimordialSoup.ns $NEWSPEAK/EurasiaRuntime.ns"
+MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $PRIMORDIALSOUP/newspeak/ActorsForPrimordialSoup.ns $NEWSPEAK/EurasiaRuntime.ns $NEWSPEAK/EurasiaValueProbe.ns"
 
 echo "== building EurasiaPackager.vfuel"
 (cd "$PRIMORDIALSOUP" && ./out/ReleaseX64/primordialsoup ./out/snapshots/WebCompiler.vfuel \
@@ -41,7 +41,9 @@ ls -l "$OUT/base.eus"
 echo "== running the base image"
 "$EURASIA_BIN" "$OUT/base.eus" | tee "$OUT/output.txt"
 expected=$(printf '%s\n' 7 1267650600228229401496703205376 'instance of _Array' abcdef 42 \
-  'caught DNU' 'NumberFloorDivide failed: zeroDivide' 'start body ensure' 42 done 'eventually 42')
+  'caught DNU' 'NumberFloorDivide failed: zeroDivide' 'start body ensure' 42 \
+  'values: true true true false' 'VmApplyMixin failed: wrongKind 1' 'SlotStore failed: wrongKind 1' \
+  'VmApplyMixin failed: wrongKind 3' done 'eventually 42')
 if [ "$(cat "$OUT/output.txt")" != "$expected" ]; then
   echo "Unexpected output from the base image."; exit 1
 fi

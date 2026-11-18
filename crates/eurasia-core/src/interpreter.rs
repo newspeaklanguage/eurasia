@@ -26,7 +26,7 @@ use crate::bytecode::{SendKind, instruction_length, op};
 use crate::gc;
 use crate::host::Host;
 use crate::natives::{self, Native, NativeContext, Outcome, Reason};
-use crate::object::{Access, Body, FROZEN, Heap, MethodKind, Space};
+use crate::object::{Access, Body, FROZEN, Heap, MethodKind, Space, VALUE};
 use crate::roles::{Role, Roles};
 use crate::value::Value;
 
@@ -644,6 +644,29 @@ impl Vm {
                 let receiver = self.stack[base];
                 let value = self.stack[base + 1];
                 let index = self.slot_index(method, receiver, header.slot)?;
+                // A frozen object is never written; a value only by its init
+                // setters, and only with values (design doc section 5).
+                let flags = self.heap.get(receiver).map_or(0, |o| o.header.flags);
+                let refusal = if flags & FROZEN != 0 {
+                    Some(Reason::WrongKind(0))
+                } else if flags & VALUE != 0 && !self.is_value(value) {
+                    Some(Reason::WrongKind(1))
+                } else {
+                    None
+                };
+                if let Some(reason) = refusal {
+                    let failure = self.new_failure(
+                        Native::SlotStore,
+                        receiver,
+                        alloc::vec![value],
+                        reason,
+                        host,
+                    );
+                    self.stack.truncate(base);
+                    self.stack.push(failure);
+                    let signal = self.symbol("signal");
+                    return self.ordinary_send(signal, 0, host);
+                }
                 match self.heap.get_mut(receiver).map(|o| &mut o.body) {
                     Some(Body::Regular(slots)) if index < slots.len() => {
                         slots[index] = value;
@@ -1112,6 +1135,14 @@ impl Vm {
     /// The failure object of `eq:native-failure-reification`: an instance of
     /// the failure class with slots native name, receiver, arguments, reason
     /// and reason argument. No user code runs.
+    /// Whether `v` is a value (see [`NativeContext::is_value`]).
+    fn is_value(&self, v: Value) -> bool {
+        v == self.nil()
+            || v == self.roles.get(Role::True)
+            || v == self.roles.get(Role::False)
+            || self.heap.is_value(v)
+    }
+
     fn new_failure(
         &mut self,
         native: Native,
