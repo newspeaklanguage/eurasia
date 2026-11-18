@@ -179,6 +179,9 @@ impl ImageBuilder {
         let name_string = self.string(name);
         let mixin = self.new_mixin(name_string, self.nil);
         let meta_mixin = self.new_mixin(name_string, self.nil);
+        if let Some(Body::Mixin(m)) = self.heap.get_mut(mixin).map(|o| &mut o.body) {
+            m.class_mixin = meta_mixin;
+        }
         let meta_super = if superclass == self.nil {
             self.nil
         } else {
@@ -235,6 +238,7 @@ impl ImageBuilder {
                 enclosing_mixin: enclosing,
                 slot_names,
                 slot_count: 0,
+                class_mixin: self.nil,
                 library: self.nil,
             }),
         );

@@ -162,34 +162,35 @@ natives! {
     VmPerformWith = 119 / 3: "`vm object:perform:with:`: an ordinary send, whatever the receiver overrides.",
     VmGarbageCollect = 120 / 0: "`vm garbageCollect`: nothing until the collector (M3).",
     VmMonotonicNanos = 121 / 0: "`vm monotonicNanos` (input).",
-    VmApplyMixin = 122 / 4: "`vm applyMixin:classMixin:superclass:enclosingObject:`: a new class and its metaclass.",
+    VmApplyMixin = 122 / 3: "`vm applyMixin:superclass:enclosingObject:`: a new class and its metaclass.",
 }
 
-/// `vm applyMixin: m classMixin: cm superclass: s enclosingObject: eo`
-/// (operation list, section 6; formal semantics, mixin application): a new
-/// class applying `m` to `s`, named after `m`, and its metaclass applying
-/// `cm`. The metaclass's superclass is that of `s`'s metaclass and its class
+/// `vm applyMixin: m superclass: s enclosingObject: eo` (operation list,
+/// section 6; formal semantics, mixin application): a new class applying
+/// the instance-side mixin `m` to `s`, named after `m`, and its metaclass
+/// applying `m`'s class-side mixin (a contract field of `m`). The metaclass's superclass is that of `s`'s metaclass and its class
 /// is `s`'s metaclass's class, so the new pair follows the image's own
 /// convention (in the genesis kernel, every metaclass's superclass is
 /// `Class`). Nothing is installed: the pair is ordinary heap objects, and
 /// instances get their layout from the mixins along the chain.
-fn apply_mixin(m: Value, cm: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Outcome {
-    let Some(name) = ctx.heap.mixin(m).map(|x| x.name) else {
+fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Outcome {
+    // An instance-side mixin: one whose class-side mixin is a mixin.
+    let Some((name, cm)) = ctx.heap.mixin(m).map(|x| (x.name, x.class_mixin)) else {
         return Outcome::Fail(Reason::WrongKind(1));
     };
     if ctx.heap.mixin(cm).is_none() {
-        return Outcome::Fail(Reason::WrongKind(2));
+        return Outcome::Fail(Reason::WrongKind(1));
     }
     let Some(Body::Class(_)) = ctx.heap.get(s).map(|o| &o.body) else {
-        return Outcome::Fail(Reason::WrongKind(3));
+        return Outcome::Fail(Reason::WrongKind(2));
     };
     let super_meta = ctx.heap.get(s).expect("class").header.class;
     let Some(super_meta_object) = ctx.heap.get(super_meta) else {
-        return Outcome::Fail(Reason::WrongKind(3));
+        return Outcome::Fail(Reason::WrongKind(2));
     };
     let metaclass_class = super_meta_object.header.class;
     let Body::Metaclass(meta_behavior) = &super_meta_object.body else {
-        return Outcome::Fail(Reason::WrongKind(3));
+        return Outcome::Fail(Reason::WrongKind(2));
     };
     let meta_super = meta_behavior.superclass;
     let nil = ctx.nil();
@@ -762,6 +763,7 @@ pub(crate) fn readable_fields(body: &Body) -> Option<Vec<Value>> {
             m.methods,
             m.enclosing_mixin,
             m.slot_names,
+            m.class_mixin,
             m.library
         ],
         Body::Method(m) => alloc::vec![m.literals, m.mixin, m.selector, m.source, m.library],
@@ -1427,7 +1429,7 @@ pub fn invoke(
             None => Outcome::Answer(arg(0)),
         },
         Native::VmInstantiate => invoke(Native::ClassBasicNew, arg(0), &[], ctx),
-        Native::VmApplyMixin => apply_mixin(arg(0), arg(1), arg(2), arg(3), ctx),
+        Native::VmApplyMixin => apply_mixin(arg(0), arg(1), arg(2), ctx),
         Native::VmIsCanonical => {
             let frozen = match ctx.heap.get(arg(0)) {
                 Some(o) => o.header.flags & FROZEN != 0,

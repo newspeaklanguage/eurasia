@@ -1,6 +1,6 @@
 # Eurasia snapshot format
 
-**Status:** Draft, format version 1. Written before the code (implementation
+**Status:** Draft, format version 2. Written before the code (implementation
 plan M0); the packager (Newspeak) and `eurasia-snapshot` (Rust) are tested
 against each other.
 
@@ -32,7 +32,7 @@ psoup groups objects by class instead, which loses that order.
 | Field | Type | Meaning |
 |---|---|---|
 | magic | `bytes(4)` | `EURA` (0x45 0x55 0x52 0x41) |
-| format version | `u16` | This document: 1 |
+| format version | `u16` | This document: 2 (2026-11-17: mixins gained the class-side mixin field) |
 | kernel version | `u16` | Must equal the VM's `KERNEL_VERSION` |
 | bytecode version | `u16` | Must equal the VM's `BYTECODE_VERSION` |
 | word size | `u8` | Always 64 |
@@ -99,7 +99,7 @@ cycles need no special handling.
 | 7 | float | `bytes(8)`, IEEE 754 binary64, little-endian, NaN canonical | class value |
 | 8 | large integer | `u8` sign (0 or 1), `uv` length, `bytes(length)` magnitude, little-endian | class value |
 | 9 | method | header (section 6), `uv` bytecode length, `bytes(length)` | class value, literals array, mixin, selector, source, library field |
-| 10 | mixin | `uv` slot-declaration count | class value, name, methods array, enclosing mixin, slot-declaration names array, library field |
+| 10 | mixin | `uv` slot-declaration count | class value, name, methods array, enclosing mixin, slot-declaration names array, class-side mixin (nil for a class-side mixin), library field |
 | 11 | class | none | class value (its metaclass), mixin, superclass, enclosing object, name, library field |
 | 12 | metaclass | none | class value, mixin, superclass, enclosing object, this class, library field |
 | 13 | closure | `uv` initial bytecode index, `uv` argument count, `uv` copied count | class value, defining activation, then the copied values |

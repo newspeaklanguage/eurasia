@@ -290,6 +290,7 @@ fn write_edges(w: &mut Writer, o: &Object, to_node: &dyn Fn(Value) -> Value) {
             m.methods,
             m.enclosing_mixin,
             m.slot_names,
+            m.class_mixin,
             m.library,
         ]
         .into_iter()
@@ -550,6 +551,7 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
             slot_names: p,
             slot_count: u32::try_from(r.uv()?)
                 .map_err(|_| LoadError::UnknownKind { node, kind })?,
+            class_mixin: p,
             library: p,
         }),
         KIND_CLASS | KIND_METACLASS => {
@@ -595,7 +597,8 @@ fn edge_count(body: &Body) -> usize {
     1 + match body {
         Body::Regular(e) | Body::Array(e) | Body::WeakArray(e) => e.len(),
         Body::Ephemeron { .. } => 3,
-        Body::Method(_) | Body::Mixin(_) | Body::Class(_) | Body::Metaclass(_) => 5,
+        Body::Mixin(_) => 6,
+        Body::Method(_) | Body::Class(_) | Body::Metaclass(_) => 5,
         Body::Closure(c) => 1 + c.copied.len(),
         Body::Activation(_) => 3,
         Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => 0,
@@ -640,7 +643,8 @@ fn fill_body(
             methods: resolve(e[1])?,
             enclosing_mixin: resolve(e[2])?,
             slot_names: resolve(e[3])?,
-            library: resolve(e[4])?,
+            class_mixin: resolve(e[4])?,
+            library: resolve(e[5])?,
             ..m
         }),
         Body::Class(_) => Body::Class(Behavior {

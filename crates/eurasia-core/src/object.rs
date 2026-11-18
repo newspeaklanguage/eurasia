@@ -114,6 +114,9 @@ pub struct Mixin {
     pub slot_names: Value,
     /// The number of slot declarations.
     pub slot_count: u32,
+    /// For an instance-side mixin, its paired class-side mixin; nil for a
+    /// class-side mixin.
+    pub class_mixin: Value,
     /// The mirror library's field; the VM never reads it.
     pub library: Value,
 }

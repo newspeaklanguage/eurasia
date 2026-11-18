@@ -196,7 +196,7 @@ def main():
 		(* The VM mirror. Every method here is replaced by a native from the genesis packager's table; the bodies are never run. *)
 
 	) (
-		public applyMixin: mixin classMixin: classMixin superclass: superclass enclosingObject: enclosingObject = (
+		public applyMixin: mixin superclass: superclass enclosingObject: enclosingObject = (
 		)
 		public classOf: object = (
 		)
@@ -245,10 +245,10 @@ def main():
     #     the contract field at that position (Behavior: mixin, superclass,
     #     enclosing object; Class: name, library; Metaclass: this class,
     #     library; Method: literals, mixin, selector, source, library; mixins:
-    #     name, methods, enclosing mixin, slot names, library). psoup-only
-    #     fields become accessors answering neutral values: they serve runtime
-    #     class creation and reflective method decoding, which arrive with the
-    #     mirrors (M6).
+    #     name, methods, enclosing mixin, slot names, class-side mixin,
+    #     library). psoup-only fields become accessors answering neutral
+    #     values until the mirrors (M6), except those runtime class creation
+    #     needs (step 12).
     t = replace(t, """			private superclass <Behavior> (* Must be slot 1, known to the VM. *)
 			private methods <Array[Method]> (* Must be slot 2, known to the VM. *)
 			private enclosingObject <Object> (* Must be slot 3, known to the VM. *)
@@ -299,7 +299,8 @@ def main():
 			public _methods <Array[Method]> (* Eurasia contract field 2. *)
 			public _enclosingMixin <InstanceMixin | nil> (* Eurasia contract field 3. *)
 			public _slotNames (* Eurasia contract field 4. *)
-			public _library (* Eurasia contract field 5: the mirror library's. *)
+			public _classMixin (* Eurasia contract field 5: nil, this being a class-side mixin. *)
+			public _library (* Eurasia contract field 6: the mirror library's. *)
 		|
 	) (""")
     t = replace(t, """			public _slots <Array[{Symbol. Boolean. Symbol}]>
@@ -311,34 +312,33 @@ def main():
 			public _headerSource <String>
 		|
 	) (""", """			public _slots (* Eurasia contract field 4: slot names. *)
-			public _library (* Eurasia contract field 5: the mirror library's. *)
+			public _classMixin <ClassMixin> (* Eurasia contract field 5: the paired class-side mixin. *)
+			public _library (* Eurasia contract field 6: the mirror library's. *)
 		|
 	) (
 		public _accessModifier = (
-			^nil = _library ifTrue: [ #public ] ifFalse: [ _library at: 3 ]
+			^nil = _library ifTrue: [ #public ] ifFalse: [ _library at: 2 ]
 		)
 		public _applications = (
 			^nil
-		)
-		public _classMixin = (
-			^nil = _library ifTrue: [ nil ] ifFalse: [ _library at: 1 ]
 		)
 		public _headerSource = (
 			^nil
 		)
 		public _nestedMixins = (
-			^nil = _library ifTrue: [ {} ] ifFalse: [ _library at: 2 ]
+			^nil = _library ifTrue: [ {} ] ifFalse: [ _library at: 1 ]
 		)
 		public _primaryFactorySelector = (
-			^nil = _library ifTrue: [ nil ] ifFalse: [ _library at: 4 ]
+			^nil = _library ifTrue: [ nil ] ifFalse: [ _library at: 3 ]
 		)""")
 
     # 12. Runtime class creation (nested-class accessors, mixin
     #     applications): the VM creates the class and its metaclass from the
-    #     two mixins (`vm applyMixin:classMixin:superclass:enclosingObject:`).
-    #     The genesis packager keeps the class mixin, the nested mixins, the
-    #     access modifier and the factory selector in the instance mixin's
-    #     library field ({class mixin. nested. access. factory}). Accessors
+    #     instance mixin and its class-side mixin, a contract field
+    #     (`vm applyMixin:superclass:enclosingObject:`). The genesis packager
+    #     keeps the nested mixins, the access modifier and the factory
+    #     selector in the instance mixin's library field ({nested. access.
+    #     factory}). Accessors
     #     need no per-application copies: their slot indices are relative to
     #     their mixin. psoup's bookkeeping of applications and subclasses
     #     (weak sets) is dropped until the mirrors (M6). As in psoup, the
@@ -349,7 +349,7 @@ def main():
     start = t.index("\t\tpublic apply: superclass <Class> format: f withName: name <Symbol> enclosingObject: eo <Object> = (")
     end = t.index("\n\t\t)\n", start) + len("\n\t\t)\n")
     t = t[:start] + """		public apply: superclass <Class> format: f withName: name <Symbol> enclosingObject: eo <Object> = (
-			^vm applyMixin: self classMixin: _classMixin superclass: superclass enclosingObject: eo
+			^vm applyMixin: self superclass: superclass enclosingObject: eo
 		)
 """ + t[end:]
     t = replace(t, """			cid:: slotOf: object at: 5.
