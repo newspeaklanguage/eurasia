@@ -130,7 +130,13 @@ pub struct Vm {
     symbols: BTreeMap<&'static str, Value>,
     step_limit: Option<u64>,
     next_serial: u64,
+    snapshot_writer: Option<SnapshotWriter>,
 }
+
+/// Serializes a heap and its roles (the snapshot format's writer). The core
+/// cannot depend on `eurasia-snapshot`, which depends on it, so the embedder
+/// supplies the writer; `vm snapshot` fails with `unsupported` without one.
+pub type SnapshotWriter = fn(&Heap, &Roles) -> Vec<u8>;
 
 impl Vm {
     /// A VM over a loaded heap.
@@ -143,7 +149,13 @@ impl Vm {
             symbols: BTreeMap::new(),
             step_limit: None,
             next_serial: 0,
+            snapshot_writer: None,
         }
+    }
+
+    /// Supplies the snapshot writer that `vm snapshot` uses.
+    pub fn set_snapshot_writer(&mut self, writer: SnapshotWriter) {
+        self.snapshot_writer = Some(writer);
     }
 
     /// Limits a run to `limit` instructions; `None` (the default) is no
@@ -565,6 +577,29 @@ impl Vm {
                 self.ordinary_send(signal, 0, host)
             }
             Outcome::Exit(code) => Ok(Some(Completion::Exited(code))),
+            Outcome::Snapshot => match self.snapshot_writer {
+                Some(write) => {
+                    let bytes = write(&self.heap, &self.roles);
+                    let class = self.roles.get(Role::ByteArrayClass);
+                    let v = self
+                        .heap
+                        .allocate(class, Space::Actor(0), Body::Bytes(bytes));
+                    self.stack.push(v);
+                    Ok(None)
+                }
+                None => {
+                    let failure =
+                        self.new_failure(native, receiver, args, Reason::Unsupported, host);
+                    self.stack.push(failure);
+                    let signal = self.symbol("signal");
+                    self.ordinary_send(signal, 0, host)
+                }
+            },
+            Outcome::SetRole { role, value } => {
+                self.roles.set(role, value);
+                self.stack.push(receiver);
+                Ok(None)
+            }
             Outcome::Perform {
                 receiver,
                 selector,

@@ -136,6 +136,10 @@ natives! {
     IndexOfStartingAt = 86 / 2: "`indexOf:startingAt:`: 0 if absent.",
     LastIndexOfStartingAt = 87 / 2: "`lastIndexOf:startingAt:`: 0 if absent.",
     ObjectPerformWithArguments = 89 / 2: "`Object>>perform:withArguments:`: an ordinary send.",
+    VmSnapshot = 90 / 0: "`vm snapshot`: the heap, saved without frames, as a ByteArray.",
+    VmWriteFile = 91 / 2: "`vm writeBytes:toFile:` (output; interim host operation).",
+    VmReadFile = 92 / 1: "`vm readFile:` (input; interim host operation).",
+    VmSetRole = 93 / 2: "`vm setRole:to:`: assign a role by its snapshot id.",
 }
 
 /// The largest shift `<<` performs; beyond it the result would exhaust
@@ -239,6 +243,15 @@ pub enum Outcome {
         closure: Value,
         /// Its arguments.
         args: Vec<Value>,
+    },
+    /// `vm snapshot`: the interpreter serializes the heap and answers it.
+    Snapshot,
+    /// `vm setRole:to:`: the interpreter assigns the role.
+    SetRole {
+        /// The role.
+        role: Role,
+        /// Its new value.
+        value: Value,
     },
     /// `perform:withArguments:`: an ordinary send whose selector is a
     /// String object. The arity has been checked.
@@ -1123,6 +1136,54 @@ pub fn invoke(
                 native == Native::LastIndexOfStartingAt,
             );
             Outcome::Answer(small(i as i64))
+        }
+        Native::VmSnapshot => Outcome::Snapshot,
+        Native::VmWriteFile => {
+            let (Some(bytes), Some(path)) =
+                (bytes_of(ctx.heap, arg(0)), ctx.heap.string_bytes(arg(1)))
+            else {
+                return Outcome::Fail(Reason::WrongKind(if bytes_of(ctx.heap, arg(0)).is_none() {
+                    1
+                } else {
+                    2
+                }));
+            };
+            let (bytes, path) = (bytes.to_vec(), String::from_utf8_lossy(path).into_owned());
+            match ctx.host.write_file(&path, &bytes) {
+                Ok(()) => Outcome::Answer(receiver),
+                Err(message) => {
+                    let m = ctx.new_string(&message);
+                    Outcome::Fail(Reason::Host(m))
+                }
+            }
+        }
+        Native::VmReadFile => {
+            let Some(path) = ctx.heap.string_bytes(arg(0)) else {
+                return Outcome::Fail(Reason::WrongKind(1));
+            };
+            let path = String::from_utf8_lossy(path).into_owned();
+            match ctx.host.read_file(&path) {
+                Ok(bytes) => {
+                    Outcome::Answer(ctx.new_bytes_object(Role::ByteArrayClass, Body::Bytes(bytes)))
+                }
+                Err(message) => {
+                    let m = ctx.new_string(&message);
+                    Outcome::Fail(Reason::Host(m))
+                }
+            }
+        }
+        Native::VmSetRole => {
+            let role = arg(0)
+                .as_small_integer()
+                .and_then(|id| u64::try_from(id).ok())
+                .and_then(Role::from_id);
+            match role {
+                Some(role) => Outcome::SetRole {
+                    role,
+                    value: arg(1),
+                },
+                None => Outcome::Fail(Reason::OutOfRange(1)),
+            }
         }
         Native::ObjectPerformWithArguments => {
             let selector = arg(0);

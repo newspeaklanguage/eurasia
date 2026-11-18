@@ -23,6 +23,6 @@ pub mod roles;
 pub mod value;
 pub mod version;
 
-pub use interpreter::{Completion, Vm, VmError};
+pub use interpreter::{Completion, SnapshotWriter, Vm, VmError};
 pub use value::{SmallInteger, Value};
 pub use version::{BYTECODE_VERSION, KERNEL_VERSION};

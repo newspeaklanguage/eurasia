@@ -26,4 +26,18 @@ pub trait Host {
 
     /// Input (`vm hostDescription`): a short description of the host.
     fn description(&self) -> &str;
+
+    /// Output (`vm writeBytes:toFile:`): write `bytes` to the file `path`.
+    /// An interim host operation until the FFI (M5) makes file I/O a library;
+    /// hosts without files keep the default, which refuses.
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), alloc::string::String> {
+        let _ = (path, bytes);
+        Err(alloc::string::String::from("this host has no files"))
+    }
+
+    /// Input (`vm readFile:`): the contents of the file `path`.
+    fn read_file(&mut self, path: &str) -> Result<alloc::vec::Vec<u8>, alloc::string::String> {
+        let _ = path;
+        Err(alloc::string::String::from("this host has no files"))
+    }
 }

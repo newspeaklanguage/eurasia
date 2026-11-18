@@ -114,6 +114,11 @@ impl Roles {
         self.values[role as usize - 1]
     }
 
+    /// Assigns `value` to `role` (the kernel operation `vm setRole:to:`).
+    pub fn set(&mut self, role: Role, value: Value) {
+        self.values[role as usize - 1] = value;
+    }
+
     /// Every (role, value) pair, in id order.
     pub fn pairs(&self) -> impl Iterator<Item = (Role, Value)> + '_ {
         Role::ALL.iter().map(move |&r| (r, self.get(r)))

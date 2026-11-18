@@ -15,7 +15,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use eurasia_core::host::Host;
 use eurasia_core::{BYTECODE_VERSION, Completion, KERNEL_VERSION, Vm};
-use eurasia_snapshot::{FORMAT_VERSION, read_image};
+use eurasia_snapshot::{FORMAT_VERSION, read_image, write_image};
 
 /// The command-line host: stdout, the system clocks, and the OS entropy
 /// source.
@@ -51,6 +51,14 @@ impl Host for CommandLineHost {
 
     fn description(&self) -> &str {
         std::env::consts::OS
+    }
+
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        std::fs::write(path, bytes).map_err(|e| format!("cannot write {path}: {e}"))
+    }
+
+    fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))
     }
 }
 
@@ -90,6 +98,7 @@ fn main() -> ExitCode {
     };
     let program_args: Vec<&str> = args[2..].iter().map(String::as_str).collect();
     let mut vm = Vm::new(heap, roles);
+    vm.set_snapshot_writer(write_image);
     let mut host = CommandLineHost {
         start: Instant::now(),
     };

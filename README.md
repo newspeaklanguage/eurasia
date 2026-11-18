@@ -66,7 +66,7 @@ with `cannotReturn:` and `aboutToReturn:through:`), activation handles,
 `nonBooleanReceiver:`, and the value-native catalog: SmallIntegers and
 LargeIntegers (in-house arbitrary precision), Floats (bundled `libm`, so
 bit-identical on every host), allocation, indexed access, copying, strings
-and `perform:withArguments:`. Next: saving an idle heap, the genesis kernel
+and `perform:withArguments:`. A running program can save the whole heap (`vm snapshot`, `vm writeBytes:toFile:`) and choose the saved image's entry (`vm setRole:to:`); running the saved image continues from the saved state. Next: the genesis kernel
 and packager, and differential tests against psoup
 ([docs/EXPECTED_DIFFERENCES.md](docs/EXPECTED_DIFFERENCES.md)). M1b is the packager
 (Newspeak, in the newspeak repository), which builds images from source.
