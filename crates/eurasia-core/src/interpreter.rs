@@ -59,8 +59,16 @@ pub enum VmError {
     RecursiveDoesNotUnderstand,
     /// A method header names an unknown native, or the wrong arity.
     BadNative(u32),
-    /// The frame stack exceeded [`MAX_FRAMES`].
-    StackExhausted,
+    /// The frame stack exceeded [`MAX_FRAMES`]; the selectors of the
+    /// innermost frames, innermost first.
+    StackExhausted(Vec<String>),
+    /// A getter or setter ran on an object without that slot.
+    BadSlotAccess {
+        /// The accessor's selector.
+        selector: String,
+        /// The receiver's class name, if it has one.
+        receiver_class: String,
+    },
     /// The step limit set by [`Vm::set_step_limit`] was reached.
     StepLimitReached,
     /// The image has no method for a VM upcall (named by its role).
@@ -80,7 +88,16 @@ impl fmt::Display for VmError {
             VmError::MixinApplicationNotFound => write!(f, "cannot find mixin application"),
             VmError::RecursiveDoesNotUnderstand => write!(f, "recursive #doesNotUnderstand:"),
             VmError::BadNative(id) => write!(f, "bad native method (catalog id {id})"),
-            VmError::StackExhausted => write!(f, "stack exhausted"),
+            VmError::StackExhausted(top) => {
+                write!(f, "stack exhausted; innermost frames: {}", top.join(" < "))
+            }
+            VmError::BadSlotAccess {
+                selector,
+                receiver_class,
+            } => write!(
+                f,
+                "accessor {selector} on an instance of {receiver_class}, which has no such slot"
+            ),
             VmError::StepLimitReached => write!(f, "step limit reached"),
             VmError::MissingUpcall(role) => write!(f, "the image has no method for {role}"),
         }
@@ -479,11 +496,16 @@ impl Vm {
             MethodKind::Getter => {
                 let receiver = self.stack[base];
                 let index = self.slot_index(method, receiver, header.slot)?;
+                // A contract object (class, metaclass, mixin, method) answers
+                // its contract field at that position, as `vm slotOf:at:` does.
                 let value = match self.heap.get(receiver).map(|o| &o.body) {
                     Some(Body::Regular(slots)) => slots.get(index).copied(),
-                    _ => None,
+                    Some(body) => {
+                        natives::readable_fields(body).and_then(|f| f.get(index).copied())
+                    }
+                    None => None,
                 }
-                .ok_or(VmError::Malformed("getter on an object without that slot"))?;
+                .ok_or_else(|| self.bad_slot_access(method, receiver))?;
                 self.stack.truncate(base);
                 self.stack.push(value);
                 Ok(None)
@@ -496,7 +518,7 @@ impl Vm {
                     Some(Body::Regular(slots)) if index < slots.len() => {
                         slots[index] = value;
                     }
-                    _ => return Err(VmError::Malformed("setter on an object without that slot")),
+                    _ => return Err(self.bad_slot_access(method, receiver)),
                 }
                 self.stack.truncate(base + 1);
                 Ok(None)
@@ -507,7 +529,7 @@ impl Vm {
             }
             MethodKind::Ordinary => {
                 if self.frames.len() >= MAX_FRAMES {
-                    return Err(VmError::StackExhausted);
+                    return Err(self.stack_exhausted());
                 }
                 let receiver = self.stack[base];
                 let lp = self.stack.len();
@@ -630,7 +652,7 @@ impl Vm {
     /// copied values become its first locals.
     fn activate_closure(&mut self, closure: Value, n: usize) -> Result<(), VmError> {
         if self.frames.len() >= MAX_FRAMES {
-            return Err(VmError::StackExhausted);
+            return Err(self.stack_exhausted());
         }
         let c = self
             .heap
@@ -936,18 +958,22 @@ impl Vm {
             };
             reason.argument(&mut ctx)
         };
+        // The five failure fields are the failure class's own last five
+        // slots, after any its superclasses declare (it is normally an
+        // Exception subclass).
         let class = self.roles.get(Role::FailureClass);
-        self.heap.allocate(
-            class,
-            Space::Actor(0),
-            Body::Regular(alloc::vec![
-                name,
-                receiver,
-                arguments,
-                reason_name,
-                reason_argument
-            ]),
-        )
+        let nil = self.nil();
+        let total = self.instance_slot_count(class).unwrap_or(5).max(5);
+        let mut slots = alloc::vec![nil; total];
+        slots[total - 5..].copy_from_slice(&[
+            name,
+            receiver,
+            arguments,
+            reason_name,
+            reason_argument,
+        ]);
+        self.heap
+            .allocate(class, Space::Actor(0), Body::Regular(slots))
     }
 
     // ----- Execution -----
@@ -965,6 +991,31 @@ impl Vm {
         VmError::Unimplemented {
             what,
             selector: self.method_selector(f.method),
+        }
+    }
+
+    fn stack_exhausted(&self) -> VmError {
+        VmError::StackExhausted(
+            self.frames
+                .iter()
+                .rev()
+                .take(24)
+                .map(|f| self.method_selector(f.method))
+                .collect(),
+        )
+    }
+
+    fn bad_slot_access(&self, method: Value, receiver: Value) -> VmError {
+        let class = self.class_of(receiver);
+        let receiver_class = self
+            .heap
+            .behavior(class)
+            .and_then(|b| self.heap.string_bytes(b.name))
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_else(|| String::from("?"));
+        VmError::BadSlotAccess {
+            selector: self.method_selector(method),
+            receiver_class,
         }
     }
 

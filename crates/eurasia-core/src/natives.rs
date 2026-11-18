@@ -616,7 +616,7 @@ fn bytes_of(heap: &Heap, v: Value) -> Option<&[u8]> {
 /// The fields `vm slotOf:at:` reads: a regular object's slots, an
 /// ephemeron's key, value and finalizer, or a contract object's fields in the
 /// snapshot format's edge order (format section 5).
-fn readable_fields(body: &Body) -> Option<Vec<Value>> {
+pub(crate) fn readable_fields(body: &Body) -> Option<Vec<Value>> {
     Some(match body {
         Body::Regular(slots) => slots.clone(),
         Body::Ephemeron {

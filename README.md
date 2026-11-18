@@ -66,7 +66,7 @@ with `cannotReturn:` and `aboutToReturn:through:`), activation handles,
 `nonBooleanReceiver:`, and the value-native catalog: SmallIntegers and
 LargeIntegers (in-house arbitrary precision), Floats (bundled `libm`, so
 bit-identical on every host), allocation, indexed access, copying, strings
-and `perform:withArguments:`. A running program can save the whole heap (`vm snapshot`, `vm writeBytes:toFile:`) and choose the saved image's entry (`vm setRole:to:`); running the saved image continues from the saved state. Next: the genesis kernel
+and `perform:withArguments:`. A running program can save the whole heap (`vm snapshot`, `vm writeBytes:toFile:`) and choose the saved image's entry (`vm setRole:to:`); running the saved image continues from the saved state. **Genesis works:** `scripts/genesis.sh` packages the kernel fork (`kernel/fork-kernel.py` derives it from psoup's kernel; `kernel/natives.tsv` maps its methods to natives) with a smoke-test application, runs genesis on Eurasia to save the base image, and checks the base image's output, including psoup's own exception handling and an unhandled-exception trace. Images are build artifacts, always recreatable from source; genesis is reproducible byte for byte, and the script checks it. Next: differential tests against psoup
 and packager, and differential tests against psoup
 ([docs/EXPECTED_DIFFERENCES.md](docs/EXPECTED_DIFFERENCES.md)). M1b is the packager
 (Newspeak, in the newspeak repository), which builds images from source.
