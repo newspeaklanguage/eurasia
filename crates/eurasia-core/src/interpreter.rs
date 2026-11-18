@@ -565,6 +565,16 @@ impl Vm {
                 self.ordinary_send(signal, 0, host)
             }
             Outcome::Exit(code) => Ok(Some(Completion::Exited(code))),
+            Outcome::Perform {
+                receiver,
+                selector,
+                args,
+            } => {
+                let count = args.len();
+                self.stack.push(receiver);
+                self.stack.extend(args);
+                self.ordinary_send(selector, count, host)
+            }
             Outcome::ActivateClosure { closure, args } => {
                 self.stack.push(closure);
                 let n = args.len();

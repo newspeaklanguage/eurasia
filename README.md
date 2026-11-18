@@ -61,9 +61,14 @@ M1b builds classes statically from the module's nested classes and does not
 run the module's initializer; how a module-structured kernel is instantiated
 on Eurasia is still open.
 
-Not yet (M2): closures, non-local return, `ensure:`/`on:do:`,
-`nonBooleanReceiver:`, LargeIntegers and the rest of the native catalog, and
-stack exhaustion as a failure rather than a VM error. M1b is the packager
+**M2 in progress.** Done: closures, non-local return (psoup's protocol,
+with `cannotReturn:` and `aboutToReturn:through:`), activation handles,
+`nonBooleanReceiver:`, and the value-native catalog: SmallIntegers and
+LargeIntegers (in-house arbitrary precision), Floats (bundled `libm`, so
+bit-identical on every host), allocation, indexed access, copying, strings
+and `perform:withArguments:`. Next: saving an idle heap, the genesis kernel
+and packager, and differential tests against psoup
+([docs/EXPECTED_DIFFERENCES.md](docs/EXPECTED_DIFFERENCES.md)). M1b is the packager
 (Newspeak, in the newspeak repository), which builds images from source.
 
 ## License

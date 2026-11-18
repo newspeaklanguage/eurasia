@@ -266,3 +266,27 @@ fn accessor_slots_are_relative_to_their_mixin() {
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(host.printed, ["30"]);
 }
+
+#[test]
+fn perform_with_arguments_is_an_ordinary_send() {
+    // vm print: (3 perform: '+' withArguments: {4}) asString
+    let mut a = Assembler::new();
+    a.push_parameter(VM)
+        .push_integer(3)
+        .push_literal(2)
+        .push_integer(4)
+        .byte(op::PUSH_NEW_ARRAY_WITH_ELEMENTS)
+        .byte(1)
+        .send(SendKind::Ordinary, 3, 2)
+        .send(SendKind::Ordinary, 1, 0)
+        .send(SendKind::Ordinary, 0, 1)
+        .byte(op::RETURN_NIL);
+    let (result, printed) = run_main(
+        kernel(),
+        0,
+        a.finish(),
+        &["print:", "asString", "+", "perform:withArguments:"],
+    );
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(printed, ["7"]);
+}

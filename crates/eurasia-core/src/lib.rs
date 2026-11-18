@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+pub mod bigint;
 pub mod builder;
 pub mod bytecode;
 pub mod host;

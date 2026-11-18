@@ -76,6 +76,12 @@ pub fn kernel() -> Kernel {
         Access::Public,
         MethodSpec::Native(Native::StringSize),
     );
+    b.method(
+        object,
+        "perform:withArguments:",
+        Access::Public,
+        MethodSpec::Native(Native::ObjectPerformWithArguments),
+    );
     let closure = b.role(Role::ClosureClass).unwrap();
     for (selector, native) in [
         ("value", Native::ClosureValue),

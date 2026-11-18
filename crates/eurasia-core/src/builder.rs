@@ -94,6 +94,10 @@ impl ImageBuilder {
         let string = b.define_class("String", b.object);
         let array = b.define_class("Array", b.object);
         let message = b.define_class("Message", b.object);
+        let float = b.define_class("Float", b.object);
+        let large_integer = b.define_class("LargeInteger", b.object);
+        let byte_array = b.define_class("ByteArray", b.object);
+        let weak_array = b.define_class("WeakArray", b.object);
         let closure = b.define_class("Closure", b.object);
         let activation = b.define_class("Activation", b.object);
         b.roles.extend([
@@ -104,6 +108,10 @@ impl ImageBuilder {
             (Role::StringClass, string),
             (Role::ArrayClass, array),
             (Role::MessageClass, message),
+            (Role::FloatClass, float),
+            (Role::LargeIntegerClass, large_integer),
+            (Role::ByteArrayClass, byte_array),
+            (Role::WeakArrayClass, weak_array),
             (Role::ClosureClass, closure),
             (Role::ActivationClass, activation),
         ]);
