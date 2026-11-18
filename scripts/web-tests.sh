@@ -41,15 +41,15 @@ cat "$OUT/kernel-wasm-stats.txt"
 grep -q "eurasia: [1-9][0-9]* timer waits" "$OUT/kernel-wasm-stats.txt" \
   || { echo "the kernel tests never waited for a timer"; exit 1; }
 
-echo "== the JS FFI: psoup's JSTesting on wasm"
+echo "== the JS FFI and callbacks: JSTesting and EurasiaHostTesting on wasm"
 # psoup's native VM cannot run these (a failing JS primitive halts it), so
 # they are not in the differential kernel tests: the kernel test runner is
-# packaged with JSTesting too, and every JS test must succeed on wasm except
+# packaged with JSTesting and EurasiaHostTesting (callbacks), and every JS test must succeed on wasm except
 # those docs/EXPECTED_DIFFERENCES.md lists under "JS tests on wasm".
 NEWSPEAK=${NEWSPEAK:-$EURASIA/../newspeak}
 PRIMORDIALSOUP=${PRIMORDIALSOUP:-$EURASIA/../primordialsoup}
 P=$PRIMORDIALSOUP/newspeak
-JSMODULES="$P/Kernel.ns $P/CollectionsForPrimordialSoup.ns $NEWSPEAK/EurasiaActors.ns $NEWSPEAK/EurasiaRuntime.ns $P/Minitest.ns $P/JSTesting.ns"
+JSMODULES="$P/Kernel.ns $P/CollectionsForPrimordialSoup.ns $NEWSPEAK/EurasiaActors.ns $NEWSPEAK/EurasiaRuntime.ns $P/Minitest.ns $P/JSTesting.ns $NEWSPEAK/EurasiaHostTesting.ns"
 mkdir -p "$OUT/js"
 # shellcheck disable=SC2086
 "$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel \
@@ -59,9 +59,9 @@ mkdir -p "$OUT/js"
 node web/run-node.mjs "$WASM" "$OUT/js/base.eus" > "$OUT/js/output.txt" || true
 cat "$OUT/js/output.txt"
 tail -1 "$OUT/js/output.txt" | grep -qx done || { echo "the JS tests did not finish on wasm"; exit 1; }
-grep '^JSTests>>' "$OUT/js/output.txt" | grep -v ' success$' | awk '{ print $1 }' | sort > "$OUT/js/failing.txt" || true
+grep -E '^(JSTests|CallbackTests)>>' "$OUT/js/output.txt" | grep -v ' success$' | awk '{ print $1 }' | sort > "$OUT/js/failing.txt" || true
 sed -n '/^## JS tests on wasm/,/^## /p' docs/EXPECTED_DIFFERENCES.md | grep -o '^- `[^`]*`' | tr -d '`-' | tr -d ' ' | sort > "$OUT/js/expected.txt" || true
-[ "$(grep -c '^JSTests>>' "$OUT/js/output.txt")" -ge 7 ] || { echo "the JS tests did not run"; exit 1; }
+[ "$(grep -cE '^(JSTests|CallbackTests)>>' "$OUT/js/output.txt")" -ge 16 ] || { echo "the JS tests did not run"; exit 1; }
 if ! cmp -s "$OUT/js/failing.txt" "$OUT/js/expected.txt"; then
   echo "JS tests not succeeding, against those expected:"; diff "$OUT/js/failing.txt" "$OUT/js/expected.txt" || true; exit 1
 fi

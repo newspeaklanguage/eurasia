@@ -29,6 +29,27 @@ pub enum HostValue {
     String(alloc::string::String),
     /// Any other host object: an index into the host's table.
     Ref(u32),
+    /// To the host only: a Newspeak closure as a host-callable function, by
+    /// its index in the VM's expat table. Calling it calls
+    /// [`HostCallbacks::callback`].
+    Expat(u32),
+}
+
+/// Calling back into the VM from the host (design doc section 4). The host
+/// gets this during a host operation, for callbacks that arrive while the
+/// operation runs (sub-steps of the current turn); a host whose event loop
+/// calls an expat while the VM is idle calls the VM's own implementation.
+pub trait HostCallbacks {
+    /// Runs expat `expat` with `args` and answers its result. Extra
+    /// arguments are dropped and missing ones are nil. An exception in the
+    /// callback, a non-local return out of it, too deep a nesting, or a dead
+    /// expat fail it, and the host caller sees a host exception.
+    fn callback(
+        &mut self,
+        host: &mut dyn Host,
+        expat: u32,
+        args: &[HostValue],
+    ) -> Result<HostValue, HostError>;
 }
 
 /// The reference to the host's global object.
@@ -95,15 +116,16 @@ pub trait Host {
     }
 
     /// Input and output (operation list, section 10): a host-object
-    /// operation on the object `receiver` refers to. The default host has
-    /// none.
+    /// operation on the object `receiver` refers to. Callbacks into the VM
+    /// while it runs go through `callbacks`. The default host has none.
     fn host_operation(
         &mut self,
         op: HostOp,
         receiver: u32,
         args: &[HostValue],
+        callbacks: &mut dyn HostCallbacks,
     ) -> Result<HostValue, HostError> {
-        let _ = (op, receiver, args);
+        let _ = (op, receiver, args, callbacks);
         Err(HostError::Unsupported)
     }
 

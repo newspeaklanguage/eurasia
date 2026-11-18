@@ -20,8 +20,31 @@ const FAILED = -1;
 // 0 undefined, 1 null, 2 Boolean, 3 number, 4 string, 5 reference, 6 the
 // host raised (the payload describes the exception), 7 a dead reference.
 // The table only grows, as psoup's does; reclaiming it is open.
-function hostObjects(bytesAt, decoder, encoder) {
+//
+// A Newspeak closure crosses as an expat: a function that calls the VM
+// (eurasia_callback), which reads the call's arguments (cb_arg_count,
+// cb_arg) and stages its result, or a description of its failure, which the
+// function throws. `link` gives the VM's exports, counts the VM calls under
+// way (depth), and resumes the VM after a callback that came while it was
+// idle (afterIdleCallback), so that the sends it queued run.
+function hostObjects(bytesAt, decoder, encoder, link) {
   const refs = [undefined, globalThis];
+  let callArguments = [];
+  const expat = (id) => function (...args) {
+    callArguments = args;
+    const idle = link.depth === 0;
+    link.depth += 1;
+    let status;
+    try {
+      status = link.exports.eurasia_callback(id);
+    } finally {
+      link.depth -= 1;
+    }
+    const result = staged.pop();
+    if (idle) link.afterIdleCallback();
+    if (status !== 0) throw new Error(result);
+    return result;
+  };
   let staged = [];
   let number = 0;
   let string = new Uint8Array(0);
@@ -52,6 +75,9 @@ function hostObjects(bytesAt, decoder, encoder) {
     ffi_arg_number: (x) => { staged.push(x); },
     ffi_arg_string: (ptr, len) => { staged.push(decoder.decode(bytesAt(ptr, len))); },
     ffi_arg_ref: (r) => { staged.push(refs[r]); },
+    ffi_arg_expat: (id) => { staged.push(expat(id)); },
+    cb_arg_count: () => callArguments.length,
+    cb_arg: (i) => answer(callArguments[i]),
     ffi_perform: (op, receiver) => {
       const args = staged;
       staged = [];
@@ -76,6 +102,7 @@ function hostObjects(bytesAt, decoder, encoder) {
 // a VM failure rejects it with an Error.
 export async function run(wasm, snapshot, { print = console.log } = {}) {
   let memory = null;
+  const link = { exports: null, depth: 0, afterIdleCallback: () => {} };
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const bytesAt = (ptr, len) => new Uint8Array(memory.buffer, ptr, len);
@@ -85,19 +112,35 @@ export async function run(wasm, snapshot, { print = console.log } = {}) {
       monotonic_nanos: () => Math.floor(performance.now() * 1e6),
       utc_nanos: () => Date.now() * 1e6,
       random_bytes: (ptr, len) => crypto.getRandomValues(bytesAt(ptr, len)),
-      ...hostObjects(bytesAt, decoder, encoder),
+      ...hostObjects(bytesAt, decoder, encoder, link),
     },
   };
   const module = wasm instanceof WebAssembly.Module ? wasm : await WebAssembly.compile(wasm);
   const instance = await WebAssembly.instantiate(module, imports);
   const vm = instance.exports;
   memory = vm.memory;
+  link.exports = vm;
+  const call = (f) => {
+    link.depth += 1;
+    try {
+      return f();
+    } finally {
+      link.depth -= 1;
+    }
+  };
 
   const buffer = vm.eurasia_buffer(snapshot.length);
   bytesAt(buffer, snapshot.length).set(snapshot);
 
   let resumes = 0;
+  let timer = null;
+  // The promise settles when the run first returns, exits or fails; expats
+  // keep working after it has, and each idle callback resumes the VM.
   return new Promise((resolve, reject) => {
+    link.afterIdleCallback = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => settle(call(vm.eurasia_resume)), 0);
+    };
     const settle = (status) => {
       switch (status) {
         case RETURNED:
@@ -108,9 +151,10 @@ export async function run(wasm, snapshot, { print = console.log } = {}) {
           return;
         case WAITING: {
           const delay = (vm.eurasia_wakeup_nanos() - performance.now() * 1e6) / 1e6;
-          setTimeout(() => {
+          clearTimeout(timer);
+          timer = setTimeout(() => {
             resumes += 1;
-            settle(vm.eurasia_resume());
+            settle(call(vm.eurasia_resume));
           }, Math.max(0, delay));
           return;
         }
@@ -121,6 +165,6 @@ export async function run(wasm, snapshot, { print = console.log } = {}) {
           reject(new Error(`eurasia: unknown status ${status}`));
       }
     };
-    settle(vm.eurasia_start());
+    settle(call(vm.eurasia_start));
   });
 }

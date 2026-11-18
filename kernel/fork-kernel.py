@@ -502,6 +502,24 @@ def main():
 	)
 """ + anchor)
 
+    # 17. The callback boundary (role 28; design doc section 4): the VM runs
+    #     a callback from the host as this method, so that an exception in
+    #     it stops here and a non-local return through it raises
+    #     cannotReturn: (the VM's non-local return stops at role 28).
+    t = replace(t, """		public ensure: onUnwind <[]> = (
+""", """		public dispatchCallbackWith: arguments <Array> = (
+			(* The boundary of a callback from the host (Eurasia; design doc section 4, role 28). The VM runs a callback as this method: an exception in it stops here, and a non-local return through it raises cannotReturn:. Answers {true. result} or {false. a description of the exception}, from which the host caller gets a host exception. *)
+
+			^[ {true. self valueWithArguments: arguments. } ] on: Exception
+				do: [:e |
+					| text |
+					text:: e messageText.
+					{false. nil = text ifTrue: [ 'an exception' ] ifFalse: [ text ]. }
+				]
+		)
+		public ensure: onUnwind <[]> = (
+""")
+
     # 15. Far references (role 35): opaque VM objects (Φ). An ordinary send
     #     to one fails as an immediate send to psoup's eventual refs does.
     anchor = "\tpublic class Fraction reducedNumerator: num denominator: denom = Number new ("

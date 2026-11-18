@@ -19,14 +19,19 @@
 //! call-based FFI (operation list, section 10): each operation's arguments
 //! are staged one by one (`ffi_arg_*`), `ffi_perform(op, receiver)` performs
 //! it and answers the result's tag, and `ffi_result_*` read the result.
-//! Expats and callbacks come next in M5.
+//! A closure passed to the host arrives as a function (`ffi_arg_expat`);
+//! calling it calls the export `eurasia_callback(expat)`, which reads the
+//! call's arguments with `cb_arg_count()` and `cb_arg(i)` and stages its
+//! result as an argument. A callback during a host operation is a sub-step
+//! of the running turn; one while the VM is idle starts a turn, after which
+//! the loader resumes the VM.
 
 // `no_mangle` exports and the host imports are the unsafe constructs here.
 #![allow(unsafe_code)]
 
 use std::cell::RefCell;
 
-use eurasia_core::host::{Host, HostError, HostOp, HostValue};
+use eurasia_core::host::{Host, HostCallbacks, HostError, HostOp, HostValue};
 use eurasia_core::{BYTECODE_VERSION, Completion, KERNEL_VERSION, Vm, VmError};
 use eurasia_snapshot::{FORMAT_VERSION, read_image, write_image};
 
@@ -68,6 +73,45 @@ struct State {
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
+    /// The VM's callback interface for each host operation now running,
+    /// innermost last: a callback during one re-enters the VM through it.
+    static CALLBACKS: RefCell<Vec<*mut (dyn HostCallbacks + 'static)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Calls expat `expat` from the host, with the arguments the host gives
+/// (`cb_arg_count`, `cb_arg`). Stages the result (or, on failure, a
+/// description) for the host and answers 0, or 1 when the callback failed.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_callback(expat: u32) -> i32 {
+    let args = imports::callback_arguments();
+    let inner = CALLBACKS.with_borrow(|c| c.last().copied());
+    let result = match inner {
+        // SAFETY: the pointer is the VM's callback interface for the host
+        // operation that is running further up this stack (it was pushed
+        // when the operation began and is popped when it ends); the VM uses
+        // it only through this call while the operation is suspended.
+        Some(callbacks) => unsafe { (*callbacks).callback(&mut WebHost, expat, &args) },
+        None => STATE.with_borrow_mut(|s| match s.vm.as_mut() {
+            Some(vm) => vm.callback(&mut WebHost, expat, &args),
+            None => Err(HostError::Dead),
+        }),
+    };
+    match result {
+        Ok(v) => {
+            imports::stage(&v);
+            0
+        }
+        Err(e) => {
+            let description = match e {
+                HostError::Raised(m) => m,
+                HostError::Dead => String::from("the expat is dead"),
+                HostError::Unsupported => String::from("unsupported"),
+            };
+            imports::stage(&HostValue::String(description));
+            1
+        }
+    }
 }
 
 /// A buffer of `length` bytes in wasm memory, for the loader to fill with a
@@ -185,10 +229,8 @@ impl Host for WebHost {
         op: HostOp,
         receiver: u32,
         args: &[HostValue],
+        callbacks: &mut dyn HostCallbacks,
     ) -> Result<HostValue, HostError> {
-        for a in args {
-            imports::stage(a);
-        }
         let op = match op {
             HostOp::Get => 0,
             HostOp::Set => 1,
@@ -199,7 +241,19 @@ impl Host for WebHost {
             HostOp::New => 6,
             HostOp::InstanceOf => 7,
         };
-        match imports::perform(op, receiver) {
+        for a in args {
+            imports::stage(a);
+        }
+        let callbacks: *mut (dyn HostCallbacks + '_) = callbacks;
+        // SAFETY: only the lifetime is erased. The pointer is popped right
+        // after the operation, before `callbacks` goes out of scope, so it
+        // is never used after.
+        let callbacks: *mut (dyn HostCallbacks + 'static) =
+            unsafe { core::mem::transmute(callbacks) };
+        CALLBACKS.with_borrow_mut(|c| c.push(callbacks));
+        let tag = imports::perform(op, receiver);
+        CALLBACKS.with_borrow_mut(|c| c.pop());
+        match tag {
             0 => Ok(HostValue::Undefined),
             1 => Ok(HostValue::Null),
             2 => Ok(HostValue::Bool(imports::result_number() != 0.0)),
@@ -239,6 +293,9 @@ mod imports {
         fn ffi_arg_number(x: f64);
         fn ffi_arg_string(ptr: *const u8, len: usize);
         fn ffi_arg_ref(r: u32);
+        fn ffi_arg_expat(e: u32);
+        fn cb_arg_count() -> u32;
+        fn cb_arg(i: u32) -> i32;
         fn ffi_perform(op: i32, receiver: u32) -> i32;
         fn ffi_result_number() -> f64;
         fn ffi_result_string_length() -> usize;
@@ -259,7 +316,25 @@ mod imports {
                 HostValue::Number(x) => ffi_arg_number(*x),
                 HostValue::String(s) => ffi_arg_string(s.as_ptr(), s.len()),
                 HostValue::Ref(r) => ffi_arg_ref(*r),
+                HostValue::Expat(e) => ffi_arg_expat(*e),
             }
+        }
+    }
+
+    /// The arguments of the host's call of an expat.
+    pub fn callback_arguments() -> Vec<HostValue> {
+        // SAFETY: plain values; each cb_arg makes that argument the result.
+        unsafe {
+            (0..cb_arg_count())
+                .map(|i| match cb_arg(i) {
+                    1 => HostValue::Null,
+                    2 => HostValue::Bool(ffi_result_number() != 0.0),
+                    3 => HostValue::Number(ffi_result_number()),
+                    4 => HostValue::String(result_string()),
+                    5 => HostValue::Ref(ffi_result_number() as u32),
+                    _ => HostValue::Undefined,
+                })
+                .collect()
         }
     }
 
@@ -328,6 +403,10 @@ mod imports {
 
     pub fn stage(v: &eurasia_core::host::HostValue) {
         let _ = v;
+    }
+
+    pub fn callback_arguments() -> Vec<eurasia_core::host::HostValue> {
+        Vec::new()
     }
 
     /// Without a JavaScript host every operation raises.

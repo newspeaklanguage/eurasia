@@ -25,6 +25,7 @@ use core::fmt;
 use crate::bytecode::{SendKind, instruction_length, op};
 use crate::gc;
 use crate::host::Host;
+use crate::host::{HostCallbacks, HostError, HostValue};
 use crate::natives::{self, Native, NativeContext, Outcome, Reason};
 use crate::object::{Access, Body, FROZEN, Heap, MethodKind, PromiseRecord, Space, VALUE};
 use crate::roles::{Role, Roles};
@@ -171,6 +172,12 @@ pub struct Vm {
     actors: Vec<Actor>,
     /// The running actor.
     current: usize,
+    /// Expats (operation list, section 10): closures the host may call, with
+    /// their owning actors; a host function names one by its index. The
+    /// table only grows, as psoup's does; expat lifetime is open.
+    expats: Vec<(Value, u32)>,
+    /// Callbacks now running, nested.
+    callback_depth: usize,
 }
 
 /// A VM actor: its message loop (in its platform), its mailbox of packets
@@ -182,7 +189,13 @@ struct Actor {
     mailbox: VecDeque<Value>,
     /// The monotonic time of its next timer, in nanoseconds; 0: none.
     wakeup: u64,
+    /// A callback ran while the VM was idle: its message loop must run (to
+    /// drain the sends the callback queued) even with no packet or timer.
+    poked: bool,
 }
+
+/// How deeply callbacks may nest (design doc section 4; psoup's limit).
+const MAX_CALLBACK_NESTING: usize = 64;
 
 /// The fewest allocations between scheduled collections.
 const MIN_GC_BUDGET: u64 = 1 << 20;
@@ -212,6 +225,8 @@ impl Vm {
             has_loop: false,
             actors: Vec::new(),
             current: 0,
+            expats: Vec::new(),
+            callback_depth: 0,
         }
     }
 
@@ -251,8 +266,12 @@ impl Vm {
             roots.push(a.message_loop);
             roots.extend(a.mailbox.iter().copied());
         }
+        roots.extend(self.expats.iter().map(|&(c, _)| c));
         let nil = self.roles.get(Role::Nil);
         let (fwd, statistics) = self.heap.collect(&roots, nil);
+        for e in &mut self.expats {
+            e.0 = fwd.forward(e.0);
+        }
         for a in &mut self.actors {
             a.message_loop = fwd.forward(a.message_loop);
             for v in a.mailbox.iter_mut() {
@@ -338,6 +357,7 @@ impl Vm {
             message_loop,
             mailbox: VecDeque::new(),
             wakeup: 0,
+            poked: false,
         }];
         self.current = 0;
         self.has_loop = has_loop;
@@ -820,12 +840,7 @@ impl Vm {
             }
             // Rule Native-Fail: allocate the failure exception and send it
             // #signal; its answer is the send's answer.
-            Outcome::Fail(reason) => {
-                let failure = self.new_failure(native, receiver, args, reason, host);
-                self.stack.push(failure);
-                let signal = self.symbol("signal");
-                self.ordinary_send(signal, 0, host)
-            }
+            Outcome::Fail(reason) => self.native_failure(native, receiver, args, reason, host),
             Outcome::Exit(code) => Ok(Some(Completion::Exited(code))),
             Outcome::Frame(_) => unreachable!("frame natives are resolved above"),
             Outcome::Spawn(mixin) => {
@@ -867,6 +882,7 @@ impl Vm {
                     message_loop,
                     mailbox: VecDeque::new(),
                     wakeup: 0,
+                    poked: false,
                 });
                 let far_class = self.roles.get(Role::FarReferenceClass);
                 let r = self.heap.allocate(
@@ -897,6 +913,7 @@ impl Vm {
                     message_loop,
                     mailbox: VecDeque::new(),
                     wakeup: 0,
+                    poked: false,
                 });
                 let class = self.roles.get(Role::FarReferenceClass);
                 let nil = self.nil();
@@ -946,6 +963,41 @@ impl Vm {
                 let message_loop = self.actors[self.current].message_loop;
                 self.stack.push(message_loop);
                 Ok(None)
+            }
+            Outcome::HostCall {
+                op,
+                receiver: r,
+                args: arguments,
+                answer,
+            } => {
+                let mut host_args = Vec::with_capacity(arguments.len());
+                for (v, index) in arguments {
+                    match self.marshal_out(v, index) {
+                        Ok(h) => host_args.push(h),
+                        Err(reason) => {
+                            return self.native_failure(native, receiver, args, reason, host);
+                        }
+                    }
+                }
+                let result = host.host_operation(op, r, &host_args, self);
+                match result {
+                    Ok(v) => {
+                        let v = match answer {
+                            Some(a) => a,
+                            None => self.marshal_in(v, Space::Actor(self.current as u32)),
+                        };
+                        self.stack.push(v);
+                        Ok(None)
+                    }
+                    Err(e) => {
+                        let reason = match e {
+                            HostError::Unsupported => Reason::Unsupported,
+                            HostError::Dead => Reason::Dead,
+                            HostError::Raised(message) => Reason::Host(self.new_string(&message)),
+                        };
+                        self.native_failure(native, receiver, args, reason, host)
+                    }
+                }
             }
             Outcome::Settle {
                 record,
@@ -1277,6 +1329,14 @@ impl Vm {
                 return self.dispatch_to_loop(selector, &[packet], host);
             }
         }
+        // An actor a callback ran in while idle: its loop drains the sends
+        // the callback queued.
+        if let Some(a) = (0..n).find(|&a| self.actors[a].poked) {
+            self.actors[a].poked = false;
+            self.current = a;
+            let nil = self.nil();
+            return self.dispatch(nil, host);
+        }
         let earliest = (0..n)
             .filter(|&a| self.actors[a].wakeup > 0)
             .min_by_key(|&a| (self.actors[a].wakeup, a));
@@ -1498,6 +1558,136 @@ impl Vm {
             .heap
             .allocate(array_class, Space::Actor(to), Body::Array(packet));
         self.actors[to as usize].mailbox.push_back(copy);
+    }
+
+    /// Rule Native-Fail: allocates the failure exception and sends it
+    /// #signal; its answer is the send's answer.
+    fn native_failure(
+        &mut self,
+        native: Native,
+        receiver: Value,
+        args: Vec<Value>,
+        reason: Reason,
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
+        let failure = self.new_failure(native, receiver, args, reason, host);
+        self.stack.push(failure);
+        let signal = self.symbol("signal");
+        self.ordinary_send(signal, 0, host)
+    }
+
+    /// `v` as it crosses to the host (operation list, section 10): nil,
+    /// Booleans, Integers within 2^53, Floats and Strings by value, Aliens
+    /// as their references, closures as new expats owned by the running
+    /// actor; anything else fails with `#wrongKind: index`.
+    fn marshal_out(&mut self, v: Value, index: u32) -> Result<HostValue, Reason> {
+        if v == self.nil() {
+            return Ok(HostValue::Null);
+        }
+        if v == self.roles.get(Role::True) {
+            return Ok(HostValue::Bool(true));
+        }
+        if v == self.roles.get(Role::False) {
+            return Ok(HostValue::Bool(false));
+        }
+        if let Some(n) = v.as_small_integer() {
+            if n.abs() > natives::HOST_EXACT {
+                return Err(Reason::OutOfRange(index));
+            }
+            return Ok(HostValue::Number(n as f64));
+        }
+        if let Some(r) = natives::alien_reference_in(&self.heap, &self.roles, v) {
+            return Ok(if r == 0 {
+                HostValue::Undefined
+            } else {
+                HostValue::Ref(r)
+            });
+        }
+        match self.heap.get(v).map(|o| &o.body) {
+            Some(Body::Float(f)) => Ok(HostValue::Number(*f)),
+            Some(Body::String(b)) => match core::str::from_utf8(b) {
+                Ok(s) => Ok(HostValue::String(String::from(s))),
+                Err(_) => Err(Reason::WrongKind(index)),
+            },
+            Some(Body::Closure(_)) => {
+                let id = self.expats.len() as u32;
+                self.expats.push((v, self.current as u32));
+                Ok(HostValue::Expat(id))
+            }
+            Some(Body::LargeInteger { .. }) => Err(Reason::OutOfRange(index)),
+            _ => Err(Reason::WrongKind(index)),
+        }
+    }
+
+    /// A host value as it arrives in Newspeak, allocated in `space`: `null`
+    /// as nil, `undefined` and host objects as Aliens, integral numbers
+    /// within 2^53 as Integers.
+    fn marshal_in(&mut self, v: HostValue, space: Space) -> Value {
+        let alien = |vm: &mut Vm, r: u32| {
+            let class = vm.roles.get(Role::AlienClass);
+            let reference = Value::small_integer(i64::from(r)).expect("small");
+            vm.heap
+                .allocate(class, space, Body::Regular(alloc::vec![reference]))
+        };
+        match v {
+            HostValue::Undefined => alien(self, 0),
+            HostValue::Null => self.nil(),
+            HostValue::Bool(b) => self.roles.get(if b { Role::True } else { Role::False }),
+            HostValue::Number(x) => {
+                if libm::trunc(x) == x && x.abs() <= natives::HOST_EXACT as f64 {
+                    Value::small_integer(x as i64).expect("small")
+                } else {
+                    let x = if x.is_nan() { f64::NAN } else { x };
+                    let class = self.roles.get(Role::FloatClass);
+                    self.heap.allocate(class, space, Body::Float(x))
+                }
+            }
+            HostValue::String(s) => {
+                let class = self.roles.get(Role::StringClass);
+                self.heap
+                    .allocate(class, space, Body::String(s.as_bytes().to_vec()))
+            }
+            HostValue::Ref(r) | HostValue::Expat(r) => alien(self, r),
+        }
+    }
+
+    /// Runs `closure` with the Array `arguments` as a callback: above the
+    /// boundary frame (the callback-dispatch method, role 28), whose
+    /// `on: Exception do:` stops exceptions and through which a non-local
+    /// return raises `cannotReturn:`; nothing else runs meanwhile. Answers
+    /// the boundary's `{true. result}` or `{false. description}`.
+    fn run_callback(
+        &mut self,
+        closure: Value,
+        arguments: Value,
+        host: &mut dyn Host,
+    ) -> Result<(bool, Value), VmError> {
+        let method = self.roles.get(Role::CallbackDispatchMethod);
+        if method == self.nil() {
+            return Err(VmError::MissingUpcall("the callback-dispatch method"));
+        }
+        let base = self.frames.len();
+        self.stack.push(closure);
+        self.stack.push(arguments);
+        if self.activate(method, 1, host)?.is_some() {
+            return Err(VmError::Malformed("a callback exited"));
+        }
+        while self.frames.len() > base {
+            if self.gc_due() {
+                self.collect_garbage();
+            }
+            if let Step::Done(_) = self.step(host)? {
+                return Err(VmError::Malformed("a callback exited"));
+            }
+        }
+        let answer = self.stack.pop().ok_or(VmError::Malformed("empty stack"))?;
+        let pair = self
+            .heap
+            .array_elements(answer)
+            .filter(|e| e.len() == 2)
+            .map(<[Value]>::to_vec)
+            .ok_or(VmError::Malformed("the callback boundary answered no pair"))?;
+        Ok((pair[0] == self.roles.get(Role::True), pair[1]))
     }
 
     /// Sends `selector` (a role) to the current frame's activation with
@@ -2231,5 +2421,79 @@ impl Vm {
         let v = self.stack[f.bp + 1 + (f.arg_count - p)];
         self.stack.push(v);
         Ok(())
+    }
+}
+
+impl HostCallbacks for Vm {
+    /// A callback (design doc section 4). With a turn on the stack it is a
+    /// sub-step of that turn, which only the expat's owning actor may run:
+    /// from another actor's turn the call becomes a message to the owner and
+    /// the host gets `undefined`. With no turn on the stack it starts a turn
+    /// in the owning actor, whose message loop then drains the sends it
+    /// queued.
+    fn callback(
+        &mut self,
+        host: &mut dyn Host,
+        expat: u32,
+        args: &[HostValue],
+    ) -> Result<HostValue, HostError> {
+        let Some(&(closure, owner)) = self.expats.get(expat as usize) else {
+            return Err(HostError::Dead);
+        };
+        if self.callback_depth >= MAX_CALLBACK_NESTING {
+            return Err(HostError::Raised(String::from(
+                "callbacks nested too deeply (exhausted: nesting)",
+            )));
+        }
+        let in_turn = !self.frames.is_empty();
+        let space = Space::Actor(owner);
+        let arity = self
+            .heap
+            .closure(closure)
+            .map_or(0, |c| c.num_args as usize);
+        let mut values: Vec<Value> = args
+            .iter()
+            .take(arity)
+            .map(|a| self.marshal_in(a.clone(), space))
+            .collect();
+        values.resize(arity, self.nil());
+        let array_class = self.roles.get(Role::ArrayClass);
+        let arguments = self.heap.allocate(array_class, space, Body::Array(values));
+        if in_turn && owner as usize != self.current {
+            let selector = self.symbol("valueWithArguments:");
+            let nil = self.nil();
+            let packet = self.heap.allocate(
+                array_class,
+                space,
+                Body::Array(alloc::vec![closure, selector, nil, arguments]),
+            );
+            self.actors[owner as usize].mailbox.push_back(packet);
+            return Ok(HostValue::Undefined);
+        }
+        if !in_turn {
+            self.current = owner as usize;
+        }
+        self.callback_depth += 1;
+        let outcome = self.run_callback(closure, arguments, host);
+        self.callback_depth -= 1;
+        if !in_turn {
+            self.actors[owner as usize].poked = true;
+        }
+        match outcome {
+            Ok((true, result)) => self.marshal_out(result, 0).map_err(|_| {
+                HostError::Raised(String::from(
+                    "the callback answered an object that cannot cross to the host",
+                ))
+            }),
+            Ok((false, description)) => {
+                let text = self
+                    .heap
+                    .string_bytes(description)
+                    .and_then(|b| core::str::from_utf8(b).ok())
+                    .unwrap_or("an exception");
+                Err(HostError::Raised(alloc::format!("callback failed: {text}")))
+            }
+            Err(e) => Err(HostError::Raised(alloc::format!("callback failed: {e}"))),
+        }
     }
 }
