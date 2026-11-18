@@ -158,3 +158,8 @@ Alien	instance	callWithArguments:	AlienApply	146
 Alien	instance	newWithArguments:	AlienNew	147
 Alien	instance	isInstanceOf:	AlienInstanceOf	148
 Alien	instance	instanceOf:	AlienInstanceOf	148
+# Program objects built in Newspeak (M6 design 4.1).
+Method	instance	header	MethodHeader	149
+Method	instance	header:	MethodHeaderPut	150
+Method	instance	bytecode	MethodBytecode	151
+Method	instance	bytecode:	MethodBytecodePut	152

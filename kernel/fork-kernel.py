@@ -308,12 +308,24 @@ def main():
 		|
 	) (
 		public header ^<Integer> = (
-			(* Eurasia keeps method headers in the VM; decoding them through a mirror arrives with M6. Until then every method reads as public, with no arguments, temps or primitive. *)
+			(* Eurasia keeps method headers in the VM; a native (MethodHeader) answers psoup's header word: access << 28, primitive << 16, temps << 8, arguments. Primitive 256 + i is a getter of the mixin's own slot i, 512 + i its setter, 1024 answers the receiver, any other nonzero one is a Eurasia native. *)
 
-			^0
+			halt
+		)
+		public header: word <Integer> = (
+			(* A native (MethodHeaderPut): sets an unfrozen method's header from psoup's header word. *)
+
+			halt
 		)
 		public bytecode = (
-			^nil
+			(* A native (MethodBytecode): a copy of the V5 bytecode. *)
+
+			halt
+		)
+		public bytecode: bytes <ByteArray> = (
+			(* A native (MethodBytecodePut), on an unfrozen method. *)
+
+			halt
 		)""")
     t = replace(t, """			public _instanceMixin <InstanceMixin>
 			public _methods <Array[Method]> (* Must be slot 2, known to the VM. *)

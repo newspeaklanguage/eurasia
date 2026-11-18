@@ -18,7 +18,10 @@ use core::cmp::Ordering;
 
 use crate::bigint::BigInt;
 use crate::host::{HOST_GLOBAL, Host, HostOp};
-use crate::object::{Behavior, Body, FROZEN, Heap, PromiseRecord, Space, VALUE, VALUE_CLASS};
+use crate::object::{
+    Access, Behavior, Body, FROZEN, Heap, Method, MethodHeader, MethodKind, Mixin, PromiseRecord,
+    Space, VALUE, VALUE_CLASS,
+};
 use crate::roles::{Role, Roles};
 use crate::value::{SmallInteger, Value};
 
@@ -183,6 +186,10 @@ natives! {
     AlienApply = 146 / 1: "`Alien>>callWithArguments:`: the alien is a function; `this(...)`.",
     AlienNew = 147 / 1: "`Alien>>newWithArguments:`: `new this(...)`.",
     AlienInstanceOf = 148 / 1: "`Alien>>isInstanceOf:` (psoup's `instanceOf:`): `this instanceof constructor`.",
+    MethodHeader = 149 / 0: "`Method>>header`: psoup's header word: access << 28, primitive << 16, temps << 8, arguments; primitive 256 + i is a getter of the mixin's slot i, 512 + i its setter, 1024 answers the receiver, any other nonzero one a Eurasia native.",
+    MethodHeaderPut = 150 / 1: "`Method>>header:` on an unfrozen method: sets its kind, access, argument and local counts from psoup's header word (see `Method>>header`).",
+    MethodBytecode = 151 / 0: "`Method>>bytecode`: a copy of its V5 bytecode, a ByteArray.",
+    MethodBytecodePut = 152 / 1: "`Method>>bytecode:` on an unfrozen method: a ByteArray of well-formed V5 instructions.",
     VmSpawn = 139 / 1: "`vm spawn: mixin`: a new actor running a clone of the platform template, with the mixin applied to Object (role 37) in its heap, enclosing object nil; answers a far reference to the new class (`actor-semantics.tex`, eq. `create-actor`).",
     VmPromiseSend = 138 / 2: "`vm promise: record send: {selector. resultRecord. arguments...}`: an eventual send to the promise (Route-Pending): queued in the record, at the end of its chain, until it settles; delivered at once if it has.",
     VmIsValue = 125 / 1: "`vm isValue:`: whether the object is a value (immediates, nil, booleans, strings, numbers, instances of value classes, classes with a value enclosing object).",
@@ -345,6 +352,108 @@ fn host_call(
         receiver: r,
         args,
         answer,
+    }
+}
+
+/// A method's header as psoup's header word: access << 28, primitive << 16,
+/// temps (arguments and locals) << 8, arguments. The primitive encodes the
+/// kind: 0 ordinary, 256 + i a getter and 512 + i a setter of the method's
+/// own mixin's slot i, 1024 answers the receiver, anything else a native.
+pub fn psoup_header(h: &MethodHeader) -> i64 {
+    let access = match h.access {
+        Access::Public => 0,
+        Access::Protected => 1,
+        Access::Private => 2,
+    };
+    let primitive = match h.kind {
+        MethodKind::Ordinary => 0,
+        MethodKind::Native => i64::from(h.native),
+        MethodKind::Getter => 256 + i64::from(h.slot),
+        MethodKind::Setter => 512 + i64::from(h.slot),
+        MethodKind::ReturnSelf => 1024,
+    };
+    let temps = i64::from(h.arg_count + h.local_count);
+    (access << 28) | (primitive << 16) | (temps << 8) | i64::from(h.arg_count)
+}
+
+/// The header psoup's header word describes (see [`psoup_header`]), if it
+/// is well formed: a known access modifier, at least as many temps as
+/// arguments for an ordinary method, a native of the right arity, and
+/// accessors of the right arity.
+pub fn header_from_psoup(word: i64) -> Option<MethodHeader> {
+    if !(0..1 << 30).contains(&word) {
+        return None;
+    }
+    let access = match word >> 28 {
+        0 => Access::Public,
+        1 => Access::Protected,
+        2 => Access::Private,
+        _ => return None,
+    };
+    let primitive = ((word >> 16) & 0xFFF) as u32;
+    let temps = ((word >> 8) & 0xFF) as u32;
+    let arg_count = (word & 0xFF) as u32;
+    // psoup's accessor headers leave the temps 0; only an ordinary method's
+    // count its arguments.
+    if primitive == 0 && temps < arg_count {
+        return None;
+    }
+    let mut header = MethodHeader {
+        kind: MethodKind::Ordinary,
+        access,
+        arg_count,
+        local_count: temps.saturating_sub(arg_count),
+        native: 0,
+        slot: 0,
+    };
+    match primitive {
+        0 => {}
+        256..=511 if arg_count == 0 => {
+            header.kind = MethodKind::Getter;
+            header.slot = primitive - 256;
+        }
+        512..=1023 if arg_count == 1 => {
+            header.kind = MethodKind::Setter;
+            header.slot = primitive - 512;
+        }
+        1024 => header.kind = MethodKind::ReturnSelf,
+        n => {
+            let native = Native::from_id(n)?;
+            if native.arity() != arg_count as usize {
+                return None;
+            }
+            header.kind = MethodKind::Native;
+            header.native = n;
+        }
+    }
+    if header.kind != MethodKind::Ordinary {
+        header.local_count = 0;
+    }
+    Some(header)
+}
+
+/// Whether `bytes` is a sequence of whole V5 instructions.
+fn well_formed(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        let n = crate::bytecode::instruction_length(bytes[i]);
+        if n == 0 {
+            return false;
+        }
+        i += n;
+    }
+    i == bytes.len()
+}
+
+/// The method `v`, if it is one and not frozen (installed).
+fn unfrozen_method<'h>(ctx: &'h mut NativeContext<'_>, v: Value) -> Option<&'h mut Method> {
+    let o = ctx.heap.get_mut(v)?;
+    if o.header.flags & FROZEN != 0 {
+        return None;
+    }
+    match &mut o.body {
+        Body::Method(m) => Some(m),
+        _ => None,
     }
 }
 
@@ -1316,6 +1425,49 @@ pub fn invoke(
             if special.iter().any(|&r| ctx.roles.get(r) == receiver) {
                 return Outcome::Fail(Reason::NotInstantiable);
             }
+            // Program objects built in Newspeak (M6 design 4.1): real
+            // methods and mixins, unfrozen until installed.
+            let nil = ctx.nil();
+            if receiver == ctx.roles.get(Role::MethodClass) && receiver != nil {
+                return Outcome::Answer(ctx.heap.allocate(
+                    receiver,
+                    ctx.space,
+                    Body::Method(Method {
+                        header: MethodHeader {
+                            kind: MethodKind::Ordinary,
+                            access: Access::Public,
+                            arg_count: 0,
+                            local_count: 0,
+                            native: 0,
+                            slot: 0,
+                        },
+                        bytecode: Vec::new(),
+                        literals: nil,
+                        mixin: nil,
+                        selector: nil,
+                        source: nil,
+                        library: nil,
+                    }),
+                ));
+            }
+            if (receiver == ctx.roles.get(Role::InstanceMixinClass)
+                || receiver == ctx.roles.get(Role::ClassMixinClass))
+                && receiver != nil
+            {
+                return Outcome::Answer(ctx.heap.allocate(
+                    receiver,
+                    ctx.space,
+                    Body::Mixin(Mixin {
+                        name: nil,
+                        methods: nil,
+                        enclosing_mixin: nil,
+                        slot_names: nil,
+                        slot_count: 0,
+                        class_mixin: nil,
+                        library: nil,
+                    }),
+                ));
+            }
             match instance_slots(ctx.heap, ctx.roles, receiver) {
                 Some(n) => {
                     let nil = ctx.nil();
@@ -1724,6 +1876,50 @@ pub fn invoke(
         }
         Native::VmNewActor => Outcome::NewActor,
         Native::VmSpawn => Outcome::Spawn(arg(0)),
+        Native::MethodHeader => match ctx.heap.get(receiver).map(|o| &o.body) {
+            Some(Body::Method(m)) => Outcome::Answer(small(psoup_header(&m.header))),
+            _ => Outcome::Fail(Reason::WrongKind(0)),
+        },
+        Native::MethodHeaderPut => {
+            let Some(word) = arg(0).as_small_integer() else {
+                return Outcome::Fail(Reason::WrongKind(1));
+            };
+            let Some(header) = header_from_psoup(word) else {
+                return Outcome::Fail(Reason::WrongKind(1));
+            };
+            match unfrozen_method(ctx, receiver) {
+                Some(m) => {
+                    m.header = header;
+                    Outcome::Answer(receiver)
+                }
+                None => Outcome::Fail(Reason::WrongKind(0)),
+            }
+        }
+        Native::MethodBytecode => {
+            let Some(Body::Method(m)) = ctx.heap.get(receiver).map(|o| &o.body) else {
+                return Outcome::Fail(Reason::WrongKind(0));
+            };
+            let bytes = m.bytecode.clone();
+            let class = ctx.roles.get(Role::ByteArrayClass);
+            let space = ctx.space;
+            Outcome::Answer(ctx.heap.allocate(class, space, Body::Bytes(bytes)))
+        }
+        Native::MethodBytecodePut => {
+            let Some(Body::Bytes(bytes)) = ctx.heap.get(arg(0)).map(|o| &o.body) else {
+                return Outcome::Fail(Reason::WrongKind(1));
+            };
+            let bytes = bytes.clone();
+            if !well_formed(&bytes) {
+                return Outcome::Fail(Reason::WrongKind(1));
+            }
+            match unfrozen_method(ctx, receiver) {
+                Some(m) => {
+                    m.bytecode = bytes;
+                    Outcome::Answer(receiver)
+                }
+                None => Outcome::Fail(Reason::WrongKind(0)),
+            }
+        }
         Native::VmHostGlobal => Outcome::Answer(new_alien(ctx, HOST_GLOBAL)),
         Native::AlienAt => host_call(ctx, HostOp::Get, receiver, &[arg(0)], None, None),
         Native::AlienAtPut => host_call(

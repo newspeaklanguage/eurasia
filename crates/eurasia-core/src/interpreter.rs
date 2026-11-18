@@ -761,6 +761,37 @@ impl Vm {
                     }) if index < 3 => {
                         *[key, v, finalizer][index] = value;
                     }
+                    // An unfrozen method or mixin built in Newspeak (M6
+                    // design 4.1): its setters write its contract fields, in
+                    // `vm slotOf:at:`'s order. A mixin's slot count follows
+                    // its slot names.
+                    Some(Body::Method(m)) if index < 5 => {
+                        *[
+                            &mut m.literals,
+                            &mut m.mixin,
+                            &mut m.selector,
+                            &mut m.source,
+                            &mut m.library,
+                        ][index] = value;
+                    }
+                    Some(Body::Mixin(_)) if index < 6 => {
+                        let count = self.heap.array_elements(value).map(<[Value]>::len);
+                        let Some(Body::Mixin(m)) = self.heap.get_mut(receiver).map(|o| &mut o.body)
+                        else {
+                            unreachable!("matched above")
+                        };
+                        if index == 3 {
+                            m.slot_count = count.unwrap_or(0) as u32;
+                        }
+                        *[
+                            &mut m.name,
+                            &mut m.methods,
+                            &mut m.enclosing_mixin,
+                            &mut m.slot_names,
+                            &mut m.class_mixin,
+                            &mut m.library,
+                        ][index] = value;
+                    }
                     _ => return Err(self.bad_slot_access(method, receiver)),
                 }
                 self.stack.truncate(base + 1);

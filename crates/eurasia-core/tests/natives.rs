@@ -570,3 +570,34 @@ fn mirror_perform_numbers_its_arguments_from_the_object() {
         Outcome::Perform { .. }
     ));
 }
+
+#[test]
+fn psoup_header_words_round_trip() {
+    use eurasia_core::natives::{header_from_psoup, psoup_header};
+    use eurasia_core::object::{Access, MethodKind};
+    // An ordinary private method with 2 arguments and 3 more locals.
+    let word = (2 << 28) | (5 << 8) | 2;
+    let h = header_from_psoup(word).expect("well formed");
+    assert_eq!(
+        (h.kind, h.access, h.arg_count, h.local_count),
+        (MethodKind::Ordinary, Access::Private, 2, 3)
+    );
+    assert_eq!(psoup_header(&h), word);
+    // psoup's accessors: a getter and a setter of slot 4, with no temps.
+    let getter = header_from_psoup((256 + 4) << 16).expect("a getter");
+    assert_eq!((getter.kind, getter.slot), (MethodKind::Getter, 4));
+    let setter = header_from_psoup(((512 + 4) << 16) | 1).expect("a setter");
+    assert_eq!(
+        (setter.kind, setter.slot, setter.arg_count),
+        (MethodKind::Setter, 4, 1)
+    );
+    assert_eq!(
+        header_from_psoup(1024 << 16).expect("return self").kind,
+        MethodKind::ReturnSelf
+    );
+    // Refused: fewer temps than arguments, a native of the wrong arity, an
+    // unknown access modifier.
+    assert!(header_from_psoup((1 << 8) | 2).is_none());
+    assert!(header_from_psoup((1 << 16) | 3).is_none());
+    assert!(header_from_psoup(3 << 28).is_none());
+}
