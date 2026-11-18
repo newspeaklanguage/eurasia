@@ -46,6 +46,7 @@ impl World {
             heap: &mut self.heap,
             roles: &self.roles,
             host: &mut host,
+            space: Space::Actor(0),
         };
         natives::invoke(native, receiver, args, &mut ctx)
     }

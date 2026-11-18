@@ -17,7 +17,7 @@
 //! arrays. Closures, non-local return, eventual sends and
 //! `nonBooleanReceiver:` arrive in M2 and are reported as unimplemented.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -26,7 +26,7 @@ use crate::bytecode::{SendKind, instruction_length, op};
 use crate::gc;
 use crate::host::Host;
 use crate::natives::{self, Native, NativeContext, Outcome, Reason};
-use crate::object::{Access, Body, FROZEN, Heap, MethodKind, Space, VALUE};
+use crate::object::{Access, Body, FROZEN, Heap, MethodKind, PromiseRecord, Space, VALUE};
 use crate::roles::{Role, Roles};
 use crate::value::Value;
 
@@ -160,6 +160,22 @@ pub struct Vm {
     collections: u64,
     /// Set when a turn ends with `finish:`: the next timer's time (0: none).
     finished_turn: Option<u64>,
+    /// The cohort's actors (`EURASIA_ACTORS_DESIGN_2026-11-17.md` section
+    /// 5); actor 0 runs the image's own platform.
+    actors: Vec<Actor>,
+    /// The running actor.
+    current: usize,
+}
+
+/// A VM actor: its message loop (in its platform), its mailbox of packets
+/// (Arrays in its heap), and its next timer. Its heap is the objects of
+/// space `Actor(n)`. Turns run to completion, so an actor that is not
+/// running has no stack (until pausing, M6).
+struct Actor {
+    message_loop: Value,
+    mailbox: VecDeque<Value>,
+    /// The monotonic time of its next timer, in nanoseconds; 0: none.
+    wakeup: u64,
 }
 
 /// The fewest allocations between scheduled collections.
@@ -187,6 +203,8 @@ impl Vm {
             gc_stress: None,
             collections: 0,
             finished_turn: None,
+            actors: Vec::new(),
+            current: 0,
         }
     }
 
@@ -222,8 +240,18 @@ impl Vm {
             roots.extend(f.closure);
         }
         roots.extend(self.symbols.values().copied());
+        for a in &self.actors {
+            roots.push(a.message_loop);
+            roots.extend(a.mailbox.iter().copied());
+        }
         let nil = self.roles.get(Role::Nil);
         let (fwd, statistics) = self.heap.collect(&roots, nil);
+        for a in &mut self.actors {
+            a.message_loop = fwd.forward(a.message_loop);
+            for v in a.mailbox.iter_mut() {
+                *v = fwd.forward(*v);
+            }
+        }
         let pairs: Vec<(Role, Value)> = self.roles.pairs().collect();
         for (role, v) in pairs {
             self.roles.set(role, fwd.forward(v));
@@ -290,13 +318,21 @@ impl Vm {
     pub fn run(&mut self, host: &mut dyn Host, args: &[&str]) -> Result<Completion, VmError> {
         let strings: Vec<Value> = args.iter().map(|a| self.new_string(a)).collect();
         let array_class = self.roles.get(Role::ArrayClass);
-        let args_array = self
-            .heap
-            .allocate(array_class, Space::Actor(0), Body::Array(strings));
+        let args_array = self.heap.allocate(
+            array_class,
+            Space::Actor(self.current as u32),
+            Body::Array(strings),
+        );
         self.stack.clear();
         self.frames.clear();
         let message_loop = self.roles.get(Role::MessageLoop);
         let has_loop = message_loop != self.nil();
+        self.actors = alloc::vec![Actor {
+            message_loop,
+            mailbox: VecDeque::new(),
+            wakeup: 0,
+        }];
+        self.current = 0;
         if has_loop {
             if let Some(done) = self.dispatch(args_array, host)? {
                 return Ok(done);
@@ -320,17 +356,14 @@ impl Vm {
             }
             if self.frames.is_empty() {
                 match self.finished_turn.take() {
-                    // The event loop: wait for the next timer, then dispatch.
-                    Some(wakeup) if wakeup > 0 => {
-                        host.wait_until(wakeup);
-                        let nil = self.nil();
-                        if let Some(done) = self.dispatch(nil, host)? {
+                    // The event loop: the next turn of some actor.
+                    Some(wakeup) => {
+                        self.actors[self.current].wakeup = wakeup;
+                        if let Some(done) = self.next_turn(host)? {
                             return Ok(done);
                         }
                         continue;
                     }
-                    // Nothing left to wait for.
-                    Some(_) => return Ok(Completion::Returned(self.nil())),
                     None if has_loop => {
                         return Err(VmError::Malformed("a turn returned without finish:"));
                     }
@@ -354,8 +387,11 @@ impl Vm {
 
     fn new_string(&mut self, s: &str) -> Value {
         let class = self.roles.get(Role::StringClass);
-        self.heap
-            .allocate(class, Space::Actor(0), Body::String(s.as_bytes().to_vec()))
+        self.heap.allocate(
+            class,
+            Space::Actor(self.current as u32),
+            Body::String(s.as_bytes().to_vec()),
+        )
     }
 
     /// A String for a selector the VM sends itself, allocated once.
@@ -587,13 +623,15 @@ impl Vm {
         let method = method.ok_or(VmError::RecursiveDoesNotUnderstand)?;
         let args = self.stack.split_off(self.stack.len() - n);
         let array_class = self.roles.get(Role::ArrayClass);
-        let arguments = self
-            .heap
-            .allocate(array_class, Space::Actor(0), Body::Array(args));
+        let arguments = self.heap.allocate(
+            array_class,
+            Space::Actor(self.current as u32),
+            Body::Array(args),
+        );
         let message_class = self.roles.get(Role::MessageClass);
         let message = self.heap.allocate(
             message_class,
-            Space::Actor(0),
+            Space::Actor(self.current as u32),
             Body::Regular(alloc::vec![selector, arguments]),
         );
         if !present_receiver {
@@ -729,6 +767,7 @@ impl Vm {
                 heap: &mut self.heap,
                 roles: &self.roles,
                 host,
+                space: Space::Actor(self.current as u32),
             };
             natives::invoke(native, receiver, &args, &mut ctx)
         };
@@ -765,6 +804,139 @@ impl Vm {
             }
             Outcome::Exit(code) => Ok(Some(Completion::Exited(code))),
             Outcome::Frame(_) => unreachable!("frame natives are resolved above"),
+            Outcome::NewActor => {
+                // A new actor runs a clone of the platform template.
+                let template = self.roles.get(Role::PlatformTemplate);
+                if template == self.nil() {
+                    let failure =
+                        self.new_failure(native, receiver, args, Reason::Unsupported, host);
+                    self.stack.push(failure);
+                    let signal = self.symbol("signal");
+                    return self.ordinary_send(signal, 0, host);
+                }
+                let id = self.actors.len();
+                let message_loop = self.heap.clone_graph(template, Space::Actor(id as u32));
+                self.actors.push(Actor {
+                    message_loop,
+                    mailbox: VecDeque::new(),
+                    wakeup: 0,
+                });
+                let class = self.roles.get(Role::FarReferenceClass);
+                let nil = self.nil();
+                let handle = self.heap.allocate(
+                    class,
+                    Space::Actor(self.current as u32),
+                    Body::FarRef {
+                        actor: id as u32,
+                        target: nil,
+                    },
+                );
+                self.heap.get_mut(handle).expect("new").header.flags |= VALUE;
+                self.stack.push(handle);
+                Ok(None)
+            }
+            Outcome::Post {
+                packet,
+                far_reference,
+            } => {
+                let Some(Body::FarRef { actor, .. }) =
+                    self.heap.get(far_reference).map(|o| &o.body)
+                else {
+                    unreachable!("checked by the native")
+                };
+                let to = *actor as usize;
+                if to >= self.actors.len() {
+                    return Err(VmError::Malformed("a far reference to no actor"));
+                }
+                let elements = self.heap.array_elements(packet).expect("checked").to_vec();
+                let from = self.current;
+                let translated: Vec<Value> = elements
+                    .into_iter()
+                    .map(|v| self.remote_representation(v, from, to))
+                    .collect();
+                let array_class = self.roles.get(Role::ArrayClass);
+                let copy = self.heap.allocate(
+                    array_class,
+                    Space::Actor(to as u32),
+                    Body::Array(translated),
+                );
+                self.actors[to].mailbox.push_back(copy);
+                let nil = self.nil();
+                self.stack.push(nil);
+                Ok(None)
+            }
+            Outcome::CurrentMessageLoop => {
+                let message_loop = self.actors[self.current].message_loop;
+                self.stack.push(message_loop);
+                Ok(None)
+            }
+            Outcome::Settle {
+                record,
+                state,
+                value,
+            } => {
+                let settled = self.settle(record, state, value);
+                let answer = self
+                    .roles
+                    .get(if settled { Role::True } else { Role::False });
+                self.stack.push(answer);
+                Ok(None)
+            }
+            Outcome::PromiseSend { record, message } => {
+                let elements = self.heap.array_elements(message).expect("checked").to_vec();
+                let current = self.current;
+                let mut entry = Vec::with_capacity(elements.len() + 1);
+                entry.push(Value::small_integer(current as i64).expect("small"));
+                for v in elements {
+                    let n = self.neutral(v);
+                    entry.push(n);
+                }
+                let array_class = self.roles.get(Role::ArrayClass);
+                let entry = self.heap.allocate(
+                    array_class,
+                    Space::Actor(current as u32),
+                    Body::Array(entry),
+                );
+                let last = natives::last_promise(&self.heap, record);
+                let Some(Body::Promise(p)) = self.heap.get_mut(last).map(|o| &mut o.body) else {
+                    unreachable!("a chain of promise records ends in one")
+                };
+                if p.state == PromiseRecord::PENDING {
+                    p.queue.push(entry);
+                } else {
+                    let (state, value) = (p.state, p.value);
+                    self.deliver(entry, state, value);
+                }
+                let nil = self.nil();
+                self.stack.push(nil);
+                Ok(None)
+            }
+            Outcome::AddWaiter { record, waiter } => {
+                let last = natives::last_promise(&self.heap, record);
+                let current = self.current as u32;
+                let class = self.roles.get(Role::FarReferenceClass);
+                let far = self.heap.allocate(
+                    class,
+                    Space::Actor(current),
+                    Body::FarRef {
+                        actor: current,
+                        target: waiter,
+                    },
+                );
+                self.heap.get_mut(far).expect("new").header.flags |= VALUE;
+                let Some(Body::Promise(p)) = self.heap.get_mut(last).map(|o| &mut o.body) else {
+                    unreachable!("a chain of promise records ends in one")
+                };
+                if p.state == PromiseRecord::PENDING {
+                    p.waiters.push(far);
+                } else {
+                    let (state, value) = (p.state, p.value);
+                    self.notify(far, state, value);
+                }
+                let nil = self.nil();
+                self.stack.push(nil);
+                Ok(None)
+            }
             Outcome::FinishTurn(wakeup) => {
                 // The turn's frames unwind; the event loop takes over.
                 let frames = core::mem::take(&mut self.frames);
@@ -786,9 +958,11 @@ impl Vm {
                     let (heap, roles) = self.snapshot_heap();
                     let bytes = write(&heap, &roles);
                     let class = self.roles.get(Role::ByteArrayClass);
-                    let v = self
-                        .heap
-                        .allocate(class, Space::Actor(0), Body::Bytes(bytes));
+                    let v = self.heap.allocate(
+                        class,
+                        Space::Actor(self.current as u32),
+                        Body::Bytes(bytes),
+                    );
                     self.stack.push(v);
                     Ok(None)
                 }
@@ -884,9 +1058,11 @@ impl Vm {
             closure: f.closure.unwrap_or(nil),
         };
         let class = self.roles.get(Role::ActivationClass);
-        let a = self
-            .heap
-            .allocate(class, Space::Actor(0), Body::Activation(record));
+        let a = self.heap.allocate(
+            class,
+            Space::Actor(self.current as u32),
+            Body::Activation(record),
+        );
         self.frames[index].activation = Some(a);
         a
     }
@@ -1009,25 +1185,239 @@ impl Vm {
         }
     }
 
-    /// Starts a turn: `messageLoop dispatchMessage: message port: nil`, sent
-    /// whatever the method's access (it is the loop's private entry point).
+    /// Starts the next turn: round robin, the first actor after the current
+    /// one with a packet in its mailbox, which it delivers with
+    /// `messageLoop dispatchPacket: packet`; failing that, the actor with the
+    /// earliest timer, after waiting for it, with `messageLoop
+    /// dispatchMessage: nil port: nil`. With neither, the run is over.
+    fn next_turn(&mut self, host: &mut dyn Host) -> Result<Option<Completion>, VmError> {
+        let n = self.actors.len();
+        for k in 1..=n {
+            let a = (self.current + k) % n;
+            if let Some(packet) = self.actors[a].mailbox.pop_front() {
+                self.current = a;
+                let selector = self.symbol("dispatchPacket:");
+                return self.dispatch_to_loop(selector, &[packet], host);
+            }
+        }
+        let earliest = (0..n)
+            .filter(|&a| self.actors[a].wakeup > 0)
+            .min_by_key(|&a| (self.actors[a].wakeup, a));
+        match earliest {
+            Some(a) => {
+                host.wait_until(self.actors[a].wakeup);
+                self.actors[a].wakeup = 0;
+                self.current = a;
+                let nil = self.nil();
+                self.dispatch(nil, host)
+            }
+            None => Ok(Some(Completion::Returned(self.nil()))),
+        }
+    }
+
+    /// Starts a turn: `messageLoop dispatchMessage: message port: nil`.
     fn dispatch(
         &mut self,
         message: Value,
         host: &mut dyn Host,
     ) -> Result<Option<Completion>, VmError> {
-        let receiver = self.roles.get(Role::MessageLoop);
-        let sel = self.selector_bytes(self.roles.get(Role::DispatchMessageSelector))?;
+        let selector = self.roles.get(Role::DispatchMessageSelector);
+        let nil = self.nil();
+        self.dispatch_to_loop(selector, &[message, nil], host)
+    }
+
+    /// Sends the running actor's message loop `selector` with `args`,
+    /// whatever the method's access (the loop's entry points are private).
+    fn dispatch_to_loop(
+        &mut self,
+        selector: Value,
+        args: &[Value],
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
+        let receiver = self.actors[self.current].message_loop;
+        let sel = self.selector_bytes(selector)?;
         let mut class = Some(self.class_of(receiver));
         while let Some(c) = class {
             if let Some(m) = self.method_at(c, &sel)? {
-                let nil = self.nil();
-                self.stack.extend([receiver, message, nil]);
-                return self.activate(m, 2, host);
+                self.stack.push(receiver);
+                self.stack.extend(args.iter().copied());
+                return self.activate(m, args.len(), host);
             }
             class = self.superclass(c)?;
         }
-        Err(VmError::MissingUpcall(Role::DispatchMessageSelector.name()))
+        Err(VmError::MissingUpcall("the message loop's entry point"))
+    }
+
+    /// The remote-representation rules (`actor-semantics.tex`, RR-Same to
+    /// RR-Promise) for `v` going from actor `from` to actor `to`: a far
+    /// reference into `to` becomes its target; any other far reference, any
+    /// promise record and any value passes as itself; any other object
+    /// becomes a new far reference into `from`, held by `to`.
+    fn remote_representation(&mut self, v: Value, from: usize, to: usize) -> Value {
+        match self.heap.get(v).map(|o| &o.body) {
+            None => v,
+            Some(Body::FarRef { actor, target }) => {
+                if *actor as usize == to {
+                    *target
+                } else {
+                    v
+                }
+            }
+            Some(Body::Promise(_)) => v,
+            _ if from == to => v,
+            Some(_) if self.is_value(v) => v,
+            Some(_) => {
+                let class = self.roles.get(Role::FarReferenceClass);
+                let r = self.heap.allocate(
+                    class,
+                    Space::Actor(to as u32),
+                    Body::FarRef {
+                        actor: from as u32,
+                        target: v,
+                    },
+                );
+                self.heap.get_mut(r).expect("new").header.flags |= VALUE;
+                r
+            }
+        }
+    }
+
+    /// Settles promise record `record` (Π) from the running actor: with
+    /// `value` (in its terms) as the resolution or the problem, or, for a
+    /// resolution that is itself a promise record, by forwarding to it.
+    /// Every waiter gets a packet. Answers false, changing nothing, if the
+    /// record was not pending.
+    fn settle(&mut self, record: Value, state: u8, value: Value) -> bool {
+        let pending = matches!(
+            self.heap.get(record).map(|o| &o.body),
+            Some(Body::Promise(p)) if p.state == PromiseRecord::PENDING
+        );
+        if !pending {
+            return false;
+        }
+        let mut value = self.neutral(value);
+        let mut state = state;
+        if state == PromiseRecord::FULFILLED && natives::is_promise(&self.heap, value) {
+            if natives::last_promise(&self.heap, value) == record {
+                state = PromiseRecord::BROKEN;
+                value = self.new_string("Cyclic resolution");
+            } else {
+                state = PromiseRecord::FORWARDED;
+            }
+        }
+        let Some(Body::Promise(p)) = self.heap.get_mut(record).map(|o| &mut o.body) else {
+            unreachable!("checked above")
+        };
+        p.state = state;
+        p.value = value;
+        let waiters = core::mem::take(&mut p.waiters);
+        let queue = core::mem::take(&mut p.queue);
+        if state == PromiseRecord::FORWARDED {
+            // The queue moves to the end of the chain (or is delivered, if
+            // that has settled).
+            let last = natives::last_promise(&self.heap, value);
+            let Some(Body::Promise(q)) = self.heap.get_mut(last).map(|o| &mut o.body) else {
+                unreachable!("a chain of promise records ends in one")
+            };
+            if q.state == PromiseRecord::PENDING {
+                q.queue.extend(queue);
+            } else {
+                let (s, v) = (q.state, q.value);
+                for entry in queue {
+                    self.deliver(entry, s, v);
+                }
+            }
+        } else {
+            for entry in queue {
+                self.deliver(entry, state, value);
+            }
+        }
+        for w in waiters {
+            self.notify(w, state, value);
+        }
+        true
+    }
+
+    /// `v` in no actor's terms: a non-value near object of the running actor
+    /// becomes a far reference into it (RR-Near-Far); anything else is itself.
+    fn neutral(&mut self, v: Value) -> Value {
+        match self.heap.get(v).map(|o| &o.body) {
+            Some(Body::FarRef { .. } | Body::Promise(_)) | None => v,
+            Some(_) if self.is_value(v) => v,
+            Some(_) => {
+                let current = self.current as u32;
+                let class = self.roles.get(Role::FarReferenceClass);
+                let r = self.heap.allocate(
+                    class,
+                    Space::Actor(current),
+                    Body::FarRef {
+                        actor: current,
+                        target: v,
+                    },
+                );
+                self.heap.get_mut(r).expect("new").header.flags |= VALUE;
+                r
+            }
+        }
+    }
+
+    /// Delivers a queued eventual send (`{sending actor. selector. result
+    /// record. arguments...}`) to a promise record that has settled with
+    /// `state` and `value` (Route-Fulfilled, Route-Broken): to a resolution
+    /// that is a far reference, as a packet to its actor; to a value, as a
+    /// packet to the sender's actor; to a broken promise, by breaking the
+    /// result record with the same problem.
+    fn deliver(&mut self, entry: Value, state: u8, value: Value) {
+        let elements = self.heap.array_elements(entry).expect("an Array").to_vec();
+        let sender = elements[0].as_small_integer().expect("an actor number") as u32;
+        let result = elements[2];
+        if state == PromiseRecord::BROKEN {
+            if natives::is_promise(&self.heap, result) {
+                self.settle(result, PromiseRecord::BROKEN, value);
+            }
+            return;
+        }
+        let to = match self.heap.get(value).map(|o| &o.body) {
+            Some(Body::FarRef { actor, .. }) => *actor,
+            _ => sender,
+        };
+        let mut packet = Vec::with_capacity(elements.len());
+        packet.push(value);
+        packet.extend_from_slice(&elements[1..]);
+        let packet: Vec<Value> = packet
+            .into_iter()
+            .map(|v| natives::localize(&self.heap, v, to))
+            .collect();
+        let array_class = self.roles.get(Role::ArrayClass);
+        let copy = self
+            .heap
+            .allocate(array_class, Space::Actor(to), Body::Array(packet));
+        self.actors[to as usize].mailbox.push_back(copy);
+    }
+
+    /// Posts to the library promise that far reference `waiter` reaches
+    /// `resolveRemotely: value` (fulfilled, or forwarded to the record
+    /// `value`) or `breakRemotely: value`.
+    fn notify(&mut self, waiter: Value, state: u8, value: Value) {
+        let Some(Body::FarRef { actor, .. }) = self.heap.get(waiter).map(|o| &o.body) else {
+            unreachable!("waiters are far references")
+        };
+        let to = *actor;
+        let selector = if state == PromiseRecord::BROKEN {
+            self.symbol("breakRemotely:")
+        } else {
+            self.symbol("resolveRemotely:")
+        };
+        let nil = self.nil();
+        let packet: Vec<Value> = [waiter, selector, nil, value]
+            .into_iter()
+            .map(|v| natives::localize(&self.heap, v, to))
+            .collect();
+        let array_class = self.roles.get(Role::ArrayClass);
+        let copy = self
+            .heap
+            .allocate(array_class, Space::Actor(to), Body::Array(packet));
+        self.actors[to as usize].mailbox.push_back(copy);
     }
 
     /// Sends `selector` (a role) to the current frame's activation with
@@ -1153,15 +1543,18 @@ impl Vm {
     ) -> Value {
         let name = self.new_string(native.name());
         let array_class = self.roles.get(Role::ArrayClass);
-        let arguments = self
-            .heap
-            .allocate(array_class, Space::Actor(0), Body::Array(args));
+        let arguments = self.heap.allocate(
+            array_class,
+            Space::Actor(self.current as u32),
+            Body::Array(args),
+        );
         let reason_name = self.new_string(reason.name());
         let reason_argument = {
             let mut ctx = NativeContext {
                 heap: &mut self.heap,
                 roles: &self.roles,
                 host,
+                space: Space::Actor(self.current as u32),
             };
             reason.argument(&mut ctx)
         };
@@ -1179,8 +1572,11 @@ impl Vm {
             reason_name,
             reason_argument,
         ]);
-        self.heap
-            .allocate(class, Space::Actor(0), Body::Regular(slots))
+        self.heap.allocate(
+            class,
+            Space::Actor(self.current as u32),
+            Body::Regular(slots),
+        )
     }
 
     // ----- Execution -----
@@ -1573,7 +1969,7 @@ impl Vm {
                 let class = self.roles.get(Role::ArrayClass);
                 let a = self.heap.allocate(
                     class,
-                    Space::Actor(0),
+                    Space::Actor(self.current as u32),
                     Body::Array(alloc::vec![nil; bytes[1] as usize]),
                 );
                 self.stack.push(a);
@@ -1586,9 +1982,11 @@ impl Vm {
                 }
                 let elements = self.stack.split_off(self.stack.len() - n);
                 let class = self.roles.get(Role::ArrayClass);
-                let a = self
-                    .heap
-                    .allocate(class, Space::Actor(0), Body::Array(elements));
+                let a = self.heap.allocate(
+                    class,
+                    Space::Actor(self.current as u32),
+                    Body::Array(elements),
+                );
                 self.stack.push(a);
                 None
             }
@@ -1629,10 +2027,16 @@ impl Vm {
                 let args = self.stack.split_off(self.stack.len() - n);
                 let receiver = self.pop()?;
                 let array_class = self.roles.get(Role::ArrayClass);
-                let array = self
-                    .heap
-                    .allocate(array_class, Space::Actor(0), Body::Array(args));
-                let message_loop = self.roles.get(Role::MessageLoop);
+                let array = self.heap.allocate(
+                    array_class,
+                    Space::Actor(self.current as u32),
+                    Body::Array(args),
+                );
+                // The running actor's own loop.
+                let message_loop = self
+                    .actors
+                    .get(self.current)
+                    .map_or_else(|| self.roles.get(Role::MessageLoop), |a| a.message_loop);
                 self.stack.extend([message_loop, receiver, selector, array]);
                 let send = self.symbol("eventualSendTo:selector:arguments:");
                 self.ordinary_send(send, 3, host)?
@@ -1719,7 +2123,7 @@ impl Vm {
                 let class = self.roles.get(Role::ClosureClass);
                 let closure = self.heap.allocate(
                     class,
-                    Space::Actor(0),
+                    Space::Actor(self.current as u32),
                     Body::Closure(crate::object::Closure {
                         defining,
                         initial_ip: next as u32,

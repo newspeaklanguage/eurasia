@@ -10,7 +10,7 @@ use core::fmt;
 use eurasia_core::Value;
 use eurasia_core::object::{
     Access, Activation, Behavior, Body, Closure, FLAGS, Heap, HeapError, Method, MethodHeader,
-    MethodKind, Mixin, Object, Space,
+    MethodKind, Mixin, Object, PromiseRecord, Space,
 };
 use eurasia_core::roles::{Role, Roles, RolesError};
 
@@ -35,6 +35,8 @@ const KIND_CLASS: u8 = 11;
 const KIND_METACLASS: u8 = 12;
 const KIND_CLOSURE: u8 = 13;
 const KIND_ACTIVATION: u8 = 14;
+const KIND_FAR_REFERENCE: u8 = 15;
+const KIND_PROMISE: u8 = 16;
 
 /// Why an image could not be loaded.
 #[derive(Debug, Clone, PartialEq)]
@@ -206,6 +208,8 @@ fn write_node(w: &mut Writer, o: &Object) {
         Body::Metaclass(_) => KIND_METACLASS,
         Body::Closure(_) => KIND_CLOSURE,
         Body::Activation(_) => KIND_ACTIVATION,
+        Body::FarRef { .. } => KIND_FAR_REFERENCE,
+        Body::Promise(_) => KIND_PROMISE,
     };
     w.u8(kind);
     w.u8(o.header.flags);
@@ -265,6 +269,12 @@ fn write_node(w: &mut Writer, o: &Object) {
         }
         // Saved activations are dead: an idle heap has no frames.
         Body::Activation(_) => {}
+        Body::FarRef { actor, .. } => w.uv((*actor).into()),
+        Body::Promise(p) => {
+            w.uv(p.state.into());
+            w.uv(p.waiters.len() as u64);
+            w.uv(p.queue.len() as u64);
+        }
     }
 }
 
@@ -312,6 +322,13 @@ fn write_edges(w: &mut Writer, o: &Object, to_node: &dyn Fn(Value) -> Value) {
             c.copied.iter().for_each(|&x| v(x));
         }
         Body::Activation(a) => [a.method, a.receiver, a.closure].into_iter().for_each(v),
+        Body::FarRef { target, .. } => v(*target),
+        Body::Promise(p) => {
+            v(p.value);
+            v(p.owner);
+            p.waiters.iter().for_each(|&x| v(x));
+            p.queue.iter().for_each(|&x| v(x));
+        }
         Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => {}
     }
 }
@@ -588,6 +605,25 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
             receiver: p,
             closure: p,
         }),
+        KIND_FAR_REFERENCE => Body::FarRef {
+            actor: u32::try_from(r.uv()?).map_err(|_| LoadError::UnknownKind { node, kind })?,
+            target: p,
+        },
+        KIND_PROMISE => {
+            let state = u8::try_from(r.uv()?)
+                .ok()
+                .filter(|&s| s <= PromiseRecord::FORWARDED)
+                .ok_or(LoadError::UnknownKind { node, kind })?;
+            let waiters = len(r)?;
+            let queue = len(r)?;
+            Body::Promise(PromiseRecord {
+                state,
+                value: p,
+                owner: p,
+                waiters: alloc::vec![p; waiters],
+                queue: alloc::vec![p; queue],
+            })
+        }
         _ => return Err(LoadError::UnknownKind { node, kind }),
     };
     Ok((flags, body))
@@ -601,6 +637,8 @@ fn edge_count(body: &Body) -> usize {
         Body::Method(_) | Body::Class(_) | Body::Metaclass(_) => 5,
         Body::Closure(c) => 1 + c.copied.len(),
         Body::Activation(_) => 3,
+        Body::FarRef { .. } => 1,
+        Body::Promise(p) => 2 + p.waiters.len() + p.queue.len(),
         Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => 0,
     }
 }
@@ -673,6 +711,17 @@ fn fill_body(
             method: resolve(e[0])?,
             receiver: resolve(e[1])?,
             closure: resolve(e[2])?,
+        }),
+        Body::FarRef { actor, .. } => Body::FarRef {
+            actor,
+            target: resolve(e[0])?,
+        },
+        Body::Promise(p) => Body::Promise(PromiseRecord {
+            value: resolve(e[0])?,
+            owner: resolve(e[1])?,
+            waiters: all(&e[2..2 + p.waiters.len()])?,
+            queue: all(&e[2 + p.waiters.len()..])?,
+            ..p
         }),
         other => other,
     })

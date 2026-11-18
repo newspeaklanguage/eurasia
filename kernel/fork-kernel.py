@@ -134,19 +134,21 @@ def main():
     t = t[:start] + """	public main: v args: args = (
 		(* The genesis entry (Eurasia). The genesis packager built this module's classes and filled its slots; Eurasia runs this once and saves the base image to the path given as the first argument. The application builds its platform over this kernel (platformOver:); its actors module builds the message loop, which becomes the image's MessageLoop role, so the base image starts as psoup's images do: the VM delivers the arguments as the startup message, and the loop sends the application main: platform args:. *)
 
-		| platform |
+		| platform loop |
 		vm setRole: 32 to: application.
 		platform:: application platformOver: self.
-		messageLoop:: platform actors buildLoopForApplication: application platform: platform.
-		vm setRole: 17 to: messageLoop.
+		loop:: platform actors buildLoopForApplication: application platform: platform.
+		vm setRole: 17 to: loop.
+		(* The platform template, from which every further actor's platform is cloned: a copy made before the loop runs anything (EURASIA_ACTORS_DESIGN_2026-11-17.md section 5). *)
+		vm setRole: 36 to: (vm clone: loop).
 		vm writeBytes: vm snapshot toFile: (args at: 1)
 	)
 	unhandled: exception from: activation = (
 		(* An image with a message loop hands the exception to it, as psoup's kernel does (MessageLoop>>unhandledException:from:: the application's handler of last resort, if it set one, and the turn ends; otherwise a trace and exit). Without one (genesis), print the exception and a stack trace, then exit. Pausing the actor, the decided semantics, arrives with the debugger (M6). *)
 
 		| a |
-		nil = messageLoop ifFalse: [
-				^messageLoop unhandledException: exception from: activation
+		nil = vm currentMessageLoop ifFalse: [
+				^vm currentMessageLoop unhandledException: exception from: activation
 			].
 		nil = reportingUnhandled ifFalse: [
 				vm print: 'Unhandled exception while reporting an unhandled exception'.
@@ -206,6 +208,18 @@ def main():
 		public applyMixin: mixin superclass: superclass enclosingObject: enclosingObject = (
 		)
 		public isValue: object = (
+		)
+		public clone: root = (
+		)
+		public newActor = (
+		)
+		public farReference: handle to: value = (
+		)
+		public post: packet to: farReference = (
+		)
+		public isFarReference: object = (
+		)
+		public currentMessageLoop = (
 		)
 		public classOf: object = (
 		)
@@ -393,6 +407,28 @@ def main():
 			^left asFloat / self
 		)
 """)
+
+    # 15. Far references (role 35): opaque VM objects (Φ). An ordinary send
+    #     to one fails as an immediate send to psoup's eventual refs does.
+    anchor = "\tpublic class Fraction reducedNumerator: num denominator: denom = Number new ("
+    t = replace(t, anchor, """	public class FarReference _cannotInstantiate = (
+		(* A far reference (Eurasia): a reference to an object in another actor's heap. Only eventual sends reach its target; the VM translates their arguments by the remote-representation rules. *)
+
+	) (
+		doesNotUnderstand: message <Message> = (
+			0 = message arguments size ifTrue: [
+					(message selector startsWith: 'isKindOf') ifTrue: [ ^false ]
+				].
+			^Error signal: 'Cannot immediate-send to an eventual ref: ' , message selector
+		)
+		public isKindOfFarReference = (
+			^true
+		)
+		public printString = (
+			^'a far reference'
+		)
+	) : ()
+""" + anchor)
 
     # 14. Values (EURASIA_ACTORS_DESIGN_2026-11-17.md section 5): the Value
     #     class of the language spec, the superclass of all values, which the

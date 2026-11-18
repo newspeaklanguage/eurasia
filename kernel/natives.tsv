@@ -113,6 +113,12 @@ VMMirror	instance	garbageCollect	VmGarbageCollect	120
 VMMirror	instance	monotonicNanos	VmMonotonicNanos	121
 VMMirror	instance	applyMixin:superclass:enclosingObject:	VmApplyMixin	122
 VMMirror	instance	isValue:	VmIsValue	125
+VMMirror	instance	clone:	VmClone	126
+VMMirror	instance	newActor	VmNewActor	127
+VMMirror	instance	farReference:to:	VmFarReferenceTo	128
+VMMirror	instance	post:to:	VmPost	129
+VMMirror	instance	isFarReference:	VmIsFarReference	130
+VMMirror	instance	currentMessageLoop	VmCurrentMessageLoop	131
 VMMirror	instance	currentActivation	CurrentActivation	100
 VMMirror	instance	definingActivationOf:	DefiningActivationOf	110
 VMMirror	instance	print:	VmPrint	20
@@ -121,10 +127,21 @@ VMMirror	instance	snapshot	VmSnapshot	90
 VMMirror	instance	writeBytes:toFile:	VmWriteFile	91
 VMMirror	instance	readFile:	VmReadFile	92
 VMMirror	instance	setRole:to:	VmSetRole	93
-# psoup's actors module (ActorsForPrimordialSoup.ns), packaged unchanged but
-# for its primitive pragmas: the genesis packager installs these natives on
-# its methods by class name, as psoup's primitives were.
-ActorsForPrimordialSoup	instance	classOf:	VmClassOf	113
-ActorsForPrimordialSoup	instance	currentMonotonicNanos	VmMonotonicNanos	121
+# The actors module (newspeak/EurasiaActors.ns, derived from psoup's by
+# kernel/fork-actors.py): the genesis packager installs these natives on its
+# methods by class name, as psoup's primitives were.
+EurasiaActors	instance	classOf:	VmClassOf	113
+EurasiaActors	instance	currentMonotonicNanos	VmMonotonicNanos	121
+EurasiaActors	instance	newActorHandle	VmNewActor	127
+EurasiaActors	instance	farReference:to:	VmFarReferenceTo	128
+EurasiaActors	instance	post:to:	VmPost	129
+EurasiaActors	instance	isFarReference:	VmIsFarReference	130
 MessageLoop	instance	finish:	VmFinishTurn	123
 MessageLoop	instance	exit:	VmExit	21
+EurasiaActors	instance	newPromiseFor:	VmNewPromise	132
+EurasiaActors	instance	resolvePromise:with:	VmResolvePromise	133
+EurasiaActors	instance	breakPromise:with:	VmBreakPromise	134
+EurasiaActors	instance	promiseState:	VmPromiseState	135
+EurasiaActors	instance	promise:addWaiter:	VmPromiseAddWaiter	136
+EurasiaActors	instance	isVMPromise:	VmIsPromise	137
+EurasiaActors	instance	promise:send:	VmPromiseSend	138

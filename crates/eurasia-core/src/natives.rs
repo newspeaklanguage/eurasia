@@ -18,7 +18,7 @@ use core::cmp::Ordering;
 
 use crate::bigint::BigInt;
 use crate::host::Host;
-use crate::object::{Behavior, Body, FROZEN, Heap, Space, VALUE, VALUE_CLASS};
+use crate::object::{Behavior, Body, FROZEN, Heap, PromiseRecord, Space, VALUE, VALUE_CLASS};
 use crate::roles::{Role, Roles};
 use crate::value::{SmallInteger, Value};
 
@@ -162,6 +162,19 @@ natives! {
     VmPerformWith = 119 / 3: "`vm object:perform:with:`: an ordinary send, whatever the receiver overrides.",
     VmGarbageCollect = 120 / 0: "`vm garbageCollect`: a full collection; answers the receiver.",
     VmMonotonicNanos = 121 / 0: "`vm monotonicNanos` (input).",
+    VmClone = 126 / 1: "`vm clone: root`: a copy of the mutable graph reachable from root (values, program objects, shared objects and their classes are not copied).",
+    VmNewActor = 127 / 0: "`vm newActor`: a new actor running a clone of the platform template; answers a far reference to nil in it, its handle.",
+    VmFarReferenceTo = 128 / 2: "`vm farReference: handle to: value`: a far reference to a value in the handle's actor.",
+    VmPost = 129 / 2: "`vm post: array to: farReference`: queue the array, its elements translated by the remote-representation rules, in the far reference's actor, whose message loop gets dispatchPacket:.",
+    VmIsFarReference = 130 / 1: "`vm isFarReference:`.",
+    VmCurrentMessageLoop = 131 / 0: "`vm currentMessageLoop`: the running actor's message loop.",
+    VmNewPromise = 132 / 1: "`vm newPromiseFor: localPromise`: a pending promise record (Π) whose owner is a far reference to the argument in the running actor.",
+    VmResolvePromise = 133 / 2: "`vm resolvePromise: record with: value`: fulfil a pending record, or forward it if the value is a record; its waiters are sent resolveRemotely:. Answers whether it was pending.",
+    VmBreakPromise = 134 / 2: "`vm breakPromise: record with: problem`: break a pending record; its waiters are sent breakRemotely:. Answers whether it was pending.",
+    VmPromiseState = 135 / 1: "`vm promiseState: record`: `{state. payload}` at the end of its forwarding chain, in the running actor's terms: 0 and the owner's promise if that is in the running actor, else the last record; 1 and the resolution; 2 and the problem.",
+    VmPromiseAddWaiter = 136 / 2: "`vm promise: record addWaiter: localPromise`: the argument is sent resolveRemotely: or breakRemotely: (in a packet) when the record, at the end of its chain, settles; at once if it has.",
+    VmIsPromise = 137 / 1: "`vm isPromise:`: whether the object is a promise record.",
+    VmPromiseSend = 138 / 2: "`vm promise: record send: {selector. resultRecord. arguments...}`: an eventual send to the promise (Route-Pending): queued in the record, at the end of its chain, until it settles; delivered at once if it has.",
     VmIsValue = 125 / 1: "`vm isValue:`: whether the object is a value (immediates, nil, booleans, strings, numbers, instances of value classes, classes with a value enclosing object).",
     SlotStore = 124 / 1: "Not a native: the failure of a slot setter, for a frozen receiver or a non-value stored into a value.",
     VmFinishTurn = 123 / 1: "`MessageLoop>>finish:`: ends the turn; the argument is the next timer's monotonic time in nanoseconds, or 0 for none.",
@@ -216,7 +229,7 @@ fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Outcom
     let nil = ctx.nil();
     let metaclass = ctx.heap.allocate(
         metaclass_class,
-        Space::Actor(0),
+        ctx.space,
         Body::Metaclass(Behavior {
             mixin: cm,
             superclass: meta_super,
@@ -228,7 +241,7 @@ fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Outcom
     );
     let class = ctx.heap.allocate(
         metaclass,
-        Space::Actor(0),
+        ctx.space,
         Body::Class(Behavior {
             mixin: m,
             superclass: s,
@@ -245,6 +258,43 @@ fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Outcom
     ctx.heap.get_mut(class).expect("class").header.flags |= class_flags;
     ctx.heap.get_mut(metaclass).expect("metaclass").header.flags |= class_flags & VALUE;
     Outcome::Answer(class)
+}
+
+/// A far reference to `target` in `actor`'s heap, allocated in the running
+/// actor's. Far references are immutable capabilities, so they are values.
+pub fn new_far_reference(ctx: &mut NativeContext<'_>, actor: u32, target: Value) -> Value {
+    let class = ctx.roles.get(Role::FarReferenceClass);
+    let space = ctx.space;
+    let r = ctx
+        .heap
+        .allocate(class, space, Body::FarRef { actor, target });
+    ctx.heap.get_mut(r).expect("new").header.flags |= VALUE;
+    r
+}
+
+/// Whether `v` is a promise record.
+pub fn is_promise(heap: &Heap, v: Value) -> bool {
+    matches!(heap.get(v).map(|o| &o.body), Some(Body::Promise(_)))
+}
+
+/// The promise record at the end of `record`'s forwarding chain.
+pub fn last_promise(heap: &Heap, record: Value) -> Value {
+    let mut r = record;
+    while let Some(Body::Promise(p)) = heap.get(r).map(|o| &o.body)
+        && p.state == PromiseRecord::FORWARDED
+    {
+        r = p.value;
+    }
+    r
+}
+
+/// `v`, in no actor's terms, as actor `actor` sees it: a far reference into
+/// it is its target (RR-Far-Home); anything else is itself.
+pub fn localize(heap: &Heap, v: Value, actor: u32) -> Value {
+    match heap.get(v).map(|o| &o.body) {
+        Some(Body::FarRef { actor: a, target }) if *a == actor => *target,
+        _ => v,
+    }
 }
 
 /// Whether mixin `m` declares a mutable slot: it has a setter other than the
@@ -371,6 +421,44 @@ pub enum Outcome {
     Snapshot,
     /// Collect garbage now (`vm garbageCollect`), then answer the receiver.
     Collect,
+    /// `vm newActor`: the interpreter, which owns the actors, creates one.
+    NewActor,
+    /// `vm post:to:`: the interpreter translates and queues the packet.
+    Post {
+        /// The packet (an Array in the sending actor's heap).
+        packet: Value,
+        /// The destination.
+        far_reference: Value,
+    },
+    /// `vm currentMessageLoop`.
+    CurrentMessageLoop,
+    /// `vm resolvePromise:with:` and `vm breakPromise:with:`: the
+    /// interpreter settles the record and notifies its waiters.
+    Settle {
+        /// The promise record.
+        record: Value,
+        /// [`PromiseRecord::FULFILLED`] or [`PromiseRecord::BROKEN`].
+        state: u8,
+        /// The resolution or problem, in the running actor's terms.
+        value: Value,
+    },
+    /// `vm promise:send:`: the interpreter queues the message in the record
+    /// or delivers it.
+    PromiseSend {
+        /// The promise record.
+        record: Value,
+        /// `{selector. result record or nil. arguments...}`, in the running
+        /// actor's terms.
+        message: Value,
+    },
+    /// `vm promise:addWaiter:`: the interpreter registers the waiter, or
+    /// notifies it at once.
+    AddWaiter {
+        /// The promise record.
+        record: Value,
+        /// A library promise in the running actor.
+        waiter: Value,
+    },
     /// End the turn (`finish:`): the stack unwinds and the VM's event loop
     /// waits until the given monotonic time in nanoseconds (0: no timer).
     FinishTurn(u64),
@@ -404,6 +492,8 @@ pub struct NativeContext<'a> {
     pub roles: &'a Roles,
     /// The host.
     pub host: &'a mut dyn Host,
+    /// The running actor's heap, where allocations go.
+    pub space: Space,
 }
 
 impl NativeContext<'_> {
@@ -414,7 +504,7 @@ impl NativeContext<'_> {
 
     fn new_bytes_object(&mut self, role: Role, body: Body) -> Value {
         let class = self.roles.get(role);
-        self.heap.allocate(class, Space::Actor(0), body)
+        self.heap.allocate(class, self.space, body)
     }
 
     fn boolean(&self, b: bool) -> Value {
@@ -443,7 +533,7 @@ impl NativeContext<'_> {
         let class = self.roles.get(Role::LargeIntegerClass);
         self.heap.allocate(
             class,
-            Space::Actor(0),
+            self.space,
             Body::LargeInteger {
                 negative,
                 magnitude,
@@ -455,7 +545,7 @@ impl NativeContext<'_> {
     fn float(&mut self, f: f64) -> Value {
         let f = if f.is_nan() { f64::NAN } else { f };
         let class = self.roles.get(Role::FloatClass);
-        self.heap.allocate(class, Space::Actor(0), Body::Float(f))
+        self.heap.allocate(class, self.space, Body::Float(f))
     }
 }
 
@@ -1122,7 +1212,7 @@ pub fn invoke(
                 let nil = ctx.nil();
                 return Outcome::Answer(ctx.heap.allocate(
                     receiver,
-                    Space::Actor(0),
+                    ctx.space,
                     Body::Ephemeron {
                         key: nil,
                         value: nil,
@@ -1136,11 +1226,9 @@ pub fn invoke(
             match instance_slots(ctx.heap, ctx.roles, receiver) {
                 Some(n) => {
                     let nil = ctx.nil();
-                    let instance = ctx.heap.allocate(
-                        receiver,
-                        Space::Actor(0),
-                        Body::Regular(alloc::vec![nil; n]),
-                    );
+                    let instance =
+                        ctx.heap
+                            .allocate(receiver, ctx.space, Body::Regular(alloc::vec![nil; n]));
                     // An instance of a value class is a value from allocation;
                     // its init setters check what it is given (the end of
                     // construction is not marked yet: design doc section 5).
@@ -1179,7 +1267,7 @@ pub fn invoke(
             } else {
                 return Outcome::Fail(Reason::NotInstantiable);
             };
-            Outcome::Answer(ctx.heap.allocate(receiver, Space::Actor(0), body))
+            Outcome::Answer(ctx.heap.allocate(receiver, ctx.space, body))
         }
         Native::IndexedAt => {
             let result = match ctx.heap.get(receiver).map(|o| &o.body) {
@@ -1256,7 +1344,7 @@ pub fn invoke(
                         }
                         _ => class.expect("receiver"),
                     };
-                    Outcome::Answer(ctx.heap.allocate(class, Space::Actor(0), body))
+                    Outcome::Answer(ctx.heap.allocate(class, ctx.space, body))
                 }
                 Err(r) => Outcome::Fail(r),
             }
@@ -1537,6 +1625,125 @@ pub fn invoke(
         }
         Native::VmGarbageCollect => Outcome::Collect,
         Native::VmIsValue => Outcome::Answer(ctx.boolean(ctx.is_value(arg(0)))),
+        Native::VmClone => {
+            let space = ctx.space;
+            Outcome::Answer(ctx.heap.clone_graph(arg(0), space))
+        }
+        Native::VmNewActor => Outcome::NewActor,
+        Native::VmFarReferenceTo => {
+            let Some(Body::FarRef { actor, .. }) = ctx.heap.get(arg(0)).map(|o| &o.body) else {
+                return Outcome::Fail(Reason::WrongKind(1));
+            };
+            let actor = *actor;
+            if !ctx.is_value(arg(1)) {
+                return Outcome::Fail(Reason::WrongKind(2));
+            }
+            Outcome::Answer(new_far_reference(ctx, actor, arg(1)))
+        }
+        Native::VmPost => {
+            if !matches!(ctx.heap.get(arg(0)).map(|o| &o.body), Some(Body::Array(_))) {
+                return Outcome::Fail(Reason::WrongKind(1));
+            }
+            if !matches!(
+                ctx.heap.get(arg(1)).map(|o| &o.body),
+                Some(Body::FarRef { .. })
+            ) {
+                return Outcome::Fail(Reason::WrongKind(2));
+            }
+            Outcome::Post {
+                packet: arg(0),
+                far_reference: arg(1),
+            }
+        }
+        Native::VmIsFarReference => Outcome::Answer(ctx.boolean(matches!(
+            ctx.heap.get(arg(0)).map(|o| &o.body),
+            Some(Body::FarRef { .. })
+        ))),
+        Native::VmCurrentMessageLoop => Outcome::CurrentMessageLoop,
+        Native::VmNewPromise => {
+            let Space::Actor(current) = ctx.space else {
+                return Outcome::Fail(Reason::Unsupported);
+            };
+            let owner = new_far_reference(ctx, current, arg(0));
+            let class = ctx.roles.get(Role::FarReferenceClass);
+            let space = ctx.space;
+            Outcome::Answer(ctx.heap.allocate(
+                class,
+                space,
+                Body::Promise(PromiseRecord {
+                    state: PromiseRecord::PENDING,
+                    value: ctx.nil(),
+                    owner,
+                    waiters: Vec::new(),
+                    queue: Vec::new(),
+                }),
+            ))
+        }
+        Native::VmResolvePromise | Native::VmBreakPromise => {
+            if !is_promise(ctx.heap, arg(0)) {
+                return Outcome::Fail(Reason::WrongKind(1));
+            }
+            Outcome::Settle {
+                record: arg(0),
+                state: if native == Native::VmResolvePromise {
+                    PromiseRecord::FULFILLED
+                } else {
+                    PromiseRecord::BROKEN
+                },
+                value: arg(1),
+            }
+        }
+        Native::VmPromiseState => {
+            if !is_promise(ctx.heap, arg(0)) {
+                return Outcome::Fail(Reason::WrongKind(1));
+            }
+            let Space::Actor(current) = ctx.space else {
+                return Outcome::Fail(Reason::Unsupported);
+            };
+            let last = last_promise(ctx.heap, arg(0));
+            let Some(Body::Promise(p)) = ctx.heap.get(last).map(|o| &o.body) else {
+                unreachable!("a chain of promise records ends in one")
+            };
+            let (state, value, owner) = (p.state, p.value, p.owner);
+            let payload = if state == PromiseRecord::PENDING {
+                match ctx.heap.get(owner).map(|o| &o.body) {
+                    Some(Body::FarRef { actor, target }) if *actor == current => *target,
+                    _ => last,
+                }
+            } else {
+                localize(ctx.heap, value, current)
+            };
+            let array_class = ctx.roles.get(Role::ArrayClass);
+            let space = ctx.space;
+            let state = Value::small_integer(state.into()).expect("small");
+            Outcome::Answer(ctx.heap.allocate(
+                array_class,
+                space,
+                Body::Array(alloc::vec![state, payload]),
+            ))
+        }
+        Native::VmPromiseAddWaiter => {
+            if !is_promise(ctx.heap, arg(0)) {
+                return Outcome::Fail(Reason::WrongKind(1));
+            }
+            Outcome::AddWaiter {
+                record: arg(0),
+                waiter: arg(1),
+            }
+        }
+        Native::VmIsPromise => Outcome::Answer(ctx.boolean(is_promise(ctx.heap, arg(0)))),
+        Native::VmPromiseSend => {
+            if !is_promise(ctx.heap, arg(0)) {
+                return Outcome::Fail(Reason::WrongKind(1));
+            }
+            match ctx.heap.get(arg(1)).map(|o| &o.body) {
+                Some(Body::Array(e)) if e.len() >= 2 => Outcome::PromiseSend {
+                    record: arg(0),
+                    message: arg(1),
+                },
+                _ => Outcome::Fail(Reason::WrongKind(2)),
+            }
+        }
         // Never installed: the interpreter reports refused slot stores with it.
         Native::SlotStore => Outcome::Fail(Reason::WrongKind(0)),
         Native::VmFinishTurn => match arg(0).as_small_integer() {

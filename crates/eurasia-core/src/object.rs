@@ -34,8 +34,11 @@ pub const VALUE: u8 = 2;
 /// role (decided 2026-11-17, `EURASIA_ACTORS_DESIGN_2026-11-17.md` section
 /// 5). Its instances are values.
 pub const VALUE_CLASS: u8 = 4;
+/// Object flag: shared by every actor of the cohort, though mutable (the
+/// kernel module and the VM mirror). Cloning a platform does not copy it.
+pub const SHARED: u8 = 8;
 /// Every defined flag (snapshot format, section 5).
-pub const FLAGS: u8 = FROZEN | VALUE | VALUE_CLASS;
+pub const FLAGS: u8 = FROZEN | VALUE | VALUE_CLASS | SHARED;
 
 /// The fields every object has.
 #[derive(Clone, Debug)]
@@ -178,6 +181,39 @@ pub struct Activation {
     pub closure: Value,
 }
 
+/// A promise record (hidden layout; `actor-semantics.tex`, the table Π): the
+/// state of a promise that has crossed actors, which every actor sees.
+/// Values in it are in no actor's terms: values, far references and promise
+/// records only.
+#[derive(Clone, Debug)]
+pub struct PromiseRecord {
+    /// [`PromiseRecord::PENDING`], `FULFILLED`, `BROKEN` or `FORWARDED`.
+    pub state: u8,
+    /// The resolution, the problem, or the promise record forwarded to; nil
+    /// while pending.
+    pub value: Value,
+    /// A far reference to the library promise of the actor that created the
+    /// record, which stands for it there; nil for none.
+    pub owner: Value,
+    /// Far references to library promises waiting for it to settle.
+    pub waiters: Vec<Value>,
+    /// Eventual sends to it while pending (Route-Pending), in the order
+    /// sent: each an Array `{sending actor. selector. result record or nil.
+    /// arguments...}`, delivered when it settles.
+    pub queue: Vec<Value>,
+}
+
+impl PromiseRecord {
+    /// Not yet settled.
+    pub const PENDING: u8 = 0;
+    /// Fulfilled with `value`.
+    pub const FULFILLED: u8 = 1;
+    /// Broken with `value`, the problem.
+    pub const BROKEN: u8 = 2;
+    /// Resolved to another promise record, `value`.
+    pub const FORWARDED: u8 = 3;
+}
+
 /// An object's contents.
 #[derive(Clone, Debug)]
 pub enum Body {
@@ -221,6 +257,16 @@ pub enum Body {
     Closure(Closure),
     /// An activation handle.
     Activation(Activation),
+    /// A far reference (hidden layout; `actor-semantics.tex`, the table Φ):
+    /// the one place a reference into another actor's heap may be held.
+    FarRef {
+        /// The actor whose heap holds the target.
+        actor: u32,
+        /// The target, in that heap.
+        target: Value,
+    },
+    /// A promise record.
+    Promise(PromiseRecord),
 }
 
 /// An object.

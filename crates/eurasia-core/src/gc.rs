@@ -26,7 +26,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::object::{Body, Heap};
+use crate::object::{Body, FROZEN, Heap, SHARED, Space, VALUE};
 use crate::value::Value;
 
 /// Where each object of a collected heap went.
@@ -103,6 +103,13 @@ fn for_each_strong(body: &Body, mut f: impl FnMut(Value)) {
             c.copied.iter().copied().for_each(f);
         }
         Body::Activation(a) => [a.method, a.receiver, a.closure].into_iter().for_each(f),
+        Body::FarRef { target, .. } => f(*target),
+        Body::Promise(p) => {
+            f(p.value);
+            f(p.owner);
+            p.waiters.iter().copied().for_each(&mut f);
+            p.queue.iter().copied().for_each(f);
+        }
     }
 }
 
@@ -164,6 +171,13 @@ fn map_all(body: &mut Body, f: &impl Fn(Value) -> Value) {
             a.method = f(a.method);
             a.receiver = f(a.receiver);
             a.closure = f(a.closure);
+        }
+        Body::FarRef { target, .. } => *target = f(*target),
+        Body::Promise(p) => {
+            p.value = f(p.value);
+            p.owner = f(p.owner);
+            each(&mut p.waiters);
+            each(&mut p.queue);
         }
     }
 }
@@ -314,6 +328,103 @@ impl Heap {
             after: self.objects.len(),
         };
         (forwarding, statistics)
+    }
+}
+
+impl Heap {
+    /// Clones the mutable graph reachable from `root` into `space`, as
+    /// actor creation copies the platform template
+    /// (`EURASIA_ACTORS_DESIGN_2026-11-17.md` section 5). Shared, and not
+    /// copied: immediates, values, frozen objects, objects marked
+    /// [`SHARED`], program objects (methods, mixins), far references, and a
+    /// class or metaclass whose enclosing object is shared. A class nested
+    /// in a copied object is copied with it, so the copies' code reaches the
+    /// copies' state. Copies are allocated in discovery order (fresh
+    /// sequence numbers, deterministic) and keep their flags; weak elements
+    /// are copied like strong ones (a template is never collected into).
+    /// Answers the copy of `root`, or `root` itself if it is shared.
+    pub fn clone_graph(&mut self, root: Value, space: Space) -> Value {
+        let n = self.objects.len();
+        let mut copy_of: Vec<u64> = vec![COLLECTED; n];
+        // Breadth first; `order` is both the queue and the discovery order.
+        let mut order: Vec<usize> = Vec::new();
+        let visit = |v: Value, heap: &Heap, copy_of: &mut Vec<u64>, order: &mut Vec<usize>| {
+            if let Some(i) = v.as_reference() {
+                let i = i as usize;
+                if i < n && copy_of[i] == COLLECTED && !heap.is_shared(i) {
+                    copy_of[i] = 0;
+                    order.push(i);
+                }
+            }
+        };
+        visit(root, self, &mut copy_of, &mut order);
+        let mut head = 0;
+        while head < order.len() {
+            let i = order[head];
+            head += 1;
+            let object = &self.objects[i];
+            let mut refs = Vec::new();
+            refs.push(object.header.class);
+            every_reference(&object.body, |v| refs.push(v));
+            for v in refs {
+                visit(v, self, &mut copy_of, &mut order);
+            }
+        }
+        // Allocate the copies, in discovery order, then rewrite them.
+        let mut new_index: Vec<u64> = (0..n as u64).collect();
+        for &i in &order {
+            let original = self.objects[i].clone();
+            let copy = self.allocate(original.header.class, space, original.body);
+            if let Some(o) = self.get_mut(copy) {
+                o.header.flags = original.header.flags;
+            }
+            new_index[i] = copy.as_reference().expect("a reference");
+        }
+        let forward = |v: Value| match v.as_reference() {
+            Some(i) if (i as usize) < n => {
+                Value::reference(new_index[i as usize]).expect("in range")
+            }
+            _ => v,
+        };
+        for &i in &order {
+            let k = new_index[i] as usize;
+            let object = &mut self.objects[k];
+            object.header.class = forward(object.header.class);
+            map_all(&mut object.body, &forward);
+        }
+        forward(root)
+    }
+
+    /// Whether object `i` is shared by every actor rather than copied with
+    /// a platform (see [`Heap::clone_graph`]).
+    fn is_shared(&self, i: usize) -> bool {
+        let object = &self.objects[i];
+        if object.header.flags & (FROZEN | VALUE | SHARED) != 0
+            || object.header.space == Space::Program
+        {
+            return true;
+        }
+        match &object.body {
+            Body::Method(_) | Body::Mixin(_) | Body::FarRef { .. } | Body::Promise(_) => true,
+            Body::Class(b) | Body::Metaclass(b) => match b.enclosing_object.as_reference() {
+                Some(e) => (e as usize) == i || self.is_shared(e as usize),
+                None => true,
+            },
+            _ => false,
+        }
+    }
+}
+
+/// Calls `f` on every reference field of `body`, weak ones included.
+fn every_reference(body: &Body, f: impl FnMut(Value)) {
+    match body {
+        Body::WeakArray(e) => e.iter().copied().for_each(f),
+        Body::Ephemeron {
+            key,
+            value,
+            finalizer,
+        } => [*key, *value, *finalizer].into_iter().for_each(f),
+        other => for_each_strong(other, f),
     }
 }
 

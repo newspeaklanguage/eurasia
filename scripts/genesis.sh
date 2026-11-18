@@ -16,7 +16,7 @@ OUT=$EURASIA/target/genesis
 mkdir -p "$OUT"
 # The application's modules: psoup's public kernel, collections and actors,
 # and the platform over them.
-MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $PRIMORDIALSOUP/newspeak/ActorsForPrimordialSoup.ns $NEWSPEAK/EurasiaRuntime.ns $NEWSPEAK/EurasiaValueProbe.ns"
+MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $NEWSPEAK/EurasiaActors.ns $NEWSPEAK/EurasiaRuntime.ns $NEWSPEAK/EurasiaValueProbe.ns"
 
 echo "== building EurasiaPackager.vfuel"
 (cd "$PRIMORDIALSOUP" && ./out/ReleaseX64/primordialsoup ./out/snapshots/WebCompiler.vfuel \

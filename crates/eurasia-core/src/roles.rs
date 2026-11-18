@@ -73,6 +73,8 @@ roles! {
     Entry = 32: "The entry object; M1 sends it main:args: (until the message loop, M4).",
     AlienClass = 33: "The Alien class.",
     ValueClass = 34: "The Value class: classes whose chain includes it are value classes.",
+    FarReferenceClass = 35: "The FarReference class, of far references.",
+    PlatformTemplate = 36: "The platform template: the message loop a new actor's platform is cloned from.",
 }
 
 /// A complete assignment of values to roles.

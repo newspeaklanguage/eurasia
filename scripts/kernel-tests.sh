@@ -18,7 +18,7 @@ PRIMORDIALSOUP=${PRIMORDIALSOUP:-$EURASIA/../primordialsoup}
 PSOUP=$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup
 OUT=$EURASIA/target/kerneltests
 mkdir -p "$OUT"
-MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $PRIMORDIALSOUP/newspeak/ActorsForPrimordialSoup.ns $NEWSPEAK/EurasiaRuntime.ns $PRIMORDIALSOUP/newspeak/Minitest.ns $PRIMORDIALSOUP/newspeak/KernelTests.ns $PRIMORDIALSOUP/newspeak/AccessModifierTesting.ns $PRIMORDIALSOUP/newspeak/KernelWeakTests.ns $PRIMORDIALSOUP/newspeak/ActorsTesting.ns $PRIMORDIALSOUP/newspeak/TestActor.ns"
+MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $NEWSPEAK/EurasiaActors.ns $NEWSPEAK/EurasiaRuntime.ns $PRIMORDIALSOUP/newspeak/Minitest.ns $PRIMORDIALSOUP/newspeak/KernelTests.ns $PRIMORDIALSOUP/newspeak/AccessModifierTesting.ns $PRIMORDIALSOUP/newspeak/KernelWeakTests.ns $PRIMORDIALSOUP/newspeak/ActorsTesting.ns $PRIMORDIALSOUP/newspeak/TestActor.ns"
 
 echo "== building EurasiaPackager.vfuel and EurasiaKernelTestReference.vfuel"
 (cd "$PRIMORDIALSOUP" && "$PSOUP" ./out/snapshots/WebCompiler.vfuel \
