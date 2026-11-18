@@ -107,7 +107,9 @@ cycles need no special handling.
 
 Kinds 13 and 14 are hidden layouts: their encoding belongs to the format,
 not to a layout the image may read. A saved activation is always **dead**:
-snapshots are saved from an idle heap, which has no frames. (Paused stacks,
+snapshots are saved from an idle heap, which has no frames. A saved heap
+holds only what the roles reach: the VM collects into a copy before writing
+(M3), so nothing a running program's frames alone reach is saved. (Paused stacks,
 M7, will add live frame records.)
 
 Kinds 9–12 are the contract layouts of the implementation plan (section 4

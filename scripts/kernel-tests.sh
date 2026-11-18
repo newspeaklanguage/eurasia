@@ -7,6 +7,9 @@
 # outcome of every test. A test whose outcome differs must be listed, with
 # the reason, in docs/EXPECTED_DIFFERENCES.md; any other difference fails.
 # Needs what scripts/genesis.sh needs. Outputs go to target/kerneltests/.
+# With GC_STRESS=n, Eurasia collects at the first safepoint after every n
+# allocations (implementation plan M3's stress test; GC_STRESS=64 takes a
+# few minutes, 1 far longer).
 set -eu
 cd "$(dirname "$0")/.."
 EURASIA=$(pwd)
@@ -15,7 +18,7 @@ PRIMORDIALSOUP=${PRIMORDIALSOUP:-$EURASIA/../primordialsoup}
 PSOUP=$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup
 OUT=$EURASIA/target/kerneltests
 mkdir -p "$OUT"
-MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $PRIMORDIALSOUP/newspeak/Minitest.ns $PRIMORDIALSOUP/newspeak/KernelTests.ns $PRIMORDIALSOUP/newspeak/AccessModifierTesting.ns"
+MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $PRIMORDIALSOUP/newspeak/Minitest.ns $PRIMORDIALSOUP/newspeak/KernelTests.ns $PRIMORDIALSOUP/newspeak/AccessModifierTesting.ns $PRIMORDIALSOUP/newspeak/KernelWeakTests.ns"
 
 echo "== building EurasiaPackager.vfuel and EurasiaKernelTestReference.vfuel"
 (cd "$PRIMORDIALSOUP" && "$PSOUP" ./out/snapshots/WebCompiler.vfuel \
@@ -40,7 +43,7 @@ echo "== Eurasia: packaging, genesis, then the tests"
 cargo build -q --release -p eurasia-native
 EURASIA_BIN=$EURASIA/target/release/eurasia
 (cd "$OUT" && "$EURASIA_BIN" genesis.eus base.eus)
-"$EURASIA_BIN" "$OUT/base.eus" > "$OUT/eurasia-raw.txt" 2>&1 || true
+EURASIA_GC_STRESS=${GC_STRESS:-0} "$EURASIA_BIN" "$OUT/base.eus" > "$OUT/eurasia-raw.txt" 2>&1 || true
 grep '>>' "$OUT/eurasia-raw.txt" | sort > "$OUT/eurasia.txt" || true
 
 echo "== comparing outcomes"

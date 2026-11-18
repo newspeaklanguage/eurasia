@@ -7,18 +7,17 @@ else is a bug.
 
 ## Per-test differences
 
-`scripts/kernel-tests.sh` runs psoup's `KernelTests` and
-`AccessModifierTesting` on both VMs and compares each test's outcome
+`scripts/kernel-tests.sh` runs psoup's `KernelTests`, `AccessModifierTesting`
+and `KernelWeakTests` on both VMs and compares each test's outcome
 (success, failure or error). A test whose outcome may differ is listed here
 as a line `- `Context>>selector`: reason`; the script fails on any other
 difference, and also reports listed tests that agree again.
 
-None at present (2026-11-17): all 353 tests have the same outcome on both
-VMs (352 successes; `FloatTests>>testFloatRaisedTo` fails on both, with the
-same message).
+None at present (2026-11-17): all 377 tests have the same outcome on both
+VMs (376 successes; `FloatTests>>testFloatRaisedTo` fails on both, with the
+same message), also under GC stress (`GC_STRESS=64`).
 
-Not yet compared: `KernelWeakTests` (the collector, M3), the actor suites
-(M4), the mirror suites and `MinitestTests` (mirrors, M6; Minitest's own
+Not yet compared: the actor suites (M4), the mirror suites and `MinitestTests` (mirrors, M6; Minitest's own
 discovery and runner use mirrors and promises, so on Eurasia the runner
 finds tests from the packager's catalog). psoup's `CollectionsTesting` does
 not run on psoup itself (it imports an `OrderedMap` that
@@ -37,6 +36,8 @@ not run on psoup itself (it imports an `OrderedMap` that
 | `asStringFixed:`, `asStringExponential:`, `asStringPrecision:` | JavaScript's `toFixed`, `toExponential`, `toPrecision` | the same (`e+` exponents, digit ranges 0-20, 0-20 and 1-21) | Aligned 2026-11-17; any unusable digit count fails with `#outOfRange: 1` (operation list 3.1). |
 | Float division by zero | an infinity or NaN | the same | IEEE 754; aligned 2026-11-17 (Eurasia had failed with `#zeroDivide`). |
 | `String>>hash` | psoup's function | FNV-1a | Hash values are not portable between VMs; only equal strings hashing equally is guaranteed. |
-| `identityHash` | address-derived | the allocation sequence number | Decided: deterministic. |
+| `identityHash` | address-derived | the allocation sequence number | Decided: deterministic. Collection keeps sequence numbers, so hashes never change. |
+| When collection happens | psoup's heap policy (scavenges, mark-sweeps) | a full collection after as many allocations as there are live objects, and at `vm garbageCollect` | Permitted nondeterminism (`gc-semantics.tex`); only weak containers can observe it. Eurasia's timing depends only on the allocation count. |
+| Ephemeron finalizers | not run (psoup clears the field) | not run (cleared) | Same; finalization is not part of the platform yet. |
 | Transcendental functions | the host's `libm` | bundled `libm` crate (musl port) | Decided: bit-identical on every host. Results may differ from psoup in the last bit. |
 | SmallInteger range | word-sized (31 bits on wasm32, 63 natively) | 63 bits everywhere | Decided 2026-11-17. |

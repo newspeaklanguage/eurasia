@@ -160,7 +160,7 @@ natives! {
     VmIsCanonical = 117 / 1: "`vm isCanonical:`: whether the object is frozen.",
     VmSetCanonical = 118 / 1: "`vm setCanonical:`: freeze the object.",
     VmPerformWith = 119 / 3: "`vm object:perform:with:`: an ordinary send, whatever the receiver overrides.",
-    VmGarbageCollect = 120 / 0: "`vm garbageCollect`: nothing until the collector (M3).",
+    VmGarbageCollect = 120 / 0: "`vm garbageCollect`: a full collection; answers the receiver.",
     VmMonotonicNanos = 121 / 0: "`vm monotonicNanos` (input).",
     VmApplyMixin = 122 / 3: "`vm applyMixin:superclass:enclosingObject:`: a new class and its metaclass.",
 }
@@ -328,6 +328,8 @@ pub enum Outcome {
     },
     /// `vm snapshot`: the interpreter serializes the heap and answers it.
     Snapshot,
+    /// Collect garbage now (`vm garbageCollect`), then answer the receiver.
+    Collect,
     /// An activation native: the interpreter, which owns the frames, carries
     /// it out and answers or fails.
     Frame(Native),
@@ -1063,6 +1065,18 @@ pub fn invoke(
                 Role::ActivationClass,
                 Role::EphemeronClass,
             ];
+            if receiver == ctx.roles.get(Role::EphemeronClass) {
+                let nil = ctx.nil();
+                return Outcome::Answer(ctx.heap.allocate(
+                    receiver,
+                    Space::Actor(0),
+                    Body::Ephemeron {
+                        key: nil,
+                        value: nil,
+                        finalizer: nil,
+                    },
+                ));
+            }
             if special.iter().any(|&r| ctx.roles.get(r) == receiver) {
                 return Outcome::Fail(Reason::NotInstantiable);
             }
@@ -1456,7 +1470,7 @@ pub fn invoke(
                 other => other,
             }
         }
-        Native::VmGarbageCollect => Outcome::Answer(receiver),
+        Native::VmGarbageCollect => Outcome::Collect,
         Native::VmMonotonicNanos => {
             let t = ctx.host.monotonic_nanos();
             Outcome::Answer(ctx.integer(BigInt::from_i128(i128::from(t))))

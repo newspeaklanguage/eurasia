@@ -23,6 +23,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::bytecode::{SendKind, instruction_length, op};
+use crate::gc;
 use crate::host::Host;
 use crate::natives::{self, Native, NativeContext, Outcome, Reason};
 use crate::object::{Access, Body, FROZEN, Heap, MethodKind, Space};
@@ -148,7 +149,19 @@ pub struct Vm {
     step_limit: Option<u64>,
     next_serial: u64,
     snapshot_writer: Option<SnapshotWriter>,
+    /// The allocation counter after the last collection.
+    gc_counter: u64,
+    /// Allocations after which the next safepoint collects.
+    gc_budget: u64,
+    /// Stress testing: collect after this many allocations, whatever the
+    /// live size.
+    gc_stress: Option<u64>,
+    /// Collections so far.
+    collections: u64,
 }
+
+/// The fewest allocations between scheduled collections.
+const MIN_GC_BUDGET: u64 = 1 << 20;
 
 /// Serializes a heap and its roles (the snapshot format's writer). The core
 /// cannot depend on `eurasia-snapshot`, which depends on it, so the embedder
@@ -167,7 +180,83 @@ impl Vm {
             step_limit: None,
             next_serial: 0,
             snapshot_writer: None,
+            gc_counter: 0,
+            gc_budget: MIN_GC_BUDGET,
+            gc_stress: None,
+            collections: 0,
         }
+    }
+
+    /// Stress mode: with `Some(n)`, collect at the first safepoint after
+    /// every `n` allocations (`n` = 1: after every allocation), so that a
+    /// reference the VM holds across a safepoint without rooting it shows up
+    /// at once (implementation plan, M3). `None` is normal scheduling.
+    pub fn set_gc_stress(&mut self, interval: Option<u64>) {
+        self.gc_stress = interval.map(|n| n.max(1));
+    }
+
+    /// The number of collections so far.
+    pub fn collections(&self) -> u64 {
+        self.collections
+    }
+
+    fn gc_due(&self) -> bool {
+        let allocated = self.heap.allocation_counter() - self.gc_counter;
+        allocated >= self.gc_stress.unwrap_or(self.gc_budget)
+    }
+
+    /// A full collection at a safepoint. The roots are the roles, the
+    /// operand stack, the frames and the VM's own selector strings; every
+    /// reference the VM holds is rewritten. The next scheduled collection
+    /// comes after as many allocations as there are live objects (at least
+    /// [`MIN_GC_BUDGET`]), so the heap stays within about twice its live size.
+    pub fn collect_garbage(&mut self) -> gc::Statistics {
+        let mut roots: Vec<Value> = self.roles.pairs().map(|(_, v)| v).collect();
+        roots.extend(self.stack.iter().copied());
+        for f in &self.frames {
+            roots.extend([f.method, f.receiver]);
+            roots.extend(f.activation);
+            roots.extend(f.closure);
+        }
+        roots.extend(self.symbols.values().copied());
+        let nil = self.roles.get(Role::Nil);
+        let (fwd, statistics) = self.heap.collect(&roots, nil);
+        let pairs: Vec<(Role, Value)> = self.roles.pairs().collect();
+        for (role, v) in pairs {
+            self.roles.set(role, fwd.forward(v));
+        }
+        for v in &mut self.stack {
+            *v = fwd.forward(*v);
+        }
+        for f in &mut self.frames {
+            f.method = fwd.forward(f.method);
+            f.receiver = fwd.forward(f.receiver);
+            f.activation = f.activation.map(|v| fwd.forward(v));
+            f.closure = f.closure.map(|v| fwd.forward(v));
+        }
+        for v in self.symbols.values_mut() {
+            *v = fwd.forward(*v);
+        }
+        self.gc_counter = self.heap.allocation_counter();
+        self.gc_budget = MIN_GC_BUDGET.max(statistics.after as u64);
+        self.collections += 1;
+        statistics
+    }
+
+    /// The heap and roles a snapshot saves: what the roles reach, collected
+    /// into a copy. A saved image has no frames (snapshot format, section
+    /// 5), so objects only the running program's frames reach are not
+    /// saved; the running program is not disturbed.
+    fn snapshot_heap(&self) -> (Heap, Roles) {
+        let mut heap = self.heap.clone();
+        let roots: Vec<Value> = self.roles.pairs().map(|(_, v)| v).collect();
+        let (fwd, _) = heap.collect(&roots, self.roles.get(Role::Nil));
+        let mut roles = self.roles.clone();
+        let pairs: Vec<(Role, Value)> = self.roles.pairs().collect();
+        for (role, v) in pairs {
+            roles.set(role, fwd.forward(v));
+        }
+        (heap, roles)
     }
 
     /// Supplies the snapshot writer that `vm snapshot` uses.
@@ -213,6 +302,10 @@ impl Vm {
             if self.frames.is_empty() {
                 let result = self.stack.pop().ok_or(VmError::Malformed("empty stack"))?;
                 return Ok(Completion::Returned(result));
+            }
+            // A safepoint: every value the VM holds is in the roots.
+            if self.gc_due() {
+                self.collect_garbage();
             }
             if let Step::Done(done) = self.step(host)? {
                 return Ok(done);
@@ -518,6 +611,14 @@ impl Vm {
                     Some(Body::Regular(slots)) if index < slots.len() => {
                         slots[index] = value;
                     }
+                    // The kernel's Ephemeron declares key, value, finalizer.
+                    Some(Body::Ephemeron {
+                        key,
+                        value: v,
+                        finalizer,
+                    }) if index < 3 => {
+                        *[key, v, finalizer][index] = value;
+                    }
                     _ => return Err(self.bad_slot_access(method, receiver)),
                 }
                 self.stack.truncate(base + 1);
@@ -604,9 +705,16 @@ impl Vm {
             }
             Outcome::Exit(code) => Ok(Some(Completion::Exited(code))),
             Outcome::Frame(_) => unreachable!("frame natives are resolved above"),
+            Outcome::Collect => {
+                // A safepoint: the receiver is back on the stack first.
+                self.stack.push(receiver);
+                self.collect_garbage();
+                Ok(None)
+            }
             Outcome::Snapshot => match self.snapshot_writer {
                 Some(write) => {
-                    let bytes = write(&self.heap, &self.roles);
+                    let (heap, roles) = self.snapshot_heap();
+                    let bytes = write(&heap, &roles);
                     let class = self.roles.get(Role::ByteArrayClass);
                     let v = self
                         .heap

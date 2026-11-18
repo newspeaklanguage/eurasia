@@ -32,9 +32,6 @@ cargo build -q -p eurasia-native
 EURASIA_BIN=$EURASIA/target/debug/eurasia
 
 echo "== genesis: running the genesis image, which saves the base image"
-# Run in the output directory with a relative name: the arguments end up in
-# the saved heap (there is no collector yet, M3), so reproducible builds need
-# identical arguments.
 (cd "$OUT" && "$EURASIA_BIN" genesis.eus base.eus)
 ls -l "$OUT/base.eus"
 
@@ -45,6 +42,11 @@ expected=$(printf '%s\n' 7 1267650600228229401496703205376 'instance of _Array' 
 if [ "$(cat "$OUT/output.txt")" != "$expected" ]; then
   echo "Unexpected output from the base image."; exit 1
 fi
+
+echo "== the same under GC stress: a collection after every allocation"
+EURASIA_GC_STRESS=1 "$EURASIA_BIN" "$OUT/base.eus" > "$OUT/output-stress.txt" 2> "$OUT/stress.log"
+cat "$OUT/stress.log"
+cmp "$OUT/output.txt" "$OUT/output-stress.txt" || { echo "GC stress changed the output"; exit 1; }
 
 echo "== an unhandled exception prints a trace and exits 1"
 set +e
@@ -59,7 +61,9 @@ mkdir -p "$OUT/again"
 "$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" "$OUT/EurasiaPackager.vfuel" \
   "$NEWSPEAK/EurasiaKernel.ns" "$EURASIA/kernel/natives.tsv" \
   "$NEWSPEAK/EurasiaKernelSmokeTest.ns" "$OUT/again/genesis.eus" > /dev/null
-(cd "$OUT/again" && "$EURASIA_BIN" genesis.eus base.eus)
+# A different output path: a snapshot saves only what the roles reach, so
+# the arguments genesis ran with are not in the image.
+"$EURASIA_BIN" "$OUT/again/genesis.eus" "$OUT/again/base.eus"
 cmp "$OUT/genesis.eus" "$OUT/again/genesis.eus" || { echo "the genesis image is not reproducible"; exit 1; }
 cmp "$OUT/base.eus" "$OUT/again/base.eus" || { echo "the base image is not reproducible"; exit 1; }
 echo "Genesis: base image built, checked and reproducible."

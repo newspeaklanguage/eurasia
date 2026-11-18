@@ -3,7 +3,10 @@
 
 //! `eurasia`: the command-line Eurasia VM.
 //!
-//! Usage: `eurasia SNAPSHOT [ARGS...]`, or `eurasia --version`.
+//! Usage: `eurasia SNAPSHOT [ARGS...]`, or `eurasia --version`. With
+//! `EURASIA_GC_STRESS=n` in the environment the VM collects at the first
+//! safepoint after every `n` allocations (a test mode; `n` = 1 is after every
+//! allocation, and slow).
 //!
 //! Exit status: the code given to `vm exit:`; 0 when the entry send returns;
 //! 65 when the snapshot cannot be loaded; 70 when the VM stops with an error;
@@ -99,10 +102,20 @@ fn main() -> ExitCode {
     let program_args: Vec<&str> = args[2..].iter().map(String::as_str).collect();
     let mut vm = Vm::new(heap, roles);
     vm.set_snapshot_writer(write_image);
+    vm.set_gc_stress(
+        std::env::var("EURASIA_GC_STRESS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0),
+    );
     let mut host = CommandLineHost {
         start: Instant::now(),
     };
-    match vm.run(&mut host, &program_args) {
+    let outcome = vm.run(&mut host, &program_args);
+    if std::env::var_os("EURASIA_GC_STRESS").is_some() {
+        eprintln!("eurasia: {} collections", vm.collections());
+    }
+    match outcome {
         Ok(Completion::Returned(_)) => ExitCode::SUCCESS,
         Ok(Completion::Exited(code)) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Err(e) => {

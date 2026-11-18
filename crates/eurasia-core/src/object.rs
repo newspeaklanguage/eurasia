@@ -237,9 +237,9 @@ pub enum HeapError {
 }
 
 /// The objects of a VM, in allocation order.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Heap {
-    objects: Vec<Object>,
+    pub(crate) objects: Vec<Object>,
     next_seq: u64,
 }
 
