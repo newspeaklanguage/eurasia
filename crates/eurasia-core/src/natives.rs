@@ -195,6 +195,10 @@ natives! {
     ClosureCopiedAtPut = 155 / 3: "`copiedOf: closure at: i put: v`.",
     ClosureInitialPc = 156 / 1: "`initialBCIOf: closure`: the bytecode position of its body, from 1.",
     ClosureNumCopied = 157 / 1: "`numCopiedOf: closure`: the number of its copied values.",
+    VmCommit = 158 / 1: "`vm commit: {old objects. new objects. layout maps}`: installs a change set atomically. Each old program object's references go to its new one, which is frozen with what it reaches of the program; each layout map {old class. new class. for each new slot, the old slot index or 0} reshapes every instance of the old class in place. Answers the new program version.",
+    VmMixinApplicationsOf = 159 / 1: "`vm mixinApplicationsOf: m`: an Array of the live classes whose mixin is `m`, cohort-wide, in allocation order (after a full collection).",
+    VmSubclassesOf = 160 / 1: "`vm subclassesOf: c`: an Array of the live classes whose superclass is `c`, cohort-wide, in allocation order (after a full collection).",
+    VmProgramVersion = 161 / 0: "`vm programVersion`: the number of commits so far.",
     VmSpawn = 139 / 1: "`vm spawn: mixin`: a new actor running a clone of the platform template, with the mixin applied to Object (role 37) in its heap, enclosing object nil; answers a far reference to the new class (`actor-semantics.tex`, eq. `create-actor`).",
     VmPromiseSend = 138 / 2: "`vm promise: record send: {selector. resultRecord. arguments...}`: an eventual send to the promise (Route-Pending): queued in the record, at the end of its chain, until it settles; delivered at once if it has.",
     VmIsValue = 125 / 1: "`vm isValue:`: whether the object is a value (immediates, nil, booleans, strings, numbers, instances of value classes, classes with a value enclosing object).",
@@ -219,10 +223,18 @@ pub fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Ou
     if ctx.heap.mixin(cm).is_none() {
         return Outcome::Fail(Reason::WrongKind(1));
     }
-    let Some(Body::Class(_)) = ctx.heap.get(s).map(|o| &o.body) else {
+    // A nil superclass makes a root class, as psoup's apply does; its
+    // metaclass follows the image's root's (`Class` its superclass).
+    let nil = ctx.nil();
+    let reference = if s == nil {
+        ctx.roles.get(Role::ObjectClass)
+    } else {
+        s
+    };
+    let Some(Body::Class(_)) = ctx.heap.get(reference).map(|o| &o.body) else {
         return Outcome::Fail(Reason::WrongKind(2));
     };
-    let super_meta = ctx.heap.get(s).expect("class").header.class;
+    let super_meta = ctx.heap.get(reference).expect("class").header.class;
     let Some(super_meta_object) = ctx.heap.get(super_meta) else {
         return Outcome::Fail(Reason::WrongKind(2));
     };
@@ -236,8 +248,9 @@ pub fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Ou
     // slot (a setter other than the private init` ones) (design doc section
     // 5: the checks happen at mixin application until the spec lets the
     // compiler know value classes).
-    let value_class = ctx.heap.get(s).expect("class").header.flags & VALUE_CLASS != 0
-        || s == ctx.roles.get(Role::ValueClass);
+    let value_class = s != nil
+        && (ctx.heap.get(s).expect("class").header.flags & VALUE_CLASS != 0
+            || s == ctx.roles.get(Role::ValueClass));
     if value_class {
         if !ctx.is_value(eo) {
             return Outcome::Fail(Reason::WrongKind(3));
@@ -248,7 +261,6 @@ pub fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Ou
     }
     let class_flags =
         (if ctx.is_value(eo) { VALUE } else { 0 }) | (if value_class { VALUE_CLASS } else { 0 });
-    let nil = ctx.nil();
     let metaclass = ctx.heap.allocate(
         metaclass_class,
         ctx.space,
@@ -641,6 +653,18 @@ pub enum Outcome {
     Spawn(Value),
     /// `vm allInstancesOf:`: the interpreter collects, then answers them.
     AllInstances(Value),
+    /// `vm commit:`: the interpreter applies the change set.
+    Commit(Value),
+    /// `vm mixinApplicationsOf:` (by mixin) or `vm subclassesOf:`: the
+    /// interpreter collects, so that no dead class answers, then scans.
+    ClassQuery {
+        /// The mixin or the superclass.
+        target: Value,
+        /// Whether `target` is a mixin.
+        by_mixin: bool,
+    },
+    /// `vm programVersion`.
+    ProgramVersion,
     /// `vm resolvePromise:with:` and `vm breakPromise:with:`: the
     /// interpreter settles the record and notifies its waiters.
     Settle {
@@ -1748,6 +1772,16 @@ pub fn invoke(
             None => Outcome::Fail(Reason::WrongKind(1)),
         },
         Native::VmAllInstancesOf => Outcome::AllInstances(arg(0)),
+        Native::VmCommit => Outcome::Commit(arg(0)),
+        Native::VmProgramVersion => Outcome::ProgramVersion,
+        Native::VmMixinApplicationsOf => Outcome::ClassQuery {
+            target: arg(0),
+            by_mixin: true,
+        },
+        Native::VmSubclassesOf => Outcome::ClassQuery {
+            target: arg(0),
+            by_mixin: false,
+        },
         Native::ClosureNumCopied => match ctx.heap.closure(arg(0)) {
             Some(c) => Outcome::Answer(small(c.copied.len() as i64)),
             None => Outcome::Fail(Reason::WrongKind(1)),

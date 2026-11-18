@@ -178,6 +178,8 @@ pub struct Vm {
     expats: Vec<(Value, u32)>,
     /// Callbacks now running, nested.
     callback_depth: usize,
+    /// Commits so far (`vm programVersion`).
+    program_version: u64,
 }
 
 /// A VM actor: its message loop (in its platform), its mailbox of packets
@@ -227,6 +229,7 @@ impl Vm {
             current: 0,
             expats: Vec::new(),
             callback_depth: 0,
+            program_version: 0,
         }
     }
 
@@ -1107,6 +1110,53 @@ impl Vm {
                 self.finished_turn = Some(wakeup);
                 Ok(None)
             }
+            Outcome::ProgramVersion => {
+                let v = Value::small_integer(self.program_version as i64).expect("small");
+                self.stack.push(v);
+                Ok(None)
+            }
+            Outcome::Commit(change_set) => match self.commit(change_set) {
+                Ok(()) => {
+                    let v = Value::small_integer(self.program_version as i64).expect("small");
+                    self.stack.push(v);
+                    Ok(None)
+                }
+                Err(index) => {
+                    self.native_failure(native, receiver, args, Reason::WrongKind(index), host)
+                }
+            },
+            Outcome::ClassQuery { target, by_mixin } => {
+                // Only live classes: a collection first, with the target
+                // rooted on the stack. Classes only, as psoup's weak sets
+                // hold: every metaclass's superclass is Class, which is not
+                // a subclass relation.
+                self.stack.push(target);
+                self.collect_garbage();
+                let target = self.stack.pop().expect("pushed");
+                let found: Vec<Value> = self
+                    .heap
+                    .iter()
+                    .filter(|(_, o)| match &o.body {
+                        Body::Class(b) => {
+                            if by_mixin {
+                                b.mixin == target
+                            } else {
+                                b.superclass == target
+                            }
+                        }
+                        _ => false,
+                    })
+                    .map(|(v, _)| v)
+                    .collect();
+                let array_class = self.roles.get(Role::ArrayClass);
+                let answer = self.heap.allocate(
+                    array_class,
+                    Space::Actor(self.current as u32),
+                    Body::Array(found),
+                );
+                self.stack.push(answer);
+                Ok(None)
+            }
             Outcome::AllInstances(class) => {
                 // Only live instances: a collection first, at this safepoint,
                 // with the class rooted on the stack.
@@ -1610,6 +1660,153 @@ impl Vm {
             .heap
             .allocate(array_class, Space::Actor(to), Body::Array(packet));
         self.actors[to as usize].mailbox.push_back(copy);
+    }
+
+    /// `vm commit:` (operation list, section 6; M6 design 4.3): validates
+    /// the change set, then, all or nothing, reshapes the instances its
+    /// layout maps name, forwards each old object's identity to its new one,
+    /// freezes the new program objects and what they reach of the program,
+    /// and bumps the program version. Running frames keep their methods.
+    /// Fails with the index of the malformed part (1 the pairs, 2 a layout
+    /// map) before changing anything.
+    fn commit(&mut self, change_set: Value) -> Result<(), u32> {
+        let parts = self
+            .heap
+            .array_elements(change_set)
+            .filter(|p| p.len() == 3)
+            .map(<[Value]>::to_vec)
+            .ok_or(1u32)?;
+        let olds = self.heap.array_elements(parts[0]).ok_or(1u32)?.to_vec();
+        let news = self.heap.array_elements(parts[1]).ok_or(1u32)?.to_vec();
+        if olds.len() != news.len() || olds.iter().any(|o| o.as_reference().is_none()) {
+            return Err(1);
+        }
+        let maps = self.heap.array_elements(parts[2]).ok_or(2u32)?.to_vec();
+        let mut layouts = Vec::with_capacity(maps.len());
+        for m in maps {
+            let entry = self
+                .heap
+                .array_elements(m)
+                .filter(|e| e.len() == 3)
+                .map(<[Value]>::to_vec)
+                .ok_or(2u32)?;
+            let remap: Vec<usize> = self
+                .heap
+                .array_elements(entry[2])
+                .ok_or(2u32)?
+                .iter()
+                .map(|v| v.as_small_integer().filter(|&i| i >= 0).map(|i| i as usize))
+                .collect::<Option<Vec<usize>>>()
+                .ok_or(2u32)?;
+            layouts.push((entry[0], entry[1], remap));
+        }
+        // Reshape instances in place: identity, flags and actor are kept.
+        let nil = self.nil();
+        for (old_class, new_class, remap) in &layouts {
+            let instances: Vec<Value> = self
+                .heap
+                .iter()
+                .filter(|(_, o)| o.header.class == *old_class && matches!(o.body, Body::Regular(_)))
+                .map(|(v, _)| v)
+                .collect();
+            for v in instances {
+                let object = self.heap.get_mut(v).expect("an instance");
+                let Body::Regular(old) = &object.body else {
+                    unreachable!("filtered")
+                };
+                let slots: Vec<Value> = remap
+                    .iter()
+                    .map(|&i| {
+                        if i == 0 {
+                            nil
+                        } else {
+                            old.get(i - 1).copied().unwrap_or(nil)
+                        }
+                    })
+                    .collect();
+                object.body = Body::Regular(slots);
+                object.header.class = *new_class;
+            }
+        }
+        // Forward identities, in the heap and in every root the VM holds.
+        let map: BTreeMap<u64, Value> = olds
+            .iter()
+            .zip(news.iter())
+            .filter(|(o, n)| o != n)
+            .map(|(o, n)| (o.as_reference().expect("checked"), *n))
+            .collect();
+        if !map.is_empty() {
+            let forward = |v: Value| match v.as_reference() {
+                Some(i) => map.get(&i).copied().unwrap_or(v),
+                None => v,
+            };
+            self.heap.forward_identities(&forward);
+            for v in &mut self.stack {
+                *v = forward(*v);
+            }
+            for f in &mut self.frames {
+                f.receiver = forward(f.receiver);
+                f.closure = f.closure.map(forward);
+            }
+            let pairs: Vec<(Role, Value)> = self.roles.pairs().collect();
+            for (role, v) in pairs {
+                self.roles.set(role, forward(v));
+            }
+            for a in &mut self.actors {
+                a.message_loop = forward(a.message_loop);
+                for p in a.mailbox.iter_mut() {
+                    *p = forward(*p);
+                }
+            }
+            for e in &mut self.expats {
+                e.0 = forward(e.0);
+            }
+            for v in self.symbols.values_mut() {
+                *v = forward(*v);
+            }
+        }
+        // Freeze the new program: each new method, mixin and class, and the
+        // methods and method arrays its mixins hold.
+        let mut pending: Vec<Value> = news;
+        let mut seen = alloc::collections::BTreeSet::new();
+        while let Some(v) = pending.pop() {
+            if !seen.insert(v.as_reference()) {
+                continue;
+            }
+            let Some(object) = self.heap.get_mut(v) else {
+                continue;
+            };
+            if object.header.flags & FROZEN != 0 {
+                continue;
+            }
+            match &object.body {
+                Body::Method(m) => {
+                    let literals = m.literals;
+                    object.header.flags |= FROZEN;
+                    pending.push(literals);
+                }
+                Body::Mixin(m) => {
+                    let (methods, class_mixin) = (m.methods, m.class_mixin);
+                    object.header.flags |= FROZEN;
+                    pending.push(methods);
+                    pending.push(class_mixin);
+                }
+                Body::Class(b) | Body::Metaclass(b) => {
+                    let mixin = b.mixin;
+                    object.header.flags |= FROZEN;
+                    pending.push(mixin);
+                }
+                // A mixin's methods, a method's literals: followed, not
+                // frozen, so that only program objects are.
+                Body::Array(e) => {
+                    let e = e.clone();
+                    pending.extend(e);
+                }
+                _ => {}
+            }
+        }
+        self.program_version += 1;
+        Ok(())
     }
 
     /// Rule Native-Fail: allocates the failure exception and sends it

@@ -180,3 +180,10 @@ EurasiaMirrors	instance	numCopiedOf:	ClosureNumCopied	157
 EurasiaMirrors	instance	slotOf:at:	VmSlotOfAt	111
 EurasiaMirrors	instance	slotOf:at:put:	VmSlotOfAtPut	112
 ClassMirror	class	allInstancesOf:	VmAllInstancesOf	153
+# Program change (M6 step 3).
+VMMirror	instance	commit:	VmCommit	158
+VMMirror	instance	mixinApplicationsOf:	VmMixinApplicationsOf	159
+VMMirror	instance	subclassesOf:	VmSubclassesOf	160
+VMMirror	instance	programVersion	VmProgramVersion	161
+EurasiaMirrors	instance	subclassesOf:	VmSubclassesOf	160
+EurasiaMirrors	instance	commit:	VmCommit	158

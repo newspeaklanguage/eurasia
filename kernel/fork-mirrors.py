@@ -24,14 +24,20 @@ Every edit is checked: the script fails if psoup's source has changed under
 it. Usage: fork-mirrors.py <MirrorsForPrimordialSoup.ns> <output>.
 """
 
+import re
 import sys
 
 
 def replace(text, old, new, count=1):
-    found = text.count(old)
+    """Replaces exactly `count` occurrences of `old`. A whitespace-only line
+    in `old` matches a whitespace-only line in the text, however indented:
+    psoup's printer indents blank lines, editors often strip them."""
+    pattern = re.compile(
+        "\n".join(r"[ \t]*" if line.strip() == "" else re.escape(line) for line in old.split("\n")))
+    found = len(pattern.findall(text))
     if found != count:
         sys.exit(f"fork-mirrors: expected {count} of {old[:70]!r}, found {found}")
-    return text.replace(old, new)
+    return pattern.sub(lambda m: new, text)
 
 
 def main():
@@ -83,6 +89,131 @@ def main():
     # 3. The V5 compiler.
     t = replace(t, """		compilation:: namespace Newspeak2PrimordialSoupCompilation usingPlatform: cachedPlatform""",
                 """		compilation:: namespace Newspeak2V5BytecodeCompilation usingPlatform: cachedPlatform""")
+
+    # 4. Installing (M6 design 4.3): vm commit: instead of a become. The
+    #    VM reshapes instances in place from layout maps, so their identity
+    #    and actor stay, and forwards the old program objects' identities.
+    t = replace(t, """			private updateInstances <IdentityMap[OldObject, NewObject]>""",
+                """			private updateInstances <IdentityMap[OldObject, NewObject]> (* Eurasia: unused; instances are reshaped by the VM from layoutMaps. *)
+			private layoutMaps <List[{Class. Class. Array[Integer]}]>""")
+    t = replace(t, """		private installAll = (
+			| updateCount oldObjects newObjects index |
+			updateCount:: updateMixinsAndClasses size + updateInstances size.
+			oldObjects:: Array new: updateCount.
+			newObjects:: Array new: updateCount.
+			index: 1.
+			updateInstances keysAndValuesDo: [:old :new |
+					oldObjects at: index put: old.
+					newObjects at: index put: new.
+					index: index + 1
+				].
+
+			(* Put updated mixins and classes last, so A -> C follows B -> C (see class comment). *)
+			updateMixinsAndClasses keysAndValuesDo: [:old :new |
+					oldObjects at: index put: old.
+					newObjects at: index put: (updateInstances at: old ifAbsent: [ new ]).
+
+					(* Follow B to avoid B -> C, A -> B. *)
+					index: index + 1
+				].
+			updateCount = 0 ifTrue: [ ^self ].
+			elementsOf: oldObjects forwardIdentityToElementsOf: newObjects
+		)""", """		private installAll = (
+			(* Eurasia: one vm commit: with the forwarding pairs (old mixins and classes to new) and the layout maps, which the VM applies to the instances in place. *)
+
+			| oldObjects newObjects index |
+			oldObjects:: Array new: updateMixinsAndClasses size.
+			newObjects:: Array new: updateMixinsAndClasses size.
+			index:: 1.
+			updateMixinsAndClasses keysAndValuesDo: [:old :new |
+					oldObjects at: index put: old.
+					newObjects at: index put: new.
+					index:: index + 1
+				].
+			(index = 1 and: [ layoutMaps isEmpty ]) ifTrue: [ ^self ].
+			commit: {oldObjects. newObjects. layoutMaps asArray. }
+		)""")
+    t = replace(t, """			(allInstancesOf: oldClass) do: [:oldInstance |
+
+					(* Avoid A -> D (see class comment). *)
+					(updateMixinsAndClasses includesKey: oldInstance) ifFalse: [
+							| newInstance = allocate: newClass. |
+
+							(* Copy state from oldInstance to newInstance. *)
+							1 to: newSlotCount
+								do: [:newIndex |
+									| oldIndex value |
+									oldIndex:: remapIndices at: newIndex.
+									0 = oldIndex ifFalse: [
+											value:: slotOf: oldInstance at: oldIndex.
+											slotOf: newInstance at: newIndex put: value
+										]
+								].
+							updateInstances at: oldInstance put: newInstance
+						]
+				]""", """			(* Eurasia: the VM reshapes every instance in place (vm commit:'s layout maps). *)
+			layoutMaps add: {oldClass. newClass. remapIndices asArray. }""")
+    t = replace(t, """			updateInstances:: IdentityMap new.
+			existingClasses:: IdentityMap new.""", """			updateInstances:: IdentityMap new.
+			layoutMaps:: List new.
+			existingClasses:: IdentityMap new.""")
+    t = replace(t, """			updateInstances: nil.
+			existingClasses: nil.""", """			updateInstances: nil.
+			layoutMaps: nil.
+			existingClasses: nil.""")
+    # Slot accessors are synthesized per mixin, with indices relative to it
+    # (psoup's are placeholders its kernel rebuilds for each application).
+    t = replace(t, """		private methodDictionaryFor: mixin <AbstractMixin> from: imixin <IntermediateMixin> ^<MethodDictionary> = (
+			| cmethods |
+			cmethods:: imixin assembleMethods collect: [:imethod <IntermediateMethod> |
+					imethod methodMixin: mixin.
+					imethod compiledMethod
+				].
+			^cmethods asArray
+		)""", """		private methodDictionaryFor: mixin <AbstractMixin> from: imixin <IntermediateMixin> ^<MethodDictionary> = (
+			(* Eurasia: the slot accessors are made here, with indices relative to the mixin, as the genesis packager makes them; psoup's assembleMethods has placeholders, which psoup's kernel rebuilds for each application. *)
+
+			| slots accessors cmethods |
+			slots:: imixin assembleSlots.
+			accessors:: List new.
+			1 to: slots size
+				do: [:i |
+					| slot = slots at: i. |
+					accessors add: (internalKernel Method newGetterForSlot: slot name
+							at: i
+							accessModifier: slot accessModifier).
+					accessors add: (internalKernel Method newInitializerForSlot: slot name at: i).
+					slot isMutable ifTrue: [
+							accessors add: (internalKernel Method newSetterForSlot: slot name
+									at: i
+									accessModifier: slot accessModifier)
+						]
+				].
+			accessors do: [:accessor | accessor mixin: mixin ].
+			cmethods:: List new.
+			imixin assembleMethods do: [:imethod <IntermediateMethod> |
+					| method |
+					imethod methodMixin: mixin.
+					method:: imethod compiledMethod.
+					(accessors anySatisfy: [:accessor | accessor selector = method selector ]) ifFalse: [
+							cmethods add: method
+						]
+				].
+			cmethods addAll: accessors.
+			^cmethods asArray
+		)""")
+    t = replace(t, """	private subclassesOf: klass = (
+		^self slotOf: klass at: 8
+	)""", """	private commit: changeSet = (
+		(* Eurasia: a native (VmCommit). *)
+
+		halt
+	)
+	private subclassesOf: klass = (
+		(* Eurasia: a native (VmSubclassesOf); psoup keeps a weak set in the class. *)
+
+		halt
+	)""")
 
     open(output, "w").write(t)
     print(f"fork-mirrors: wrote {output}")

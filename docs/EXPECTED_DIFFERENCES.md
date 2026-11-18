@@ -19,10 +19,13 @@ difference, and also reports listed tests that agree again.
 - `ObjectMirrorTests>>testObjectMirrorEvaluate`: until M6 step 4. `ObjectMirror>>evaluate:` runs the expression in the mirrors' Simulator, which needs psoup's activation factory (`Activation class>>sender:…`) and, on Eurasia, the V5 Simulator (`newspeak/EURASIA_M6_REFLECTION_DESIGN_2026-11-18.md`).
 - `ObjectMirrorTests>>testObjectMirrorEvaluateEmpty`: the same.
 - `ObjectMirrorTests>>testObjectMirrorEvaluateWithScope`: the same.
+- `ClassDeclarationBuilderTests>>testEvaluateEmptyString`: the same (MirrorBuilderTesting).
+- `ClassDeclarationBuilderTests>>testEvaluateWithScope`: the same.
+- `ClassDeclarationBuilderTests>>testIncrementalScopeBuilding`: the same (it evaluates in each scope it builds).
 
-The other 492 tests have the same outcome on both VMs (2026-11-18), including
-the 48 others of psoup's `MirrorTesting`, also under GC stress
-(`GC_STRESS=50`). Of the 444 outside `MirrorTesting`, 428 succeed on both; the 16 that
+The other 541 tests have the same outcome on both VMs (2026-11-18), including
+the 48 others of psoup's `MirrorTesting` and the 51 others of
+`MirrorBuilderTesting`, also under GC stress (`GC_STRESS=50`). Of the 444 outside `MirrorTesting`, 428 succeed on both; the 16 that
 do not fail identically on both, with the same message:
 `FloatTests>>testFloatRaisedTo` (the test computes `8 ** 1 / 3`, which is
 `(8 ** 1) / 3`) and 15 `SingleActorTests`, which immediate-send `isPromise`

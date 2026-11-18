@@ -113,6 +113,26 @@ fn for_each_strong(body: &Body, mut f: impl FnMut(Value)) {
     }
 }
 
+impl Heap {
+    /// Forwards identities (`vm commit:`'s forwarding pairs): every
+    /// reference to an object that `forward` maps is replaced by its image,
+    /// in every object's class and fields, except an activation's method:
+    /// frames already running keep their code (`reflection-semantics.tex`,
+    /// the observation table).
+    pub fn forward_identities(&mut self, forward: &impl Fn(Value) -> Value) {
+        for object in &mut self.objects {
+            object.header.class = forward(object.header.class);
+            match &mut object.body {
+                Body::Activation(a) => {
+                    a.receiver = forward(a.receiver);
+                    a.closure = forward(a.closure);
+                }
+                body => map_all(body, forward),
+            }
+        }
+    }
+}
+
 /// Rewrites every reference field of `body`, weak ones included.
 fn map_all(body: &mut Body, f: &impl Fn(Value) -> Value) {
     let each = |e: &mut Vec<Value>| e.iter_mut().for_each(|v| *v = f(*v));

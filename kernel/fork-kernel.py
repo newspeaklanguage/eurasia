@@ -225,6 +225,14 @@ def main():
 		)
 		public hostGlobal = (
 		)
+		public commit: changeSet = (
+		)
+		public mixinApplicationsOf: mixin = (
+		)
+		public subclassesOf: class = (
+		)
+		public programVersion = (
+		)
 		public classOf: object = (
 		)
 		public currentActivation = (
@@ -368,7 +376,9 @@ def main():
 			library at: 2 put: a
 		)
 		public _applications = (
-			^nil
+			(* Eurasia: the classes applying this mixin, from the VM (psoup keeps a weak set). *)
+
+			^vm mixinApplicationsOf: self
 		)
 		public _headerSource = (
 			^(nil = _library or: [ _library size < 4 ]) ifTrue: [ nil ] ifFalse: [ _library at: 4 ]
