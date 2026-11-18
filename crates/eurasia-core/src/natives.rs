@@ -162,6 +162,7 @@ natives! {
     VmPerformWith = 119 / 3: "`vm object:perform:with:`: an ordinary send, whatever the receiver overrides.",
     VmGarbageCollect = 120 / 0: "`vm garbageCollect`: a full collection; answers the receiver.",
     VmMonotonicNanos = 121 / 0: "`vm monotonicNanos` (input).",
+    VmFinishTurn = 123 / 1: "`MessageLoop>>finish:`: ends the turn; the argument is the next timer's monotonic time in nanoseconds, or 0 for none.",
     VmApplyMixin = 122 / 3: "`vm applyMixin:superclass:enclosingObject:`: a new class and its metaclass.",
 }
 
@@ -330,6 +331,9 @@ pub enum Outcome {
     Snapshot,
     /// Collect garbage now (`vm garbageCollect`), then answer the receiver.
     Collect,
+    /// End the turn (`finish:`): the stack unwinds and the VM's event loop
+    /// waits until the given monotonic time in nanoseconds (0: no timer).
+    FinishTurn(u64),
     /// An activation native: the interpreter, which owns the frames, carries
     /// it out and answers or fails.
     Frame(Native),
@@ -1471,6 +1475,11 @@ pub fn invoke(
             }
         }
         Native::VmGarbageCollect => Outcome::Collect,
+        Native::VmFinishTurn => match arg(0).as_small_integer() {
+            Some(t) if t >= 0 => Outcome::FinishTurn(t as u64),
+            Some(_) => Outcome::Fail(Reason::OutOfRange(1)),
+            None => Outcome::Fail(Reason::WrongKind(1)),
+        },
         Native::VmMonotonicNanos => {
             let t = ctx.host.monotonic_nanos();
             Outcome::Answer(ctx.integer(BigInt::from_i128(i128::from(t))))

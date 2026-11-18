@@ -120,3 +120,10 @@ VMMirror	instance	snapshot	VmSnapshot	90
 VMMirror	instance	writeBytes:toFile:	VmWriteFile	91
 VMMirror	instance	readFile:	VmReadFile	92
 VMMirror	instance	setRole:to:	VmSetRole	93
+# psoup's actors module (ActorsForPrimordialSoup.ns), packaged unchanged but
+# for its primitive pragmas: the genesis packager installs these natives on
+# its methods by class name, as psoup's primitives were.
+ActorsForPrimordialSoup	instance	classOf:	VmClassOf	113
+ActorsForPrimordialSoup	instance	currentMonotonicNanos	VmMonotonicNanos	121
+MessageLoop	instance	finish:	VmFinishTurn	123
+MessageLoop	instance	exit:	VmExit	21

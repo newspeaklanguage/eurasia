@@ -158,6 +158,8 @@ pub struct Vm {
     gc_stress: Option<u64>,
     /// Collections so far.
     collections: u64,
+    /// Set when a turn ends with `finish:`: the next timer's time (0: none).
+    finished_turn: Option<u64>,
 }
 
 /// The fewest allocations between scheduled collections.
@@ -184,6 +186,7 @@ impl Vm {
             gc_budget: MIN_GC_BUDGET,
             gc_stress: None,
             collections: 0,
+            finished_turn: None,
         }
     }
 
@@ -274,22 +277,38 @@ impl Vm {
         self.roles.get(Role::Nil)
     }
 
-    /// Runs the program: sends `main:args:` to the entry object with the VM
-    /// mirror and an Array of the argument strings.
+    /// Runs the program with an Array of the argument strings.
+    ///
+    /// An image with a message loop (the MessageLoop role is not nil) runs
+    /// as psoup's do: the VM delivers the arguments as the startup message,
+    /// `messageLoop dispatchMessage: args port: nil`, and every turn ends
+    /// with `finish:`, naming the next timer. The VM then waits for that
+    /// time and dispatches again (`dispatchMessage: nil port: nil`); with no
+    /// timer (and, until ports, M4, nothing else to wait for) the run is over.
+    /// An image without one (first light) sends the entry `main:args:` with
+    /// the VM mirror, and the run is over when that returns.
     pub fn run(&mut self, host: &mut dyn Host, args: &[&str]) -> Result<Completion, VmError> {
         let strings: Vec<Value> = args.iter().map(|a| self.new_string(a)).collect();
         let array_class = self.roles.get(Role::ArrayClass);
         let args_array = self
             .heap
             .allocate(array_class, Space::Actor(0), Body::Array(strings));
-        let entry = self.roles.get(Role::Entry);
-        let vm_mirror = self.roles.get(Role::VmMirror);
         self.stack.clear();
         self.frames.clear();
-        self.stack.extend([entry, vm_mirror, args_array]);
-        let selector = self.symbol("main:args:");
-        if let Some(done) = self.ordinary_send(selector, 2, host)? {
-            return Ok(done);
+        let message_loop = self.roles.get(Role::MessageLoop);
+        let has_loop = message_loop != self.nil();
+        if has_loop {
+            if let Some(done) = self.dispatch(args_array, host)? {
+                return Ok(done);
+            }
+        } else {
+            let entry = self.roles.get(Role::Entry);
+            let vm_mirror = self.roles.get(Role::VmMirror);
+            self.stack.extend([entry, vm_mirror, args_array]);
+            let selector = self.symbol("main:args:");
+            if let Some(done) = self.ordinary_send(selector, 2, host)? {
+                return Ok(done);
+            }
         }
         let mut steps: u64 = 0;
         loop {
@@ -300,8 +319,26 @@ impl Vm {
                 steps += 1;
             }
             if self.frames.is_empty() {
-                let result = self.stack.pop().ok_or(VmError::Malformed("empty stack"))?;
-                return Ok(Completion::Returned(result));
+                match self.finished_turn.take() {
+                    // The event loop: wait for the next timer, then dispatch.
+                    Some(wakeup) if wakeup > 0 => {
+                        host.wait_until(wakeup);
+                        let nil = self.nil();
+                        if let Some(done) = self.dispatch(nil, host)? {
+                            return Ok(done);
+                        }
+                        continue;
+                    }
+                    // Nothing left to wait for.
+                    Some(_) => return Ok(Completion::Returned(self.nil())),
+                    None if has_loop => {
+                        return Err(VmError::Malformed("a turn returned without finish:"));
+                    }
+                    None => {
+                        let result = self.stack.pop().ok_or(VmError::Malformed("empty stack"))?;
+                        return Ok(Completion::Returned(result));
+                    }
+                }
             }
             // A safepoint: every value the VM holds is in the roots.
             if self.gc_due() {
@@ -705,6 +742,16 @@ impl Vm {
             }
             Outcome::Exit(code) => Ok(Some(Completion::Exited(code))),
             Outcome::Frame(_) => unreachable!("frame natives are resolved above"),
+            Outcome::FinishTurn(wakeup) => {
+                // The turn's frames unwind; the event loop takes over.
+                let frames = core::mem::take(&mut self.frames);
+                for f in &frames {
+                    self.retire(f);
+                }
+                self.stack.clear();
+                self.finished_turn = Some(wakeup);
+                Ok(None)
+            }
             Outcome::Collect => {
                 // A safepoint: the receiver is back on the stack first.
                 self.stack.push(receiver);
@@ -939,6 +986,27 @@ impl Vm {
         }
     }
 
+    /// Starts a turn: `messageLoop dispatchMessage: message port: nil`, sent
+    /// whatever the method's access (it is the loop's private entry point).
+    fn dispatch(
+        &mut self,
+        message: Value,
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
+        let receiver = self.roles.get(Role::MessageLoop);
+        let sel = self.selector_bytes(self.roles.get(Role::DispatchMessageSelector))?;
+        let mut class = Some(self.class_of(receiver));
+        while let Some(c) = class {
+            if let Some(m) = self.method_at(c, &sel)? {
+                let nil = self.nil();
+                self.stack.extend([receiver, message, nil]);
+                return self.activate(m, 2, host);
+            }
+            class = self.superclass(c)?;
+        }
+        Err(VmError::MissingUpcall(Role::DispatchMessageSelector.name()))
+    }
+
     /// Sends `selector` (a role) to the current frame's activation with
     /// `args`, as psoup does for #cannotReturn:, #aboutToReturn:through: and
     /// #nonBooleanReceiver:. Lookup ignores access, like DNU.
@@ -1091,14 +1159,6 @@ impl Vm {
         VmError::InvalidBytecode {
             selector: self.method_selector(f.method),
             index: f.ip,
-        }
-    }
-
-    fn unimplemented(&self, what: &'static str) -> VmError {
-        let f = self.frames.last().expect("a frame");
-        VmError::Unimplemented {
-            what,
-            selector: self.method_selector(f.method),
         }
     }
 
@@ -1526,7 +1586,26 @@ impl Vm {
                 self.stack.push(v);
                 None
             }
-            op::EVENTUAL_SEND => return Err(self.unimplemented("eventual send")),
+            op::EVENTUAL_SEND => {
+                // `r <-: sel args` is `messageLoop eventualSendTo: r
+                // selector: sel arguments: {args}` (V5 spec, opcode 239).
+                let index = bytes[1] as usize | (((bytes[2] & 15) as usize) << 8);
+                let n = (bytes[2] >> 4) as usize;
+                let selector = self.literal(method, index).ok_or_else(|| self.invalid())?;
+                if self.stack.len() < self.frames.last().expect("a frame").lp + n + 1 {
+                    return Err(self.invalid());
+                }
+                let args = self.stack.split_off(self.stack.len() - n);
+                let receiver = self.pop()?;
+                let array_class = self.roles.get(Role::ArrayClass);
+                let array = self
+                    .heap
+                    .allocate(array_class, Space::Actor(0), Body::Array(args));
+                let message_loop = self.roles.get(Role::MessageLoop);
+                self.stack.extend([message_loop, receiver, selector, array]);
+                let send = self.symbol("eventualSendTo:selector:arguments:");
+                self.ordinary_send(send, 3, host)?
+            }
             op::BRANCH_BACK => {
                 let target = next.checked_sub(wide()).ok_or_else(|| self.invalid())?;
                 self.frames.last_mut().expect("a frame").ip = target;

@@ -2,7 +2,7 @@
 # Copyright (c) 2026-2027, Gilad Bracha. All rights reserved. Use of this source
 # code is governed by a BSD-style license that can be found in the LICENSE file.
 # Differential kernel tests (implementation plan section 5, item 3): run
-# psoup's KernelTests on psoup with Minitest (EurasiaKernelTestReference) and
+# psoup's kernel, weak, access-modifier and actor test suites on psoup with Minitest (EurasiaKernelTestReference) and
 # on Eurasia from a genesis image (EurasiaKernelTestRunner), then compare the
 # outcome of every test. A test whose outcome differs must be listed, with
 # the reason, in docs/EXPECTED_DIFFERENCES.md; any other difference fails.
@@ -18,7 +18,7 @@ PRIMORDIALSOUP=${PRIMORDIALSOUP:-$EURASIA/../primordialsoup}
 PSOUP=$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup
 OUT=$EURASIA/target/kerneltests
 mkdir -p "$OUT"
-MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $PRIMORDIALSOUP/newspeak/Minitest.ns $PRIMORDIALSOUP/newspeak/KernelTests.ns $PRIMORDIALSOUP/newspeak/AccessModifierTesting.ns $PRIMORDIALSOUP/newspeak/KernelWeakTests.ns"
+MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $PRIMORDIALSOUP/newspeak/ActorsForPrimordialSoup.ns $NEWSPEAK/EurasiaRuntime.ns $PRIMORDIALSOUP/newspeak/Minitest.ns $PRIMORDIALSOUP/newspeak/KernelTests.ns $PRIMORDIALSOUP/newspeak/AccessModifierTesting.ns $PRIMORDIALSOUP/newspeak/KernelWeakTests.ns $PRIMORDIALSOUP/newspeak/ActorsTesting.ns $PRIMORDIALSOUP/newspeak/TestActor.ns"
 
 echo "== building EurasiaPackager.vfuel and EurasiaKernelTestReference.vfuel"
 (cd "$PRIMORDIALSOUP" && "$PSOUP" ./out/snapshots/WebCompiler.vfuel \

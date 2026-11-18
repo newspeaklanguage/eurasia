@@ -14,6 +14,9 @@ NEWSPEAK=${NEWSPEAK:-$EURASIA/../newspeak}
 PRIMORDIALSOUP=${PRIMORDIALSOUP:-$EURASIA/../primordialsoup}
 OUT=$EURASIA/target/genesis
 mkdir -p "$OUT"
+# The application's modules: psoup's public kernel, collections and actors,
+# and the platform over them.
+MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $PRIMORDIALSOUP/newspeak/ActorsForPrimordialSoup.ns $NEWSPEAK/EurasiaRuntime.ns"
 
 echo "== building EurasiaPackager.vfuel"
 (cd "$PRIMORDIALSOUP" && ./out/ReleaseX64/primordialsoup ./out/snapshots/WebCompiler.vfuel \
@@ -26,7 +29,7 @@ echo "== building EurasiaPackager.vfuel"
 echo "== packaging the genesis image"
 "$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" "$OUT/EurasiaPackager.vfuel" \
   "$NEWSPEAK/EurasiaKernel.ns" "$EURASIA/kernel/natives.tsv" \
-  "$NEWSPEAK/EurasiaKernelSmokeTest.ns" "$OUT/genesis.eus"
+  "$NEWSPEAK/EurasiaKernelSmokeTest.ns" $MODULES "$OUT/genesis.eus"
 
 cargo build -q -p eurasia-native
 EURASIA_BIN=$EURASIA/target/debug/eurasia
@@ -38,7 +41,7 @@ ls -l "$OUT/base.eus"
 echo "== running the base image"
 "$EURASIA_BIN" "$OUT/base.eus" | tee "$OUT/output.txt"
 expected=$(printf '%s\n' 7 1267650600228229401496703205376 'instance of _Array' abcdef 42 \
-  'caught DNU' 'NumberFloorDivide failed: zeroDivide' 'start body ensure' 42 done)
+  'caught DNU' 'NumberFloorDivide failed: zeroDivide' 'start body ensure' 42 done 'eventually 42')
 if [ "$(cat "$OUT/output.txt")" != "$expected" ]; then
   echo "Unexpected output from the base image."; exit 1
 fi
@@ -60,7 +63,7 @@ echo "== reproducibility: building again must give byte-identical images"
 mkdir -p "$OUT/again"
 "$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" "$OUT/EurasiaPackager.vfuel" \
   "$NEWSPEAK/EurasiaKernel.ns" "$EURASIA/kernel/natives.tsv" \
-  "$NEWSPEAK/EurasiaKernelSmokeTest.ns" "$OUT/again/genesis.eus" > /dev/null
+  "$NEWSPEAK/EurasiaKernelSmokeTest.ns" $MODULES "$OUT/again/genesis.eus" > /dev/null
 # A different output path: a snapshot saves only what the roles reach, so
 # the arguments genesis ran with are not in the image.
 "$EURASIA_BIN" "$OUT/again/genesis.eus" "$OUT/again/base.eus"

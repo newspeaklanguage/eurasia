@@ -24,6 +24,13 @@ pub trait Host {
     /// Input (`vm randomBytes:`): fill `buffer` with host entropy.
     fn random_bytes(&mut self, buffer: &mut [u8]);
 
+    /// Waits until the monotonic clock reaches `nanos` (the next timer), or
+    /// an event arrives. The default does not wait: the event loop then
+    /// polls the clock, which is correct but busy.
+    fn wait_until(&mut self, nanos: u64) {
+        let _ = nanos;
+    }
+
     /// Input (`vm hostDescription`): a short description of the host.
     fn description(&self) -> &str;
 

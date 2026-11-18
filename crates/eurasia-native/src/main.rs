@@ -52,6 +52,13 @@ impl Host for CommandLineHost {
         assert!(ok, "no entropy source");
     }
 
+    fn wait_until(&mut self, nanos: u64) {
+        let now = self.monotonic_nanos();
+        if nanos > now {
+            std::thread::sleep(std::time::Duration::from_nanos(nanos - now));
+        }
+    }
+
     fn description(&self) -> &str {
         std::env::consts::OS
     }
@@ -102,17 +109,16 @@ fn main() -> ExitCode {
     let program_args: Vec<&str> = args[2..].iter().map(String::as_str).collect();
     let mut vm = Vm::new(heap, roles);
     vm.set_snapshot_writer(write_image);
-    vm.set_gc_stress(
-        std::env::var("EURASIA_GC_STRESS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n > 0),
-    );
+    let gc_stress = std::env::var("EURASIA_GC_STRESS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &u64| n > 0);
+    vm.set_gc_stress(gc_stress);
     let mut host = CommandLineHost {
         start: Instant::now(),
     };
     let outcome = vm.run(&mut host, &program_args);
-    if std::env::var_os("EURASIA_GC_STRESS").is_some() {
+    if gc_stress.is_some() {
         eprintln!("eurasia: {} collections", vm.collections());
     }
     match outcome {

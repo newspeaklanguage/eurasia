@@ -7,17 +7,24 @@ else is a bug.
 
 ## Per-test differences
 
-`scripts/kernel-tests.sh` runs psoup's `KernelTests`, `AccessModifierTesting`
-and `KernelWeakTests` on both VMs and compares each test's outcome
+`scripts/kernel-tests.sh` runs psoup's `KernelTests`, `AccessModifierTesting`,
+`KernelWeakTests` and `ActorsTesting` on both VMs, asynchronously as psoup's
+`TestRunner` does, and compares each test's outcome
 (success, failure or error). A test whose outcome may differ is listed here
 as a line `- `Context>>selector`: reason`; the script fails on any other
 difference, and also reports listed tests that agree again.
 
-None at present (2026-11-17): all 377 tests have the same outcome on both
-VMs (376 successes; `FloatTests>>testFloatRaisedTo` fails on both, with the
-same message), also under GC stress (`GC_STRESS=64`).
+None at present (2026-11-17): all 445 tests have the same outcome on both
+VMs, also under GC stress (`GC_STRESS=64`). 429 succeed on both; the 16 that
+do not fail identically on both, with the same message:
+`FloatTests>>testFloatRaisedTo` (the test computes `8 ** 1 / 3`, which is
+`(8 ** 1) / 3`) and 15 `SingleActorTests`, which immediate-send `isPromise`
+or `isResolved` to an eventual reference, which the actors library refuses.
+Both runners install a handler of last resort, so a turn's unhandled
+exception (`TimerTests>>testOneShotTimerInvalidCallback` causes one) is
+reported and the suite goes on, as on psoup.
 
-Not yet compared: the actor suites (M4), the mirror suites and `MinitestTests` (mirrors, M6; Minitest's own
+Not yet compared: ports and spawning another VM (no suite uses them), the mirror suites and `MinitestTests` (mirrors, M6; Minitest's own
 discovery and runner use mirrors and promises, so on Eurasia the runner
 finds tests from the packager's catalog). psoup's `CollectionsTesting` does
 not run on psoup itself (it imports an `OrderedMap` that
@@ -31,6 +38,7 @@ not run on psoup itself (it imports an `OrderedMap` that
 | `<`, `>`, `<=`, `>=` with a non-number argument | `ArgumentError`, except a Fraction argument | tail-sends the reversed comparison to the argument (`a < b` sends `b > a`), so a non-number receiver of the reversal gets DNU | No fallback bodies (design doc section 3); the argument decides. |
 | Comparisons with a Fraction argument | **psoup bug**: `a < b` answers `b >= a` (and likewise for the others), which is wrong when the values are equal | correct reversal | `KernelForPrimordialSoup.ns`, `Number>><` and siblings. |
 | `Integer>>/` | primitive, then Fraction in the fallback | an ordinary Newspeak method | The fallback was real code (operation list, section 3.1). |
+| A closure called with the wrong number of arguments | `ArgumentError` (the primitive fails and `Closure>>value` reports it) | `NativeFailure`, `#arity` | No fallback bodies: a failing native signals (operation list, section 0). Both are Errors, so `on: Error` catches either; printed messages differ. |
 | Callback arguments | extra JS arguments raise `ArgumentError` | dropped; missing ones are nil | Decided 2026-11-10. |
 | Float printing | double-conversion's shortest form | the same digits and spelling (`3.0`, `1.7976931348623157e+308`, `1.5e-7`), from Rust's shortest round-trip digits | Aligned 2026-11-17 by the kernel tests. |
 | `asStringFixed:`, `asStringExponential:`, `asStringPrecision:` | JavaScript's `toFixed`, `toExponential`, `toPrecision` | the same (`e+` exponents, digit ranges 0-20, 0-20 and 1-21) | Aligned 2026-11-17; any unusable digit count fails with `#outOfRange: 1` (operation list 3.1). |
