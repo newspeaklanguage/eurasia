@@ -1,0 +1,18 @@
+[package]
+name = "eurasia-native"
+description = "Command-line Eurasia VM for macOS and Linux."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "eurasia"
+path = "src/main.rs"
+
+[dependencies]
+eurasia-core.workspace = true
+eurasia-snapshot.workspace = true
+
+[lints]
+workspace = true

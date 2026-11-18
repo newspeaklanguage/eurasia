@@ -1,0 +1,10 @@
+[package]
+name = "eurasia-core"
+description = "Eurasia VM core: values, object model, heaps, the V5 interpreter, natives and kernel operations."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

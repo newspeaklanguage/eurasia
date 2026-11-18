@@ -1,0 +1,13 @@
+[package]
+name = "eurasia-snapshot"
+description = "Reading and writing Eurasia snapshots (docs/SNAPSHOT_FORMAT.md)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eurasia-core.workspace = true
+
+[lints]
+workspace = true

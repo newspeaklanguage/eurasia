@@ -1,0 +1,54 @@
+# Eurasia
+
+A new virtual machine for Newspeak, replacing Primordial Soup. Written in
+Rust, for native platforms and the web (wasm32) from one code base.
+
+## Specification
+
+Eurasia implements documents in the Newspeak repository (`../newspeak`):
+
+- `VM_KERNEL_CONTRACT_DESIGN_2026-11-09.md`: the contract between the VM and
+  Newspeak, and its decisions;
+- `VM_KERNEL_OPERATIONS_2026-11-10.md`: every operation, its failures and
+  effect category;
+- `formal-semantics/kernel-semantics.tex`: the rules (section 13 of the
+  formal semantics), with the native-method rules mechanized in SpecTec;
+- `BYTECODES_V5_SPEC_2026-07-13.md`: the instruction set (V5, refined);
+- `NEW_VM_IMPLEMENTATION_PLAN_2026-11-17.md`: architecture and milestones.
+
+The snapshot format is [docs/SNAPSHOT_FORMAT.md](docs/SNAPSHOT_FORMAT.md).
+
+## Layout
+
+| Crate | Contents |
+|---|---|
+| `eurasia-core` | Values, object model, heaps, the V5 interpreter, natives, kernel operations. No I/O; `no_std`. |
+| `eurasia-snapshot` | The snapshot format. `no_std`. |
+| `eurasia-host` | The host interface: every input and output effect. `no_std`. |
+| `eurasia-native` | The `eurasia` command-line VM. |
+| `eurasia-web` | The wasm32 build. |
+
+## Building and checking
+
+The toolchain is pinned in `rust-toolchain.toml`. Run
+
+```sh
+scripts/check.sh
+```
+
+which checks formatting, runs clippy and the tests natively, and builds and
+lints the libraries for wasm32. Every change must pass it.
+
+## Status
+
+M0 (skeleton): tagged 64-bit values, the snapshot encoding and header. The
+VM does not run anything yet; M1 is the first image.
+
+## License
+
+Copyright 2026-2027, Gilad Bracha. Eurasia is licensed under the same
+BSD-style license as the Primordial Soup VM; see [LICENSE](LICENSE). It is a
+new implementation and contains no psoup VM code. The kernel and actors fork
+scripts (`kernel/fork-kernel.py`, `kernel/fork-actors.py`) contain excerpts
+of psoup's Newspeak sources, which are under the Apache License 2.0; the
+LICENSE file acknowledges them.

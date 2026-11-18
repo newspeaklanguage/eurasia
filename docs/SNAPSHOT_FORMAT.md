@@ -1,0 +1,154 @@
+# Eurasia snapshot format
+
+**Status:** Draft, format version 1. Written before the code (implementation
+plan M0); the packager (Newspeak) and `eurasia-snapshot` (Rust) are tested
+against each other.
+
+Eurasia snapshots replace psoup's vfuels. The structure follows psoup's
+PrimordialFuel (a graph written as nodes, then edges), with one essential
+difference: **objects are written in allocation order, with their allocation
+sequence numbers**. Allocation order is the identity order of the formal
+semantics, and an object's sequence number is its identity hash
+(`kernel-semantics.tex`, equations `eq:kernel-fresh` and
+`eq:kernel-identity-hash`), so both must survive a save and restore exactly.
+psoup groups objects by class instead, which loses that order.
+
+## 1. Encoding conventions
+
+- `u8`, `u16`, `u32`: fixed width, **little-endian**.
+- `uv`: unsigned LEB128 (7 bits per byte, low group first, high bit set on
+  every byte but the last). At most 10 bytes.
+- `sv`: signed LEB128 of the zigzag encoding (`(n << 1) ^ (n >> 63)`).
+- `bytes(n)`: `n` raw bytes.
+- A **value** is a `uv` holding the 64-bit tagged word of the VM
+  (`eurasia-core::Value`): bit 0 = 0 is a SmallInteger shifted left by one;
+  bit 0 = 1 is a reference, `ref << 1 | 1`, where `ref` is a **node number**
+  (section 3), not a memory address. SmallIntegers are written zigzagged
+  first, so small negative numbers stay short: the written `uv` is
+  `zigzag(n) << 1` for a SmallInteger `n`.
+
+## 2. Header
+
+| Field | Type | Meaning |
+|---|---|---|
+| magic | `bytes(4)` | `EURA` (0x45 0x55 0x52 0x41) |
+| format version | `u16` | This document: 1 |
+| kernel version | `u16` | Must equal the VM's `KERNEL_VERSION` |
+| bytecode version | `u16` | Must equal the VM's `BYTECODE_VERSION` |
+| word size | `u8` | Always 64 |
+| flags | `u8` | Reserved, 0 |
+| allocation counter | `uv` | `n_α`: the next sequence number to allocate |
+| node count | `uv` | Number of nodes in the file |
+| section count | `uv` | Number of sections |
+
+A VM refuses a snapshot whose magic, format version, kernel version,
+bytecode version or word size differs from its own, and says which. (psoup
+dies with "unimplemented code" when given a snapshot that is too new.)
+
+An optional `#!` interpreter line before the magic is skipped, as in psoup.
+
+## 3. Nodes and references
+
+Nodes are numbered from 1 in file order across all sections; 0 is not a
+node. File order **is** allocation order: sequence numbers strictly increase
+through the file. A value's reference field names a node number.
+
+## 4. Sections
+
+Each section is a kind, then its nodes, then its edges:
+
+| Field | Type |
+|---|---|
+| section kind | `u8` |
+| owner | `uv` (0 for the program section; the actor number for a heap) |
+| node count | `uv` |
+| nodes | node records |
+| edges | edge records, one per node, in the same order |
+
+Section kinds:
+
+| Kind | Name | Contents |
+|---|---|---|
+| 1 | roles | No nodes. Edges: `uv` count, then pairs (`uv` role id, value). Role ids are fixed by the kernel version (section 7). Must be the last section. |
+| 2 | program | Installed methods and mixins: frozen, shared by every actor of the cohort. |
+| 3 | actor heap | One actor's objects, including its class objects. |
+
+Two-phase loading, as in psoup: all nodes of all sections are allocated
+first (their sizes are in the node records), then edges are filled, so
+cycles need no special handling.
+
+## 5. Node records
+
+| Field | Type | Meaning |
+|---|---|---|
+| sequence delta | `uv` | Sequence number minus the previous node's (the first node's is absolute). Gaps are objects collected before the save. |
+| kind | `u8` | Below |
+| flags | `u8` | Bit 0: frozen (installed or canonical). Others reserved. |
+| shape | depends on kind | Below |
+
+| Kind | Name | Shape in the node record | Edge record |
+|---|---|---|---|
+| 1 | regular | `uv` slot count | class value, then one value per slot |
+| 2 | bytes | `uv` length, `bytes(length)` | class value |
+| 3 | string | `uv` length, `bytes(length)` (UTF-8) | class value |
+| 4 | array | `uv` length | class value, then the elements |
+| 5 | weak array | `uv` length | class value, then the elements |
+| 6 | ephemeron | none | class value, key, value, finalizer |
+| 7 | float | `bytes(8)`, IEEE 754 binary64, little-endian, NaN canonical | class value |
+| 8 | large integer | `u8` sign (0 or 1), `uv` length, `bytes(length)` magnitude, little-endian | class value |
+| 9 | method | header (section 6), `uv` bytecode length, `bytes(length)` | class value, literals array, mixin, selector, source, library field |
+| 10 | mixin | `uv` slot-declaration count | class value, name, methods array, enclosing mixin, slot-declaration names array, library field |
+| 11 | class | none | class value (its metaclass), mixin, superclass, enclosing object, name, library field |
+| 12 | metaclass | none | class value, mixin, superclass, enclosing object, this class, library field |
+
+Kinds 9–12 are the contract layouts of the implementation plan (section 4
+of the operation list): the VM reads those fields and no others. Everything
+the VM derives (class ids, final layouts, lookup caches) is rebuilt at load
+and never written. Closures, activations and paused stacks (hidden layouts)
+get kinds when M7 defines how a paused actor is saved.
+
+## 6. Method header
+
+| Field | Type | Meaning |
+|---|---|---|
+| kind | `u8` | 0 ordinary, 1 native, 2 getter, 3 setter, 4 return-self |
+| access | `u8` | 0 public, 1 protected, 2 private |
+| argument count | `uv` | |
+| local count | `uv` | |
+| native id | `uv` | Kind 1 only: the catalog entry, valid for this kernel version |
+| slot index | `uv` | Kinds 2 and 3 only |
+
+A native method has bytecode length 0.
+
+## 7. Roles
+
+Role ids for kernel version 1 (the operation list, section 2):
+
+| Id | Role | Id | Role |
+|---|---|---|---|
+| 1 | nil | 16 | Expat class |
+| 2 | true | 17 | message loop |
+| 3 | false | 18 | `doesNotUnderstand:` selector |
+| 4 | SmallInteger class | 19 | `nonBooleanReceiver:` selector |
+| 5 | MediumInteger class | 20 | `cannotReturn:` selector |
+| 6 | LargeInteger class | 21 | `aboutToReturnThrough:` selector |
+| 7 | Float class | 22 | `dispatchMessage:port:` selector |
+| 8 | String class | 23 | `dispatchSignal` selector |
+| 9 | ByteArray class | 24 | failure exception class |
+| 10 | Array class | 25 | `ensure:` method |
+| 11 | WeakArray class | 26 | `on:do:` method |
+| 12 | Ephemeron class | 27 | simulation-root method |
+| 13 | Closure class | 28 | callback-dispatch method |
+| 14 | Activation class | 29 | common-selector array (V5 opcodes 176–207) |
+| 15 | Method class | 30 | Message class |
+
+Every role must be present. Unknown role ids are an error.
+
+## 8. Validation at load
+
+The loader checks, and refuses the snapshot with a message naming the node if
+any fails: the header; strictly increasing sequence numbers below the
+allocation counter; every reference names an existing node; node counts match;
+every kind and flag is known; method headers are consistent with their kind;
+every role is present. Bytecode is checked when a method is first run, not at
+load.

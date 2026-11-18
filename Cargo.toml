@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/eurasia-core",
+    "crates/eurasia-snapshot",
+    "crates/eurasia-host",
+    "crates/eurasia-native",
+    "crates/eurasia-web",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+rust-version = "1.100"
+
+[workspace.dependencies]
+eurasia-core = { path = "crates/eurasia-core" }
+eurasia-snapshot = { path = "crates/eurasia-snapshot" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
