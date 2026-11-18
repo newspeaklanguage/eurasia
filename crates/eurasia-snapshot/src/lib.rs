@@ -3,8 +3,7 @@
 
 //! Eurasia snapshots: the format of `docs/SNAPSHOT_FORMAT.md`.
 //!
-//! M0 provides the encoding primitives and the header. Sections, nodes and
-//! edges follow in M1, together with the packager that writes them.
+//! The encoding primitives, the header, and whole images.
 
 #![no_std]
 
@@ -12,6 +11,8 @@ extern crate alloc;
 
 pub mod encoding;
 pub mod header;
+pub mod image;
 
 pub use encoding::{DecodeError, Reader, Writer};
 pub use header::{FORMAT_VERSION, Header, HeaderError, MAGIC, WORD_SIZE};
+pub use image::{LoadError, read_image, write_image};

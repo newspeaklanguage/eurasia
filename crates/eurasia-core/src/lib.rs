@@ -12,8 +12,16 @@
 
 extern crate alloc;
 
+pub mod builder;
+pub mod bytecode;
+pub mod host;
+pub mod interpreter;
+pub mod natives;
+pub mod object;
+pub mod roles;
 pub mod value;
 pub mod version;
 
+pub use interpreter::{Completion, Vm, VmError};
 pub use value::{SmallInteger, Value};
 pub use version::{BYTECODE_VERSION, KERNEL_VERSION};

@@ -14,5 +14,8 @@ path = "src/main.rs"
 eurasia-core.workspace = true
 eurasia-snapshot.workspace = true
 
+[dev-dependencies]
+eurasia-core.workspace = true
+
 [lints]
 workspace = true

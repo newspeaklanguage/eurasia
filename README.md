@@ -41,8 +41,22 @@ lints the libraries for wasm32. Every change must pass it.
 
 ## Status
 
-M0 (skeleton): tagged 64-bit values, the snapshot encoding and header. The
-VM does not run anything yet; M1 is the first image.
+**M1a (first light, Rust side) done.** The VM loads a snapshot and runs V5
+bytecode: ordinary, self, implicit-receiver, super and outer sends with
+psoup's lookup and access rules; DNU; natives with their three outcomes
+(answer, tail send, failure through the failure class); local returns,
+branches, literals, parameters, locals and arrays. Images are built in Rust
+(`eurasia_core::builder`) until the packager exists.
+
+```sh
+cargo run -p eurasia-native --example write_first_light -- first-light.eus
+cargo run -p eurasia-native -- first-light.eus      # prints 7
+```
+
+Not yet (M2): closures, non-local return, `ensure:`/`on:do:`,
+`nonBooleanReceiver:`, LargeIntegers and the rest of the native catalog, and
+stack exhaustion as a failure rather than a VM error. M1b is the packager
+(Newspeak, in the newspeak repository), which builds images from source.
 
 ## License
 

@@ -1,38 +1,79 @@
 // Copyright (c) 2026-2027, Gilad Bracha. All rights reserved. Use of this source
 // code is governed by a BSD-style license that can be found in the LICENSE file.
 
-//! The host interface of the Eurasia VM.
+//! Host implementations of the Eurasia VM's host interface.
 //!
-//! Everything nondeterministic or external reaches the VM through [`Host`]:
-//! these are the *input* and *output* effects of the kernel layer
-//! (`kernel-semantics.tex`, section 13.3), which replay logs and feeds back.
-//! M0 defines only the operations M1 needs; calls, callbacks and expats
-//! (operation list, section 10) come with the web host in M5.
+//! The [`Host`] trait itself is defined in `eurasia-core`, because natives
+//! call it. This crate holds hosts that are not tied to a platform; the
+//! command-line and web hosts live in their own crates.
 
 #![no_std]
 
-/// The services a host provides to the VM.
-pub trait Host {
-    /// Output (`vm print:`): send a line of text to the host's console.
-    fn print(&mut self, text: &str);
+extern crate alloc;
 
-    /// Input (`vm monotonicNanos`): a monotonic clock in nanoseconds.
-    fn monotonic_nanos(&mut self) -> u64;
+use alloc::string::String;
+use alloc::vec::Vec;
 
-    /// Input (`vm utcNanos`): wall-clock time in nanoseconds since the epoch.
-    fn utc_nanos(&mut self) -> i64;
+pub use eurasia_core::host::Host;
 
-    /// Input (`vm randomBytes:`): fill `buffer` with host entropy.
-    fn random_bytes(&mut self, buffer: &mut [u8]);
+/// A deterministic host for tests: it records printed lines, its clocks
+/// advance by one nanosecond per read, and its entropy is a counter.
+#[derive(Default)]
+pub struct RecordingHost {
+    /// Every line printed, in order.
+    pub printed: Vec<String>,
+    clock: u64,
+    entropy: u8,
+}
 
-    /// Input (`vm hostDescription`): a short description of the host.
-    fn description(&self) -> &str;
+impl RecordingHost {
+    /// A host with nothing printed and its clocks at zero.
+    pub fn new() -> RecordingHost {
+        RecordingHost::default()
+    }
+}
 
-    /// The turn layer's host hook (`vm finishTurn:`): the VM has finished a
-    /// turn and asks to be resumed when an event arrives or `wakeup_nanos`
-    /// (a monotonic time) passes, if given.
-    fn finish_turn(&mut self, wakeup_nanos: Option<u64>);
+impl Host for RecordingHost {
+    fn print(&mut self, text: &str) {
+        self.printed.push(String::from(text));
+    }
 
-    /// `vm exit:`: the program asked to end with `code`.
-    fn exit(&mut self, code: i32);
+    fn monotonic_nanos(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn utc_nanos(&mut self) -> i64 {
+        self.clock += 1;
+        self.clock as i64
+    }
+
+    fn random_bytes(&mut self, buffer: &mut [u8]) {
+        for b in buffer {
+            self.entropy = self.entropy.wrapping_add(1);
+            *b = self.entropy;
+        }
+    }
+
+    fn description(&self) -> &str {
+        "recording test host"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_prints_and_is_deterministic() {
+        let mut h = RecordingHost::new();
+        h.print("a");
+        h.print("b");
+        assert_eq!(h.printed, ["a", "b"]);
+        assert_eq!(h.monotonic_nanos(), 1);
+        assert_eq!(h.monotonic_nanos(), 2);
+        let mut buf = [0u8; 3];
+        h.random_bytes(&mut buf);
+        assert_eq!(buf, [1, 2, 3]);
+    }
 }

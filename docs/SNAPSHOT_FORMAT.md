@@ -6,8 +6,8 @@ against each other.
 
 Eurasia snapshots replace psoup's vfuels. The structure follows psoup's
 PrimordialFuel (a graph written as nodes, then edges), with one essential
-difference: **objects are written in allocation order, with their allocation
-sequence numbers**. Allocation order is the identity order of the formal
+difference: **every object is written with its allocation sequence number**,
+and objects are written in sequence order within each section. Allocation order is the identity order of the formal
 semantics, and an object's sequence number is its identity hash
 (`kernel-semantics.tex`, equations `eq:kernel-fresh` and
 `eq:kernel-identity-hash`), so both must survive a save and restore exactly.
@@ -50,8 +50,10 @@ An optional `#!` interpreter line before the magic is skipped, as in psoup.
 ## 3. Nodes and references
 
 Nodes are numbered from 1 in file order across all sections; 0 is not a
-node. File order **is** allocation order: sequence numbers strictly increase
-through the file. A value's reference field names a node number.
+node. A value's reference field names a node number. Within a section,
+sequence numbers strictly increase. Sections hold different spaces, whose
+objects interleave in allocation order, so the loader orders all objects by
+sequence number; sequence numbers are unique across the file.
 
 ## 4. Sections
 
@@ -81,7 +83,7 @@ cycles need no special handling.
 
 | Field | Type | Meaning |
 |---|---|---|
-| sequence delta | `uv` | Sequence number minus the previous node's (the first node's is absolute). Gaps are objects collected before the save. |
+| sequence delta | `uv` | Sequence number minus the previous node's in the same section (the section's first node's is absolute). Gaps are objects in other spaces, or collected before the save. |
 | kind | `u8` | Below |
 | flags | `u8` | Bit 0: frozen (installed or canonical). Others reserved. |
 | shape | depends on kind | Below |
@@ -126,29 +128,31 @@ Role ids for kernel version 1 (the operation list, section 2):
 
 | Id | Role | Id | Role |
 |---|---|---|---|
-| 1 | nil | 16 | Expat class |
-| 2 | true | 17 | message loop |
-| 3 | false | 18 | `doesNotUnderstand:` selector |
-| 4 | SmallInteger class | 19 | `nonBooleanReceiver:` selector |
-| 5 | MediumInteger class | 20 | `cannotReturn:` selector |
-| 6 | LargeInteger class | 21 | `aboutToReturnThrough:` selector |
-| 7 | Float class | 22 | `dispatchMessage:port:` selector |
-| 8 | String class | 23 | `dispatchSignal` selector |
-| 9 | ByteArray class | 24 | failure exception class |
-| 10 | Array class | 25 | `ensure:` method |
-| 11 | WeakArray class | 26 | `on:do:` method |
-| 12 | Ephemeron class | 27 | simulation-root method |
-| 13 | Closure class | 28 | callback-dispatch method |
-| 14 | Activation class | 29 | common-selector array (V5 opcodes 176–207) |
-| 15 | Method class | 30 | Message class |
+| 1 | nil | 18 | `doesNotUnderstand:` selector |
+| 2 | true | 19 | `nonBooleanReceiver:` selector |
+| 3 | false | 20 | `cannotReturn:` selector |
+| 4 | SmallInteger class | 21 | `aboutToReturnThrough:` selector |
+| 5 | MediumInteger class | 22 | `dispatchMessage:port:` selector |
+| 6 | LargeInteger class | 23 | `dispatchSignal` selector |
+| 7 | Float class | 24 | failure exception class |
+| 8 | String class | 25 | `ensure:` method |
+| 9 | ByteArray class | 26 | `on:do:` method |
+| 10 | Array class | 27 | simulation-root method |
+| 11 | WeakArray class | 28 | callback-dispatch method |
+| 12 | Ephemeron class | 29 | common-selector array (V5 opcodes 176–207) |
+| 13 | Closure class | 30 | Message class |
+| 14 | Activation class | 31 | VM mirror (its class carries the kernel operations) |
+| 15 | Method class | 32 | entry object (M1: sent `main:args:` with the VM mirror and an Array of argument Strings; the message loop replaces it in M4) |
+| 16 | Expat class | 33 | Alien class |
+| 17 | message loop | | |
 
 Every role must be present. Unknown role ids are an error.
 
 ## 8. Validation at load
 
 The loader checks, and refuses the snapshot with a message naming the node if
-any fails: the header; strictly increasing sequence numbers below the
-allocation counter; every reference names an existing node; node counts match;
+any fails: the header; strictly increasing sequence numbers within each
+section, unique across the file, and below the allocation counter; every reference names an existing node; node counts match;
 every kind and flag is known; method headers are consistent with their kind;
 every role is present. Bytecode is checked when a method is first run, not at
 load.
