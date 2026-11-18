@@ -185,6 +185,9 @@ VMMirror	instance	commit:	VmCommit	158
 VMMirror	instance	mixinApplicationsOf:	VmMixinApplicationsOf	159
 VMMirror	instance	subclassesOf:	VmSubclassesOf	160
 VMMirror	instance	programVersion	VmProgramVersion	161
+VMMirror	instance	checkpointNow	VmCheckpointNow	174
+VMMirror	instance	checkpointPolicy:	VmCheckpointPolicy	175
+VMMirror	instance	logPosition	VmLogPosition	176
 EurasiaMirrors	instance	subclassesOf:	VmSubclassesOf	160
 EurasiaMirrors	instance	commit:	VmCommit	158
 # Activations and the Simulator (M6 step 4).

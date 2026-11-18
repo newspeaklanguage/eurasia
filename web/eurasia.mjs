@@ -99,8 +99,16 @@ function hostObjects(bytesAt, decoder, encoder, link) {
 // WebAssembly.Module). `print` receives each line the program prints.
 // Answers a promise of {status: 'returned', resumes} or {status: 'exited',
 // code, resumes}, where resumes counts the waits for a timer;
-// a VM failure rejects it with an Error.
-export async function run(wasm, snapshot, { print = console.log } = {}) {
+// a VM failure rejects it with an Error. A snapshot that is a checkpoint
+// (M7) is restored into this host and continues where it was taken.
+//
+// With `record` set to a number n, the session is recorded
+// (crates/eurasia-core/src/replay.rs), with a checkpoint after every n
+// allocations (0: none). `onStart` is then given {log()}, where log() answers
+// the log so far as bytes, for `eurasia --replay` on the command line; call
+// it while the VM is not running (from a timer or an event of the page's
+// own, not from a callback into Newspeak).
+export async function run(wasm, snapshot, { print = console.log, record, onStart } = {}) {
   let memory = null;
   const link = { exports: null, depth: 0, afterIdleCallback: () => {} };
   const decoder = new TextDecoder();
@@ -131,6 +139,14 @@ export async function run(wasm, snapshot, { print = console.log } = {}) {
 
   const buffer = vm.eurasia_buffer(snapshot.length);
   bytesAt(buffer, snapshot.length).set(snapshot);
+  if (record !== undefined) vm.eurasia_record(record);
+  onStart?.({
+    log: () => {
+      if (link.depth > 0) throw new Error('eurasia: the log cannot be taken while the VM runs');
+      const n = vm.eurasia_log();
+      return bytesAt(vm.eurasia_buffer_address(), n).slice();
+    },
+  });
 
   let resumes = 0;
   let timer = null;

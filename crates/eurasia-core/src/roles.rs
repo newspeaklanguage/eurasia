@@ -78,6 +78,7 @@ roles! {
     ObjectClass = 37: "The platform's Object class, the superclass `vm spawn:` applies a mixin to.",
     InstanceMixinClass = 38: "The InstanceMixin class: `basicNew` of it answers an unfrozen mixin.",
     ClassMixinClass = 39: "The ClassMixin class: `basicNew` of it answers an unfrozen class-side mixin.",
+    RestoreHandler = 40: "The object sent `restored` after a restore into a new host, or nil.",
 }
 
 /// A complete assignment of values to roles.

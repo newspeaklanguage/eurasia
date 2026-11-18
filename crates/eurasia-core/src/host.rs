@@ -129,6 +129,29 @@ pub trait Host {
         Err(HostError::Unsupported)
     }
 
+    /// Output (M7): a checkpoint, as snapshot bytes the VM can be restored
+    /// from. The VM makes one only when [`Host::wants_checkpoints`].
+    fn checkpoint(&mut self, bytes: alloc::vec::Vec<u8>) {
+        let _ = bytes;
+    }
+
+    /// Whether this host keeps checkpoints (a recording or replaying host).
+    fn wants_checkpoints(&self) -> bool {
+        false
+    }
+
+    /// `vm logPosition`: the position in this host's input log, if it has
+    /// one.
+    fn log_position(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether the VM should stop (a replay that diverged); the event loop
+    /// asks now and then and stops with [`crate::VmError::Interrupted`].
+    fn interrupted(&self) -> bool {
+        false
+    }
+
     /// Input (`vm hostDescription`): a short description of the host.
     fn description(&self) -> &str;
 

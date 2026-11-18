@@ -33,16 +33,16 @@ impl Host for Printer {
 #[test]
 fn write_read_write_is_byte_identical() {
     let (heap, roles) = first_light_image();
-    let first = write_image(&heap, &roles);
+    let first = write_image(&heap, &roles, None);
     let (heap2, roles2) = read_image(&first).expect("loads");
-    let second = write_image(&heap2, &roles2);
+    let second = write_image(&heap2, &roles2, None);
     assert_eq!(first, second);
 }
 
 #[test]
 fn a_loaded_image_runs() {
     let (heap, roles) = first_light_image();
-    let bytes = write_image(&heap, &roles);
+    let bytes = write_image(&heap, &roles, None);
     let (heap, roles) = read_image(&bytes).expect("loads");
     let mut vm = Vm::new(heap, roles);
     let mut host = Printer::default();
@@ -54,7 +54,7 @@ fn a_loaded_image_runs() {
 #[test]
 fn loading_preserves_sequence_numbers_and_the_allocation_counter() {
     let (heap, roles) = first_light_image();
-    let bytes = write_image(&heap, &roles);
+    let bytes = write_image(&heap, &roles, None);
     let (loaded, loaded_roles) = read_image(&bytes).expect("loads");
     assert_eq!(loaded.allocation_counter(), heap.allocation_counter());
     let original: Vec<u64> = heap.iter().map(|(_, o)| o.header.seq).collect();
@@ -71,7 +71,7 @@ fn loading_preserves_sequence_numbers_and_the_allocation_counter() {
 #[test]
 fn every_truncation_is_refused_without_panicking() {
     let (heap, roles) = first_light_image();
-    let bytes = write_image(&heap, &roles);
+    let bytes = write_image(&heap, &roles, None);
     for len in 0..bytes.len() {
         assert!(
             read_image(&bytes[..len]).is_err(),
@@ -83,7 +83,7 @@ fn every_truncation_is_refused_without_panicking() {
 #[test]
 fn trailing_bytes_are_refused() {
     let (heap, roles) = first_light_image();
-    let mut bytes = write_image(&heap, &roles);
+    let mut bytes = write_image(&heap, &roles, None);
     bytes.push(0);
     assert_eq!(read_image(&bytes).unwrap_err(), LoadError::TrailingBytes);
 }
@@ -91,7 +91,7 @@ fn trailing_bytes_are_refused() {
 #[test]
 fn corrupted_bytes_never_panic() {
     let (heap, roles) = first_light_image();
-    let bytes = write_image(&heap, &roles);
+    let bytes = write_image(&heap, &roles, None);
     // Flip each byte after the header in turn; loading may succeed or fail,
     // but must not panic.
     for i in 16..bytes.len() {
@@ -145,9 +145,9 @@ fn closures_and_dead_activations_round_trip() {
         }),
     );
     let (heap, roles) = b.finish();
-    let first = write_image(&heap, &roles);
+    let first = write_image(&heap, &roles, None);
     let (loaded, roles2) = read_image(&first).expect("loads");
-    assert_eq!(write_image(&loaded, &roles2), first);
+    assert_eq!(write_image(&loaded, &roles2, None), first);
     let c = loaded
         .closure(closure)
         .expect("the closure, at the same index");
@@ -160,4 +160,96 @@ fn closures_and_dead_activations_round_trip() {
             .frame
             .is_none()
     );
+}
+
+#[test]
+fn checkpoints_keep_frames_and_detached_activations() {
+    use eurasia_core::Value;
+    use eurasia_core::builder::ImageBuilder;
+    use eurasia_core::machine::{ActorState, FrameState, MachineState};
+    use eurasia_core::object::{Activation, Body, Detached, Space};
+    use eurasia_snapshot::read_checkpoint;
+
+    let mut b = ImageBuilder::new();
+    let activation_class = b.role(Role::ActivationClass).unwrap();
+    let nil = b.nil;
+    let seven = Value::small_integer(7).unwrap();
+    let live = b.heap.allocate(
+        activation_class,
+        Space::Actor(0),
+        Body::Activation(Activation {
+            frame: Some(3),
+            method: nil,
+            receiver: seven,
+            closure: nil,
+            detached: None,
+        }),
+    );
+    let detached = b.heap.allocate(
+        activation_class,
+        Space::Actor(0),
+        Body::Activation(Activation {
+            frame: None,
+            method: nil,
+            receiver: nil,
+            closure: nil,
+            detached: Some(Detached {
+                sender: live,
+                bci: seven,
+                temps: vec![seven, nil, live],
+            }),
+        }),
+    );
+    let (heap, roles) = b.finish();
+    let state = MachineState {
+        stack: vec![nil, seven, detached],
+        frames: vec![FrameState {
+            serial: 3,
+            method: nil,
+            receiver: seven,
+            bp: 0,
+            arg_count: 1,
+            lp: 2,
+            ip: 9,
+            activation: Some(live),
+            closure: None,
+        }],
+        actors: vec![ActorState {
+            message_loop: nil,
+            mailbox: vec![detached],
+            wakeup: 12,
+            poked: true,
+        }],
+        current: 0,
+        expats: vec![(detached, 0)],
+        symbols: vec![("restored".to_string(), detached)],
+        next_serial: 4,
+        gc_counter: 5,
+        gc_budget: 6,
+        collections: 1,
+        finished_turn: Some(8),
+        has_loop: true,
+        program_version: 2,
+        checkpoint_every: 100,
+        last_checkpoint: 50,
+    };
+    let bytes = write_image(&heap, &roles, Some(&state));
+    let (loaded, roles2, machine) = read_checkpoint(&bytes).expect("loads");
+    assert_eq!(machine.as_ref(), Some(&state));
+    assert_eq!(write_image(&loaded, &roles2, machine.as_ref()), bytes);
+    assert_eq!(loaded.activation(live).unwrap().frame, Some(3));
+    let d = loaded
+        .activation(detached)
+        .unwrap()
+        .detached
+        .clone()
+        .unwrap();
+    assert_eq!(
+        (d.sender, d.bci, d.temps),
+        (live, seven, vec![seven, nil, live])
+    );
+    // A snapshot (no machine state) saves a frame's handle dead.
+    let (plain, _) = read_image(&write_image(&heap, &roles, None)).expect("loads");
+    assert_eq!(plain.activation(live).unwrap().frame, None);
+    assert!(plain.activation(detached).unwrap().detached.is_some());
 }

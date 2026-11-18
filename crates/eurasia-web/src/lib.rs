@@ -25,6 +25,12 @@
 //! result as an argument. A callback during a host operation is a sub-step
 //! of the running turn; one while the VM is idle starts a turn, after which
 //! the loader resumes the VM.
+//!
+//! Recording (M7): `eurasia_record(n)` before `eurasia_start` records the
+//! session (`eurasia_core::replay`), with a checkpoint after every `n`
+//! allocations (0: none); `eurasia_log()` then encodes the log so far into
+//! the buffer, to be saved and replayed on the command line. A checkpoint
+//! given to `eurasia_start` is restored into this new host and continues.
 
 // `no_mangle` exports and the host imports are the unsafe constructs here.
 #![allow(unsafe_code)]
@@ -32,8 +38,9 @@
 use std::cell::RefCell;
 
 use eurasia_core::host::{Host, HostCallbacks, HostError, HostOp, HostValue};
+use eurasia_core::replay::{Log, record_callback, record_resume, record_run};
 use eurasia_core::{BYTECODE_VERSION, Completion, KERNEL_VERSION, Vm, VmError};
-use eurasia_snapshot::{FORMAT_VERSION, read_image, write_image};
+use eurasia_snapshot::{FORMAT_VERSION, read_checkpoint, write_image};
 
 /// `eurasia_start` and `eurasia_resume`: the run is over; the entry returned.
 pub const RETURNED: i32 = 0;
@@ -69,6 +76,10 @@ struct State {
     vm: Option<Vm>,
     exit_code: i32,
     wakeup: u64,
+    /// The session's log, when recording.
+    log: Option<Log>,
+    /// The checkpoint policy to record with.
+    record_every: Option<u64>,
 }
 
 thread_local! {
@@ -92,9 +103,13 @@ pub extern "C" fn eurasia_callback(expat: u32) -> i32 {
         // when the operation began and is popped when it ends); the VM uses
         // it only through this call while the operation is suspended.
         Some(callbacks) => unsafe { (*callbacks).callback(&mut WebHost, expat, &args) },
-        None => STATE.with_borrow_mut(|s| match s.vm.as_mut() {
-            Some(vm) => vm.callback(&mut WebHost, expat, &args),
-            None => Err(HostError::Dead),
+        None => STATE.with_borrow_mut(|s| {
+            let State { vm, log, .. } = s;
+            match (vm.as_mut(), log.as_mut()) {
+                (Some(vm), Some(log)) => record_callback(vm, &mut WebHost, log, expat, &args),
+                (Some(vm), None) => vm.callback(&mut WebHost, expat, &args),
+                (None, _) => Err(HostError::Dead),
+            }
         }),
     };
     match result {
@@ -149,20 +164,73 @@ pub extern "C" fn eurasia_wakeup_nanos() -> f64 {
     STATE.with_borrow(|s| s.wakeup as f64)
 }
 
+/// Records the session that `eurasia_start` begins, with a checkpoint
+/// after every `every` allocations (0: none).
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_record(every: f64) {
+    STATE.with_borrow_mut(|s| s.record_every = Some(every as u64));
+}
+
+/// Encodes the log recorded so far into the buffer and answers its length
+/// (0 when not recording); `eurasia_buffer_address()` is where it is.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_log() -> usize {
+    STATE.with_borrow_mut(|s| {
+        s.buffer = s.log.as_ref().map(Log::encode).unwrap_or_default();
+        s.buffer.len()
+    })
+}
+
+/// The buffer's address.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_buffer_address() -> *const u8 {
+    STATE.with_borrow(|s| s.buffer.as_ptr())
+}
+
 /// Loads the snapshot in the buffer and runs it, with no arguments, as
-/// psoup's web host does.
+/// psoup's web host does. A checkpoint is restored into this new host and
+/// continues instead (M7 design, section 3.4).
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_start() -> i32 {
     STATE.with_borrow_mut(|s| {
-        let (heap, roles) = match read_image(&s.buffer) {
+        let (heap, roles, machine) = match read_checkpoint(&s.buffer) {
             Ok(image) => image,
             Err(e) => return fail(s, &format!("the snapshot was refused: {e}")),
         };
-        s.buffer = Vec::new();
-        let mut vm = Vm::new(heap, roles);
-        vm.set_snapshot_writer(write_image);
-        let outcome = vm.run(&mut WebHost, &[]);
-        s.vm = Some(vm);
+        let bytes = core::mem::take(&mut s.buffer);
+        let outcome = match machine {
+            Some(state) => {
+                // A restored session is not recorded: its replay would need
+                // the host it was taken in.
+                let mut vm = Vm::restore(heap, roles, state);
+                vm.set_snapshot_writer(write_image);
+                vm.restored_into_new_host();
+                let outcome = vm.continue_run(&mut WebHost);
+                s.vm = Some(vm);
+                outcome
+            }
+            None => {
+                let mut vm = Vm::new(heap, roles);
+                vm.set_snapshot_writer(write_image);
+                let outcome = match s.record_every {
+                    Some(every) => {
+                        vm.set_checkpoint_policy(every);
+                        let mut log = Log {
+                            checkpoint_every: every,
+                            checkpoints: vec![bytes],
+                            checkpoint_positions: vec![0],
+                            ..Log::default()
+                        };
+                        let outcome = record_run(&mut vm, &mut WebHost, &mut log, &[]);
+                        s.log = Some(log);
+                        outcome
+                    }
+                    None => vm.run(&mut WebHost, &[]),
+                };
+                s.vm = Some(vm);
+                outcome
+            }
+        };
         report(s, outcome)
     })
 }
@@ -171,10 +239,14 @@ pub extern "C" fn eurasia_start() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_resume() -> i32 {
     STATE.with_borrow_mut(|s| {
-        let Some(vm) = s.vm.as_mut() else {
+        let State { vm, log, .. } = s;
+        let Some(vm) = vm.as_mut() else {
             return fail(s, "nothing to resume");
         };
-        let outcome = vm.resume(&mut WebHost);
+        let outcome = match log.as_mut() {
+            Some(log) => record_resume(vm, &mut WebHost, log),
+            None => vm.resume(&mut WebHost),
+        };
         report(s, outcome)
     })
 }

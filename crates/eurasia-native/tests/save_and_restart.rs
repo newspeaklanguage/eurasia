@@ -115,7 +115,7 @@ fn counter_image() -> Vec<u8> {
         },
     );
     let (heap, roles) = b.finish();
-    write_image(&heap, &roles)
+    write_image(&heap, &roles, None)
 }
 
 fn run(image: &std::path::Path, save_to: &std::path::Path) -> String {
@@ -252,7 +252,7 @@ fn a_program_can_choose_the_entry_of_the_image_it_saves() {
     std::fs::create_dir_all(&dir).unwrap();
     let first = dir.join("genesis.eus");
     let saved = dir.join("base.eus");
-    std::fs::write(&first, write_image(&heap, &roles)).unwrap();
+    std::fs::write(&first, write_image(&heap, &roles, None)).unwrap();
     assert_eq!(run(&first, &saved), "genesis\n");
     assert_eq!(run(&saved, &dir.join("unused.eus")), "base\n");
 }

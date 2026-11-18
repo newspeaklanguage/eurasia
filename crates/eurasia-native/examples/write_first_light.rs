@@ -12,5 +12,5 @@ fn main() {
         .nth(1)
         .expect("usage: write_first_light PATH");
     let (heap, roles) = first_light_image();
-    std::fs::write(&path, write_image(&heap, &roles)).expect("write the snapshot");
+    std::fs::write(&path, write_image(&heap, &roles, None)).expect("write the snapshot");
 }

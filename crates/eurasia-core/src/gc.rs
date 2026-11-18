@@ -252,6 +252,27 @@ impl Heap {
     /// observations of it to `nil`. Answers where each object went; the
     /// caller rewrites its own references (the roots) through it.
     pub fn collect(&mut self, roots: &[Value], nil: Value) -> (Forwarding, Statistics) {
+        self.collect_with(roots, nil, false)
+    }
+
+    /// Collects everything not reachable from `roots` at all, weakly or
+    /// strongly, so that no weak observation changes: the heap a checkpoint
+    /// saves (M7), whose weak references then clear at the same collections
+    /// as the running VM's.
+    pub fn collect_keeping_weak(
+        &mut self,
+        roots: &[Value],
+        nil: Value,
+    ) -> (Forwarding, Statistics) {
+        self.collect_with(roots, nil, true)
+    }
+
+    fn collect_with(
+        &mut self,
+        roots: &[Value],
+        nil: Value,
+        keep_weak: bool,
+    ) -> (Forwarding, Statistics) {
         let n = self.objects.len();
         let mut m = Marker {
             marked: vec![false; n],
@@ -271,6 +292,9 @@ impl Heap {
                         value,
                         finalizer,
                     } => {
+                        if keep_weak {
+                            m.mark(*key);
+                        }
                         if m.is_marked(*key) {
                             m.mark(*value);
                             m.mark(*finalizer);
@@ -281,6 +305,9 @@ impl Heap {
                     body => {
                         let mut refs = Vec::new();
                         for_each_strong(body, |v| refs.push(v));
+                        if keep_weak && let Body::WeakArray(e) = body {
+                            refs.extend(e.iter().copied());
+                        }
                         refs.into_iter().for_each(|v| m.mark(v));
                     }
                 }

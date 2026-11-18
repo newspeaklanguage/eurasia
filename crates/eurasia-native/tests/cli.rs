@@ -23,7 +23,7 @@ fn temp_snapshot(name: &str, bytes: &[u8]) -> std::path::PathBuf {
 #[test]
 fn first_light_prints_seven() {
     let (heap, roles) = first_light_image();
-    let path = temp_snapshot("first-light.eus", &write_image(&heap, &roles));
+    let path = temp_snapshot("first-light.eus", &write_image(&heap, &roles, None));
     let out = eurasia().arg(&path).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), "7\n");
     assert!(out.status.success(), "{out:?}");
@@ -41,6 +41,6 @@ fn a_bad_snapshot_exits_65_with_a_message() {
 fn version_names_the_supported_versions() {
     let out = eurasia().arg("--version").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("snapshot format 5"));
+    assert!(text.contains("snapshot format 6"));
     assert!(text.contains("kernel 1"));
 }

@@ -1,6 +1,6 @@
 # Eurasia snapshot format
 
-**Status:** Draft, format version 5. Written before the code (implementation
+**Status:** Draft, format version 6. Written before the code (implementation
 plan M0); the packager (Newspeak) and `eurasia-snapshot` (Rust) are tested
 against each other.
 
@@ -32,7 +32,7 @@ psoup groups objects by class instead, which loses that order.
 | Field | Type | Meaning |
 |---|---|---|
 | magic | `bytes(4)` | `EURA` (0x45 0x55 0x52 0x41) |
-| format version | `u16` | This document: 4 (2026-11-17: version 2 gave mixins the class-side mixin field, version 3 the value flag bits and the Value role; 2026-11-18: version 4 far references, promise records, the shared bit and roles 35–37; version 5 the simulation-root bit and roles 38–39) |
+| format version | `u16` | This document: 4 (2026-11-17: version 2 gave mixins the class-side mixin field, version 3 the value flag bits and the Value role; 2026-11-18: version 4 far references, promise records, the shared bit and roles 35–37; version 5 the simulation-root bit and roles 38–39; version 6 checkpoints: the machine section, live and detached activations, and role 40) |
 | kernel version | `u16` | Must equal the VM's `KERNEL_VERSION` |
 | bytecode version | `u16` | Must equal the VM's `BYTECODE_VERSION` |
 | word size | `u8` | Always 64 |
@@ -74,6 +74,37 @@ Section kinds:
 | 1 | roles | No nodes. Edges: `uv` count, then pairs (`uv` role id, value). Role ids are fixed by the kernel version (section 7). Must be the last section. |
 | 2 | program | Installed methods and mixins: frozen, shared by every actor of the cohort. |
 | 3 | actor heap | One actor's objects, including its class objects. |
+| 4 | machine | A checkpoint's machine state (M7, below). No nodes; its body follows the node count. At most one, before the roles section. |
+
+A file with a machine section is a **checkpoint**: restoring it continues
+where it was taken (`Vm::restore`, then `Vm::continue_run`). A file without
+one is a **snapshot**, which starts afresh (`vm snapshot`, genesis). The
+machine section's body, in order (values are node references, as in
+edges; a flag is a `u8` 0 or 1, and an optional value is a flag then, if
+1, the value):
+
+- the operand stack: `uv` length, then the values;
+- the frames, oldest first: `uv` count, then for each its serial number
+  (`uv`), method, receiver, operand-stack indices of its message receiver,
+  argument count, first local and next instruction (four `uv`), its
+  activation handle (optional) and closure (optional);
+- the actors: `uv` count, then for each its message loop, mailbox (`uv`
+  length, then the packets), next timer (`uv` monotonic nanoseconds, 0 for
+  none) and whether an idle callback poked it (flag);
+- the running actor (`uv`);
+- the expats: `uv` count, then each closure and its owning actor (`uv`);
+- the VM's selector strings: `uv` count, then each name (`uv` length and
+  UTF-8 bytes) and its String;
+- seven `uv` counters: the next frame serial number, the allocation counter
+  after the last collection, the collection budget, the collections so far,
+  the program version, the checkpoint policy (allocations, 0 for none) and
+  the allocation counter at the last checkpoint;
+- the timer a turn ended with (optional `uv`), and whether the image runs a
+  message loop (flag).
+
+A checkpoint's heap holds everything the VM's roots reach weakly or
+strongly, so that weak references clear at the same collections in a
+restored VM as in the running one (M7 design, section 3.2).
 
 Two-phase loading, as in psoup: all nodes of all sections are allocated
 first (their sizes are in the node records), then edges are filled, so
@@ -103,7 +134,7 @@ cycles need no special handling.
 | 11 | class | none | class value (its metaclass), mixin, superclass, enclosing object, name, library field |
 | 12 | metaclass | none | class value, mixin, superclass, enclosing object, this class, library field |
 | 13 | closure | `uv` initial bytecode index, `uv` argument count, `uv` copied count | class value, defining activation, then the copied values |
-| 14 | activation | none | class value, method, receiver, closure (nil for a method activation) |
+| 14 | activation | `u8` state: 0 dead, 1 a live frame's handle (then `uv` the frame's serial number), 2 detached (then `uv` its temp count) | class value, method, receiver, closure (nil for a method activation); a detached one's sender, bci and temps follow |
 | 15 | far reference | `uv` actor number | class value, target (in that actor's heap) |
 | 16 | promise record | `uv` state (0 pending, 1 fulfilled, 2 broken, 3 forwarded), `uv` waiter count, `uv` queue length | class value, value (resolution, problem or record forwarded to; nil while pending), owner (far reference or nil), the waiters (far references), the queued sends (Arrays `{sending actor. selector. result record. arguments...}`) |
 
@@ -112,25 +143,23 @@ the semantics' tables Φ and Π. A far reference is the only place a
 reference into another actor's heap may be held. A promise record holds
 nothing in any actor's terms: values, far references and records only. Both
 use the FarReference class (role 35). A snapshot saves only what the roles
-reach, so today only the actor whose message loop is the role is saved;
-saving every actor of a cohort is open.
-
-A detached activation (one the debugger's Simulator made, `Activation
-new`) is saved like any other activation: dead, without its state. Saving
-paused and simulated stacks comes with M7.
+reach, so only the actor whose message loop is the role is saved; a
+checkpoint saves every actor of the cohort, with its mailbox, in the machine
+section.
 
 Kinds 13 and 14 are hidden layouts: their encoding belongs to the format,
-not to a layout the image may read. A saved activation is always **dead**:
-snapshots are saved from an idle heap, which has no frames. A saved heap
-holds only what the roles reach: the VM collects into a copy before writing
-(M3), so nothing a running program's frames alone reach is saved. (Paused stacks,
-M7, will add live frame records.)
+not to a layout the image may read. In a snapshot, a frame's activation
+handle is saved **dead**: a snapshot holds only what the roles reach (the VM
+collects into a copy before writing, M3), and starts with no frames. In a
+checkpoint it is saved live, naming its frame in the machine section by
+serial number. A detached activation (one the debugger's Simulator made,
+`Activation new`, or one cut off by `vm continueAt:with:` or at the end of
+a turn) is saved with its state in both.
 
 Kinds 9–12 are the contract layouts of the implementation plan (section 4
 of the operation list): the VM reads those fields and no others. Everything
 the VM derives (class ids, final layouts, lookup caches) is rebuilt at load
-and never written. Closures, activations and paused stacks (hidden layouts)
-get kinds when M7 defines how a paused actor is saved.
+and never written.
 
 ## 6. Method header
 
@@ -173,6 +202,7 @@ Role ids for kernel version 1 (the operation list, section 2):
 | | | 37 | Object class (`vm spawn:` applies its mixin to it) |
 | | | 38 | InstanceMixin class (`basicNew` of it answers an unfrozen mixin) |
 | | | 39 | ClassMixin class (likewise, a class-side mixin) |
+| | | 40 | restore handler: sent `restored`, in a turn of its own, after a checkpoint is restored into a new host; or nil |
 
 Every role must be present. Unknown role ids are an error.
 

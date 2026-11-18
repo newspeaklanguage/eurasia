@@ -243,6 +243,12 @@ def main():
 		)
 		public programVersion = (
 		)
+		public checkpointNow = (
+		)
+		public checkpointPolicy: allocations = (
+		)
+		public logPosition = (
+		)
 		public classOf: object = (
 		)
 		public currentActivation = (

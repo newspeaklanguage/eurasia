@@ -210,6 +210,9 @@ natives! {
     VmContinueAt = 170 / 2: "`vm continueAt: a with: v`: discards the frames above the live activation `a`, whose pending send answers `v` (psoup's jump to a live activation).",
     VmResumeActivation = 171 / 1: "`vm resumeActivation: top`: turns the chain of detached activations from `top` down to the sender, which must be the current frame, into frames, and continues at `top` (psoup's jump to a simulated activation). The handles keep their identity and become live.",
     VmRunNative = 172 / 3: "`vm runNative: method receiver: r arguments: args`, for the Simulator: runs a native or accessor method and answers {0. result}, {1. the failure to signal}, {2. receiver. selector. arguments} (a send to make instead) or {3. closure. arguments} (a closure to activate).",
+    VmCheckpointNow = 174 / 0: "`vm checkpointNow`: a checkpoint at the next safepoint with no host operation under way, handed to the host (M7). Answers nil.",
+    VmCheckpointPolicy = 175 / 1: "`vm checkpointPolicy: n`: a checkpoint at the first safepoint after every `n` allocations; 0 is none. Answers the receiver.",
+    VmLogPosition = 176 / 0: "`vm logPosition`: the position in the host's input log (recording or replaying), or nil when there is none.",
     ClosureIn = 173 / 4: "`newClosureIn: activation initialBCI: bci numArgs: n numCopied: c`, for the Simulator (psoup's primitive 69): a closure defined by the activation, its body at bytecode position `bci` (from 1), with `c` copied values, nil until set.",
     VmSpawn = 139 / 1: "`vm spawn: mixin`: a new actor running a clone of the platform template, with the mixin applied to Object (role 37) in its heap, enclosing object nil; answers a far reference to the new class (`actor-semantics.tex`, eq. `create-actor`).",
     VmPromiseSend = 138 / 2: "`vm promise: record send: {selector. resultRecord. arguments...}`: an eventual send to the promise (Route-Pending): queued in the record, at the end of its chain, until it settles; delivered at once if it has.",
@@ -351,6 +354,15 @@ pub fn alien_reference_in(heap: &Heap, roles: &Roles, v: Value) -> Option<u32> {
     }
 }
 
+/// Whether `v` is an Alien that did not survive a restore into a new host
+/// ([`crate::Vm::restored_into_new_host`] gives it the reference -1).
+pub fn is_dead_alien(heap: &Heap, roles: &Roles, v: Value) -> bool {
+    heap.get(v).is_some_and(|o| {
+        o.header.class == roles.get(Role::AlienClass)
+            && matches!(&o.body, Body::Regular(s) if s.len() == 1 && s[0].as_small_integer() == Some(-1))
+    })
+}
+
 /// The arguments of a host call: the `fixed` ones (indices 1, 2, ...), then
 /// the elements of an Array argument at `spread`'s index; each with the
 /// index a failure names. The interpreter marshals them.
@@ -362,6 +374,9 @@ fn host_call(
     spread: Option<(Value, u32)>,
     answer: Option<Value>,
 ) -> Outcome {
+    if is_dead_alien(ctx.heap, ctx.roles, receiver) {
+        return Outcome::Fail(Reason::Dead);
+    }
     let Some(r) = alien_reference(ctx, receiver) else {
         return Outcome::Fail(Reason::WrongKind(0));
     };
@@ -677,6 +692,10 @@ pub enum Outcome {
     },
     /// `vm programVersion`.
     ProgramVersion,
+    /// `vm checkpointNow`.
+    CheckpointNow,
+    /// `vm checkpointPolicy:`.
+    CheckpointPolicy(u64),
     /// `vm continueAt:with:`: the interpreter cuts back to the activation.
     ContinueAt {
         /// A live activation.
@@ -1879,6 +1898,16 @@ pub fn invoke(
         }
         Native::VmCommit => Outcome::Commit(arg(0)),
         Native::VmProgramVersion => Outcome::ProgramVersion,
+        Native::VmCheckpointNow => Outcome::CheckpointNow,
+        Native::VmCheckpointPolicy => match arg(0).as_small_integer() {
+            Some(n) if n >= 0 => Outcome::CheckpointPolicy(n as u64),
+            Some(_) => Outcome::Fail(Reason::OutOfRange(1)),
+            None => Outcome::Fail(Reason::WrongKind(1)),
+        },
+        Native::VmLogPosition => match ctx.host.log_position() {
+            Some(p) => Outcome::Answer(ctx.integer(BigInt::from_i128(i128::from(p)))),
+            None => Outcome::Answer(ctx.roles.get(Role::Nil)),
+        },
         Native::VmMixinApplicationsOf => Outcome::ClassQuery {
             target: arg(0),
             by_mixin: true,

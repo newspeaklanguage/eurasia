@@ -26,6 +26,7 @@ use crate::bytecode::{SendKind, instruction_length, op};
 use crate::gc;
 use crate::host::Host;
 use crate::host::{HostCallbacks, HostError, HostValue};
+use crate::machine::{ActorState, FrameState, MachineState};
 use crate::natives::{self, Native, NativeContext, Outcome, Reason};
 use crate::object::{Access, Body, FROZEN, Heap, MethodKind, PromiseRecord, Space, VALUE};
 use crate::roles::{Role, Roles};
@@ -75,6 +76,9 @@ pub enum VmError {
     StepLimitReached,
     /// The image has no method for a VM upcall (named by its role).
     MissingUpcall(&'static str),
+    /// The host asked the VM to stop ([`Host::interrupted`]): a replay that
+    /// diverged.
+    Interrupted,
 }
 
 impl fmt::Display for VmError {
@@ -102,6 +106,7 @@ impl fmt::Display for VmError {
             ),
             VmError::StepLimitReached => write!(f, "step limit reached"),
             VmError::MissingUpcall(role) => write!(f, "the image has no method for {role}"),
+            VmError::Interrupted => write!(f, "interrupted by the host"),
         }
     }
 }
@@ -180,6 +185,15 @@ pub struct Vm {
     callback_depth: usize,
     /// Commits so far (`vm programVersion`).
     program_version: u64,
+    /// The checkpoint policy (`vm checkpointPolicy:`): a checkpoint at the
+    /// first safepoint after this many allocations; 0 is none.
+    checkpoint_every: u64,
+    /// The allocation counter at the last checkpoint.
+    last_checkpoint: u64,
+    /// `vm checkpointNow` asked for one at the next safepoint.
+    checkpoint_pending: bool,
+    /// Steps until the event loop next asks the host whether to stop.
+    interrupt_countdown: u32,
 }
 
 /// A VM actor: its message loop (in its platform), its mailbox of packets
@@ -205,7 +219,12 @@ const MIN_GC_BUDGET: u64 = 1 << 20;
 /// Serializes a heap and its roles (the snapshot format's writer). The core
 /// cannot depend on `eurasia-snapshot`, which depends on it, so the embedder
 /// supplies the writer; `vm snapshot` fails with `unsupported` without one.
-pub type SnapshotWriter = fn(&Heap, &Roles) -> Vec<u8>;
+/// Given a machine state, it writes a checkpoint (M7), which a VM restores
+/// to continue where it was taken; without one, a snapshot to start afresh.
+pub type SnapshotWriter = fn(&Heap, &Roles, Option<&MachineState>) -> Vec<u8>;
+
+/// How often the event loop asks the host whether to stop.
+const INTERRUPT_INTERVAL: u32 = 1024;
 
 impl Vm {
     /// A VM over a loaded heap.
@@ -230,6 +249,10 @@ impl Vm {
             expats: Vec::new(),
             callback_depth: 0,
             program_version: 0,
+            checkpoint_every: 0,
+            last_checkpoint: 0,
+            checkpoint_pending: false,
+            interrupt_countdown: INTERRUPT_INTERVAL,
         }
     }
 
@@ -257,19 +280,7 @@ impl Vm {
     /// comes after as many allocations as there are live objects (at least
     /// [`MIN_GC_BUDGET`]), so the heap stays within about twice its live size.
     pub fn collect_garbage(&mut self) -> gc::Statistics {
-        let mut roots: Vec<Value> = self.roles.pairs().map(|(_, v)| v).collect();
-        roots.extend(self.stack.iter().copied());
-        for f in &self.frames {
-            roots.extend([f.method, f.receiver]);
-            roots.extend(f.activation);
-            roots.extend(f.closure);
-        }
-        roots.extend(self.symbols.values().copied());
-        for a in &self.actors {
-            roots.push(a.message_loop);
-            roots.extend(a.mailbox.iter().copied());
-        }
-        roots.extend(self.expats.iter().map(|&(c, _)| c));
+        let roots = self.roots();
         let nil = self.roles.get(Role::Nil);
         let (fwd, statistics) = self.heap.collect(&roots, nil);
         for e in &mut self.expats {
@@ -317,6 +328,285 @@ impl Vm {
             roles.set(role, fwd.forward(v));
         }
         (heap, roles)
+    }
+
+    /// Every value the VM holds outside the heap: the roots of a collection.
+    fn roots(&self) -> Vec<Value> {
+        let mut roots: Vec<Value> = self.roles.pairs().map(|(_, v)| v).collect();
+        roots.extend(self.stack.iter().copied());
+        for f in &self.frames {
+            roots.extend([f.method, f.receiver]);
+            roots.extend(f.activation);
+            roots.extend(f.closure);
+        }
+        roots.extend(self.symbols.values().copied());
+        for a in &self.actors {
+            roots.push(a.message_loop);
+            roots.extend(a.mailbox.iter().copied());
+        }
+        roots.extend(self.expats.iter().map(|&(c, _)| c));
+        roots
+    }
+
+    /// The VM as a checkpoint saves it (M7 design, section 3.2): a copy of
+    /// the heap holding everything the VM's roots reach, weakly or strongly
+    /// (so that weak observations clear at the same collections as in the
+    /// uninterrupted run), its roles, and the machine state, all in the
+    /// copy's terms. The running VM is not disturbed.
+    pub fn checkpoint_image(&self) -> (Heap, Roles, MachineState) {
+        let mut heap = self.heap.clone();
+        let (fwd, _) = heap.collect_keeping_weak(&self.roots(), self.nil());
+        let f = |v: Value| fwd.forward(v);
+        let mut roles = self.roles.clone();
+        let pairs: Vec<(Role, Value)> = self.roles.pairs().collect();
+        for (role, v) in pairs {
+            roles.set(role, f(v));
+        }
+        let state = MachineState {
+            stack: self.stack.iter().map(|&v| f(v)).collect(),
+            frames: self
+                .frames
+                .iter()
+                .map(|fr| FrameState {
+                    serial: fr.serial,
+                    method: f(fr.method),
+                    receiver: f(fr.receiver),
+                    bp: fr.bp as u64,
+                    arg_count: fr.arg_count as u64,
+                    lp: fr.lp as u64,
+                    ip: fr.ip as u64,
+                    activation: fr.activation.map(f),
+                    closure: fr.closure.map(f),
+                })
+                .collect(),
+            actors: self
+                .actors
+                .iter()
+                .map(|a| ActorState {
+                    message_loop: f(a.message_loop),
+                    mailbox: a.mailbox.iter().map(|&v| f(v)).collect(),
+                    wakeup: a.wakeup,
+                    poked: a.poked,
+                })
+                .collect(),
+            current: self.current as u64,
+            expats: self.expats.iter().map(|&(c, o)| (f(c), o)).collect(),
+            symbols: self
+                .symbols
+                .iter()
+                .map(|(&k, &v)| (String::from(k), f(v)))
+                .collect(),
+            next_serial: self.next_serial,
+            gc_counter: self.gc_counter,
+            gc_budget: self.gc_budget,
+            collections: self.collections,
+            finished_turn: self.finished_turn,
+            has_loop: self.has_loop,
+            program_version: self.program_version,
+            checkpoint_every: self.checkpoint_every,
+            last_checkpoint: self.last_checkpoint,
+        };
+        (heap, roles, state)
+    }
+
+    /// A VM restored from a checkpoint (`checkpoint_image`, or a loaded
+    /// one): [`Vm::continue_run`] continues it.
+    pub fn restore(heap: Heap, roles: Roles, state: MachineState) -> Vm {
+        let mut vm = Vm::new(heap, roles);
+        vm.stack = state.stack;
+        vm.frames = state
+            .frames
+            .into_iter()
+            .map(|fr| Frame {
+                serial: fr.serial,
+                method: fr.method,
+                receiver: fr.receiver,
+                bp: fr.bp as usize,
+                arg_count: fr.arg_count as usize,
+                lp: fr.lp as usize,
+                ip: fr.ip as usize,
+                activation: fr.activation,
+                closure: fr.closure,
+            })
+            .collect();
+        vm.actors = state
+            .actors
+            .into_iter()
+            .map(|a| Actor {
+                message_loop: a.message_loop,
+                mailbox: a.mailbox.into_iter().collect(),
+                wakeup: a.wakeup,
+                poked: a.poked,
+            })
+            .collect();
+        vm.current = state.current as usize;
+        vm.expats = state.expats;
+        // The VM's selector names are static strings; a restored VM's are
+        // the checkpoint's, kept for its life.
+        vm.symbols = state
+            .symbols
+            .into_iter()
+            .map(|(k, v)| (&*alloc::boxed::Box::leak(k.into_boxed_str()), v))
+            .collect();
+        vm.next_serial = state.next_serial;
+        vm.gc_counter = state.gc_counter;
+        vm.gc_budget = state.gc_budget;
+        vm.collections = state.collections;
+        vm.finished_turn = state.finished_turn;
+        vm.has_loop = state.has_loop;
+        vm.program_version = state.program_version;
+        vm.checkpoint_every = state.checkpoint_every;
+        vm.last_checkpoint = state.last_checkpoint;
+        vm
+    }
+
+    /// Continues a restored VM: the turn under way when the checkpoint was
+    /// taken, or, for a checkpoint taken while idle (at a resume), that
+    /// resume. Answers as [`Vm::run`] does.
+    pub fn continue_run(&mut self, host: &mut dyn Host) -> Result<Completion, VmError> {
+        if self.frames.is_empty()
+            && let Some(done) = self.next_turn(host)?
+        {
+            return Ok(done);
+        }
+        self.event_loop(host)
+    }
+
+    /// Sets the checkpoint policy: a checkpoint at the first safepoint after
+    /// every `allocations` allocations; 0 is none (`vm checkpointPolicy:`).
+    pub fn set_checkpoint_policy(&mut self, allocations: u64) {
+        self.checkpoint_every = allocations;
+        self.last_checkpoint = self.heap.allocation_counter();
+    }
+
+    fn checkpoint_due(&self) -> bool {
+        self.checkpoint_pending
+            || (self.checkpoint_every != 0
+                && self.heap.allocation_counter() - self.last_checkpoint >= self.checkpoint_every)
+    }
+
+    /// Takes a checkpoint and hands it to the host (M7 design, section 3.3),
+    /// at a safepoint with no host operation under way. The counters are
+    /// updated whether or not the host wants it, so that recording does not
+    /// change the run.
+    fn take_checkpoint(&mut self, host: &mut dyn Host) {
+        self.checkpoint_pending = false;
+        self.last_checkpoint = self.heap.allocation_counter();
+        if let Some(write) = self.snapshot_writer
+            && host.wants_checkpoints()
+        {
+            let (heap, roles, state) = self.checkpoint_image();
+            host.checkpoint(write(&heap, &roles, Some(&state)));
+        }
+    }
+
+    /// After a restore into a new host (M7 design, section 3.4; contract
+    /// design, section 6): every Alien but the host's undefined and global
+    /// objects is dead, and lazy slots holding a dead Alien are reset, so
+    /// that their next read looks the host object up again. Then the
+    /// restore handler, if the program set one, is sent `restored` in a turn
+    /// of its own, after the turn under way.
+    pub fn restored_into_new_host(&mut self) {
+        let alien_class = self.roles.get(Role::AlienClass);
+        let nil = self.nil();
+        let dead = Value::small_integer(-1).expect("small");
+        let mut dead_aliens = alloc::collections::BTreeSet::new();
+        for i in 0..self.heap.len() {
+            let v = Value::reference(i as u64).expect("in range");
+            if let Some(o) = self.heap.get_mut(v)
+                && o.header.class == alien_class
+                && let Body::Regular(slots) = &mut o.body
+                && slots.len() == 1
+                && slots[0]
+                    .as_small_integer()
+                    .is_some_and(|r| r > crate::host::HOST_GLOBAL as i64)
+            {
+                slots[0] = dead;
+                dead_aliens.insert(i as u64);
+            }
+        }
+        // Each class's lazy cache slots (psoup names them x`cache`slot).
+        let mut lazy: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for i in 0..self.heap.len() {
+            let v = Value::reference(i as u64).expect("in range");
+            let class = match self.heap.get(v) {
+                Some(o) if matches!(o.body, Body::Regular(_)) => o.header.class,
+                _ => continue,
+            };
+            let key = class.as_reference().unwrap_or(u64::MAX);
+            let slots = match lazy.get(&key) {
+                Some(s) => s.clone(),
+                None => {
+                    let s = self.lazy_slot_indices(class);
+                    lazy.insert(key, s.clone());
+                    s
+                }
+            };
+            if slots.is_empty() {
+                continue;
+            }
+            if let Some(o) = self.heap.get_mut(v)
+                && let Body::Regular(values) = &mut o.body
+            {
+                for &j in &slots {
+                    if j < values.len()
+                        && values[j]
+                            .as_reference()
+                            .is_some_and(|r| dead_aliens.contains(&r))
+                    {
+                        values[j] = nil;
+                    }
+                }
+            }
+        }
+        let handler = self.roles.get(Role::RestoreHandler);
+        if handler != nil && !self.actors.is_empty() {
+            let selector = self.symbol("restored");
+            let array_class = self.roles.get(Role::ArrayClass);
+            let space = Space::Actor(0);
+            // A packet: receiver, selector, resolver, then the arguments.
+            let packet = self.heap.allocate(
+                array_class,
+                space,
+                Body::Array(alloc::vec![handler, selector, nil]),
+            );
+            self.actors[0].mailbox.push_back(packet);
+        }
+    }
+
+    /// The indices of a class's lazy cache slots, in its instances.
+    fn lazy_slot_indices(&self, class: Value) -> Vec<usize> {
+        let mut chain = Vec::new();
+        let mut c = class;
+        while let Some(b) = self.heap.behavior(c) {
+            chain.push(b.mixin);
+            c = b.superclass;
+        }
+        let mut indices = Vec::new();
+        let mut index = 0;
+        for &mixin in chain.iter().rev() {
+            let Some(m) = self.heap.mixin(mixin) else {
+                return Vec::new();
+            };
+            let names = self.heap.array_elements(m.slot_names).unwrap_or(&[]);
+            for &declaration in names {
+                // A slot's name, or since M6 a triple {name. isMutable.
+                // access}.
+                let name = match self.heap.array_elements(declaration) {
+                    Some(triple) if !triple.is_empty() => triple[0],
+                    _ => declaration,
+                };
+                if self
+                    .heap
+                    .string_bytes(name)
+                    .is_some_and(|b| b.ends_with(b"`cache`slot"))
+                {
+                    indices.push(index);
+                }
+                index += 1;
+            }
+        }
+        indices
     }
 
     /// Supplies the snapshot writer that `vm snapshot` uses.
@@ -383,6 +673,10 @@ impl Vm {
     /// Continues a run that answered [`Completion::Waiting`], once the time
     /// it named has come (a host that does not block calls it from a timer).
     pub fn resume(&mut self, host: &mut dyn Host) -> Result<Completion, VmError> {
+        // Idle: a checkpoint due since an idle callback is taken here.
+        if self.checkpoint_due() {
+            self.take_checkpoint(host);
+        }
         if let Some(done) = self.next_turn(host)? {
             return Ok(done);
         }
@@ -420,9 +714,20 @@ impl Vm {
                     }
                 }
             }
-            // A safepoint: every value the VM holds is in the roots.
+            // A safepoint: every value the VM holds is in the roots, and no
+            // host operation is under way.
             if self.gc_due() {
                 self.collect_garbage();
+            }
+            if self.checkpoint_due() {
+                self.take_checkpoint(host);
+            }
+            self.interrupt_countdown -= 1;
+            if self.interrupt_countdown == 0 {
+                self.interrupt_countdown = INTERRUPT_INTERVAL;
+                if host.interrupted() {
+                    return Err(VmError::Interrupted);
+                }
             }
             if let Step::Done(done) = self.step(host)? {
                 return Ok(done);
@@ -1099,6 +1404,17 @@ impl Vm {
                 }
                 Err(reason) => self.native_failure(native, receiver, args, reason, host),
             },
+            Outcome::CheckpointNow => {
+                self.checkpoint_pending = true;
+                let nil = self.nil();
+                self.stack.push(nil);
+                Ok(None)
+            }
+            Outcome::CheckpointPolicy(n) => {
+                self.set_checkpoint_policy(n);
+                self.stack.push(receiver);
+                Ok(None)
+            }
             Outcome::ProgramVersion => {
                 let v = Value::small_integer(self.program_version as i64).expect("small");
                 self.stack.push(v);
@@ -1176,7 +1492,7 @@ impl Vm {
             Outcome::Snapshot => match self.snapshot_writer {
                 Some(write) => {
                     let (heap, roles) = self.snapshot_heap();
-                    let bytes = write(&heap, &roles);
+                    let bytes = write(&heap, &roles, None);
                     let class = self.roles.get(Role::ByteArrayClass);
                     let v = self.heap.allocate(
                         class,

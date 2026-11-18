@@ -8,6 +8,8 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use eurasia_core::Value;
+use eurasia_core::machine::{ActorState, FrameState, MachineState};
+use eurasia_core::object::Detached;
 use eurasia_core::object::{
     Access, Activation, Behavior, Body, Closure, FLAGS, Heap, HeapError, Method, MethodHeader,
     MethodKind, Mixin, Object, PromiseRecord, Space,
@@ -20,6 +22,7 @@ use crate::header::{Header, HeaderError};
 const SECTION_ROLES: u8 = 1;
 const SECTION_PROGRAM: u8 = 2;
 const SECTION_ACTOR: u8 = 3;
+const SECTION_MACHINE: u8 = 4;
 
 const KIND_REGULAR: u8 = 1;
 const KIND_BYTES: u8 = 2;
@@ -87,6 +90,8 @@ pub enum LoadError {
     TrailingBytes,
     /// The role table was refused.
     Roles(RolesError),
+    /// The machine section is malformed, or given twice.
+    BadMachineState,
 }
 
 impl From<DecodeError> for LoadError {
@@ -124,6 +129,7 @@ impl fmt::Display for LoadError {
             }
             LoadError::TrailingBytes => write!(f, "bytes after the last section"),
             LoadError::Roles(e) => write!(f, "roles: {e:?}"),
+            LoadError::BadMachineState => write!(f, "malformed machine state"),
         }
     }
 }
@@ -131,8 +137,10 @@ impl fmt::Display for LoadError {
 // ----- Writing -----
 
 /// Writes an image. Objects keep their sequence numbers; the program space
-/// is written first, then each actor heap in actor order, then the roles.
-pub fn write_image(heap: &Heap, roles: &Roles) -> Vec<u8> {
+/// is written first, then each actor heap in actor order, then the machine
+/// state of a checkpoint, then the roles. Without a machine state, live
+/// activations are saved dead (a snapshot starts afresh).
+pub fn write_image(heap: &Heap, roles: &Roles, machine: Option<&MachineState>) -> Vec<u8> {
     // Group objects by space, each group in allocation order.
     let mut groups: BTreeMap<(u8, u32), Vec<(Value, &Object)>> = BTreeMap::new();
     for (v, o) in heap.iter() {
@@ -159,7 +167,8 @@ pub fn write_image(heap: &Heap, roles: &Roles) -> Vec<u8> {
     };
 
     let mut w = Writer::new();
-    Header::current(heap.allocation_counter(), next - 1, groups.len() as u64 + 1).write(&mut w);
+    let sections = groups.len() as u64 + 1 + u64::from(machine.is_some());
+    Header::current(heap.allocation_counter(), next - 1, sections).write(&mut w);
     for (&(space_kind, actor), objects) in &groups {
         w.u8(if space_kind == 0 {
             SECTION_PROGRAM
@@ -175,11 +184,17 @@ pub fn write_image(heap: &Heap, roles: &Roles) -> Vec<u8> {
                 Some(p) => o.header.seq - p,
             });
             previous = Some(o.header.seq);
-            write_node(&mut w, o);
+            write_node(&mut w, o, machine.is_some());
         }
         for (_, o) in objects {
             write_edges(&mut w, o, &to_node);
         }
+    }
+    if let Some(m) = machine {
+        w.u8(SECTION_MACHINE);
+        w.uv(0);
+        w.uv(0);
+        write_machine(&mut w, m, &to_node);
     }
     w.u8(SECTION_ROLES);
     w.uv(0);
@@ -192,7 +207,207 @@ pub fn write_image(heap: &Heap, roles: &Roles) -> Vec<u8> {
     w.into_bytes()
 }
 
-fn write_node(w: &mut Writer, o: &Object) {
+fn write_machine(w: &mut Writer, m: &MachineState, to_node: &dyn Fn(Value) -> Value) {
+    let opt = |w: &mut Writer, v: Option<Value>| match v {
+        Some(v) => {
+            w.u8(1);
+            w.value(to_node(v));
+        }
+        None => w.u8(0),
+    };
+    w.uv(m.stack.len() as u64);
+    m.stack.iter().for_each(|&v| w.value(to_node(v)));
+    w.uv(m.frames.len() as u64);
+    for f in &m.frames {
+        w.uv(f.serial);
+        w.value(to_node(f.method));
+        w.value(to_node(f.receiver));
+        w.uv(f.bp);
+        w.uv(f.arg_count);
+        w.uv(f.lp);
+        w.uv(f.ip);
+        opt(w, f.activation);
+        opt(w, f.closure);
+    }
+    w.uv(m.actors.len() as u64);
+    for a in &m.actors {
+        w.value(to_node(a.message_loop));
+        w.uv(a.mailbox.len() as u64);
+        a.mailbox.iter().for_each(|&v| w.value(to_node(v)));
+        w.uv(a.wakeup);
+        w.u8(u8::from(a.poked));
+    }
+    w.uv(m.current);
+    w.uv(m.expats.len() as u64);
+    for &(c, owner) in &m.expats {
+        w.value(to_node(c));
+        w.uv(owner.into());
+    }
+    w.uv(m.symbols.len() as u64);
+    for (name, v) in &m.symbols {
+        w.uv(name.len() as u64);
+        w.bytes(name.as_bytes());
+        w.value(to_node(*v));
+    }
+    for n in [
+        m.next_serial,
+        m.gc_counter,
+        m.gc_budget,
+        m.collections,
+        m.program_version,
+        m.checkpoint_every,
+        m.last_checkpoint,
+    ] {
+        w.uv(n);
+    }
+    match m.finished_turn {
+        Some(t) => {
+            w.u8(1);
+            w.uv(t);
+        }
+        None => w.u8(0),
+    }
+    w.u8(u8::from(m.has_loop));
+}
+
+/// Reads a machine section's body; its values are still node numbers.
+fn read_machine(r: &mut Reader<'_>) -> Result<MachineState, LoadError> {
+    let n = |r: &mut Reader<'_>| -> Result<usize, LoadError> {
+        usize::try_from(r.uv()?).map_err(|_| LoadError::BadMachineState)
+    };
+    let opt = |r: &mut Reader<'_>| -> Result<Option<Value>, LoadError> {
+        Ok(match r.u8()? {
+            0 => None,
+            1 => Some(r.value()?),
+            _ => return Err(LoadError::BadMachineState),
+        })
+    };
+    let flag = |r: &mut Reader<'_>| -> Result<bool, LoadError> {
+        match r.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(LoadError::BadMachineState),
+        }
+    };
+    let mut stack = Vec::new();
+    for _ in 0..n(r)? {
+        stack.push(r.value()?);
+    }
+    let mut frames = Vec::new();
+    for _ in 0..n(r)? {
+        frames.push(FrameState {
+            serial: r.uv()?,
+            method: r.value()?,
+            receiver: r.value()?,
+            bp: r.uv()?,
+            arg_count: r.uv()?,
+            lp: r.uv()?,
+            ip: r.uv()?,
+            activation: opt(r)?,
+            closure: opt(r)?,
+        });
+    }
+    let mut actors = Vec::new();
+    for _ in 0..n(r)? {
+        let message_loop = r.value()?;
+        let mut mailbox = Vec::new();
+        for _ in 0..n(r)? {
+            mailbox.push(r.value()?);
+        }
+        actors.push(ActorState {
+            message_loop,
+            mailbox,
+            wakeup: r.uv()?,
+            poked: flag(r)?,
+        });
+    }
+    let current = r.uv()?;
+    let mut expats = Vec::new();
+    for _ in 0..n(r)? {
+        let c = r.value()?;
+        let owner = u32::try_from(r.uv()?).map_err(|_| LoadError::BadMachineState)?;
+        expats.push((c, owner));
+    }
+    let mut symbols = Vec::new();
+    for _ in 0..n(r)? {
+        let len = n(r)?;
+        let name = core::str::from_utf8(r.bytes(len)?).map_err(|_| LoadError::BadMachineState)?;
+        symbols.push((alloc::string::String::from(name), r.value()?));
+    }
+    let mut c = [0u64; 7];
+    for x in &mut c {
+        *x = r.uv()?;
+    }
+    let finished_turn = if flag(r)? { Some(r.uv()?) } else { None };
+    let has_loop = flag(r)?;
+    Ok(MachineState {
+        stack,
+        frames,
+        actors,
+        current,
+        expats,
+        symbols,
+        next_serial: c[0],
+        gc_counter: c[1],
+        gc_budget: c[2],
+        collections: c[3],
+        program_version: c[4],
+        checkpoint_every: c[5],
+        last_checkpoint: c[6],
+        finished_turn,
+        has_loop,
+    })
+}
+
+/// Resolves a machine state's node numbers to arena references.
+fn resolve_machine(
+    m: MachineState,
+    resolve: &dyn Fn(Value) -> Result<Value, LoadError>,
+) -> Result<MachineState, LoadError> {
+    let opt = |v: Option<Value>| v.map(resolve).transpose();
+    let all =
+        |vs: Vec<Value>| -> Result<Vec<Value>, LoadError> { vs.into_iter().map(resolve).collect() };
+    Ok(MachineState {
+        stack: all(m.stack)?,
+        frames: m
+            .frames
+            .into_iter()
+            .map(|f| {
+                Ok(FrameState {
+                    method: resolve(f.method)?,
+                    receiver: resolve(f.receiver)?,
+                    activation: opt(f.activation)?,
+                    closure: opt(f.closure)?,
+                    ..f
+                })
+            })
+            .collect::<Result<_, LoadError>>()?,
+        actors: m
+            .actors
+            .into_iter()
+            .map(|a| {
+                Ok(ActorState {
+                    message_loop: resolve(a.message_loop)?,
+                    mailbox: all(a.mailbox)?,
+                    ..a
+                })
+            })
+            .collect::<Result<_, LoadError>>()?,
+        expats: m
+            .expats
+            .into_iter()
+            .map(|(c, o)| Ok((resolve(c)?, o)))
+            .collect::<Result<_, LoadError>>()?,
+        symbols: m
+            .symbols
+            .into_iter()
+            .map(|(k, v)| Ok((k, resolve(v)?)))
+            .collect::<Result<_, LoadError>>()?,
+        ..m
+    })
+}
+
+fn write_node(w: &mut Writer, o: &Object, keep_frames: bool) {
     let kind = match &o.body {
         Body::Regular(_) => KIND_REGULAR,
         Body::Bytes(_) => KIND_BYTES,
@@ -267,8 +482,19 @@ fn write_node(w: &mut Writer, o: &Object) {
             w.uv(c.num_args.into());
             w.uv(c.copied.len() as u64);
         }
-        // Saved activations are dead: an idle heap has no frames.
-        Body::Activation(_) => {}
+        // A frame's handle is saved live only with the frames (a
+        // checkpoint); a detached activation with its state.
+        Body::Activation(a) => match (&a.detached, a.frame) {
+            (Some(d), _) => {
+                w.u8(2);
+                w.uv(d.temps.len() as u64);
+            }
+            (None, Some(serial)) if keep_frames => {
+                w.u8(1);
+                w.uv(serial);
+            }
+            (None, _) => w.u8(0),
+        },
         Body::FarRef { actor, .. } => w.uv((*actor).into()),
         Body::Promise(p) => {
             w.uv(p.state.into());
@@ -321,7 +547,16 @@ fn write_edges(w: &mut Writer, o: &Object, to_node: &dyn Fn(Value) -> Value) {
             v(c.defining);
             c.copied.iter().for_each(|&x| v(x));
         }
-        Body::Activation(a) => [a.method, a.receiver, a.closure].into_iter().for_each(v),
+        Body::Activation(a) => {
+            [a.method, a.receiver, a.closure]
+                .into_iter()
+                .for_each(&mut v);
+            if let Some(d) = &a.detached {
+                v(d.sender);
+                v(d.bci);
+                d.temps.iter().for_each(|&x| v(x));
+            }
+        }
         Body::FarRef { target, .. } => v(*target),
         Body::Promise(p) => {
             v(p.value);
@@ -344,7 +579,14 @@ struct Pending {
 }
 
 /// Reads an image, checking everything section 8 of the format requires.
+/// A checkpoint's machine state is ignored: the image starts afresh.
 pub fn read_image(bytes: &[u8]) -> Result<(Heap, Roles), LoadError> {
+    read_checkpoint(bytes).map(|(heap, roles, _)| (heap, roles))
+}
+
+/// Reads an image with its machine state, if it is a checkpoint (M7):
+/// [`eurasia_core::Vm::restore`] continues it.
+pub fn read_checkpoint(bytes: &[u8]) -> Result<(Heap, Roles, Option<MachineState>), LoadError> {
     let mut r = Reader::new(bytes);
     let header = Header::read(&mut r)?;
     let placeholder = Value::small_integer(0).expect("small");
@@ -352,6 +594,7 @@ pub fn read_image(bytes: &[u8]) -> Result<(Heap, Roles), LoadError> {
     // Edges are read after all nodes of a section; keep (node index, edge values).
     let mut edges: Vec<Vec<Value>> = Vec::new();
     let mut role_pairs: Option<Vec<(u64, Value)>> = None;
+    let mut machine: Option<MachineState> = None;
     for _ in 0..header.section_count {
         if role_pairs.is_some() {
             return Err(LoadError::RolesNotLast);
@@ -370,6 +613,13 @@ pub fn read_image(bytes: &[u8]) -> Result<(Heap, Roles), LoadError> {
                     pairs.push((r.uv()?, r.value()?));
                 }
                 role_pairs = Some(pairs);
+                continue;
+            }
+            SECTION_MACHINE => {
+                if count != 0 || machine.is_some() {
+                    return Err(LoadError::BadMachineState);
+                }
+                machine = Some(read_machine(&mut r)?);
                 continue;
             }
             SECTION_PROGRAM => Space::Program,
@@ -454,6 +704,10 @@ pub fn read_image(bytes: &[u8]) -> Result<(Heap, Roles), LoadError> {
         pairs.push((role, resolve(0, v)?));
     }
     let roles = Roles::new(&pairs).map_err(LoadError::Roles)?;
+    let machine = match machine {
+        Some(m) => Some(resolve_machine(m, &|v| resolve(0, v))?),
+        None => None,
+    };
     // Fields the format does not store (a class's this_class, a metaclass's
     // name) are nil.
     let nil = roles.get(Role::Nil);
@@ -465,7 +719,7 @@ pub fn read_image(bytes: &[u8]) -> Result<(Heap, Roles), LoadError> {
             _ => {}
         }
     }
-    Ok((heap, roles))
+    Ok((heap, roles, machine))
 }
 
 fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, Body), LoadError> {
@@ -599,13 +853,28 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
                 copied: alloc::vec![p; copied],
             })
         }
-        KIND_ACTIVATION => Body::Activation(Activation {
-            frame: None,
-            method: p,
-            receiver: p,
-            closure: p,
-            detached: None,
-        }),
+        KIND_ACTIVATION => {
+            let (frame, detached) = match r.u8()? {
+                0 => (None, None),
+                1 => (Some(r.uv()?), None),
+                2 => (
+                    None,
+                    Some(Detached {
+                        sender: p,
+                        bci: p,
+                        temps: alloc::vec![p; len(r)?],
+                    }),
+                ),
+                _ => return Err(LoadError::UnknownKind { node, kind }),
+            };
+            Body::Activation(Activation {
+                frame,
+                method: p,
+                receiver: p,
+                closure: p,
+                detached,
+            })
+        }
         KIND_FAR_REFERENCE => Body::FarRef {
             actor: u32::try_from(r.uv()?).map_err(|_| LoadError::UnknownKind { node, kind })?,
             target: p,
@@ -637,7 +906,7 @@ fn edge_count(body: &Body) -> usize {
         Body::Mixin(_) => 6,
         Body::Method(_) | Body::Class(_) | Body::Metaclass(_) => 5,
         Body::Closure(c) => 1 + c.copied.len(),
-        Body::Activation(_) => 3,
+        Body::Activation(a) => 3 + a.detached.as_ref().map_or(0, |d| 2 + d.temps.len()),
         Body::FarRef { .. } => 1,
         Body::Promise(p) => 2 + p.waiters.len() + p.queue.len(),
         Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => 0,
@@ -707,12 +976,19 @@ fn fill_body(
             copied: all(&e[1..])?,
             ..c
         }),
-        Body::Activation(_) => Body::Activation(Activation {
-            frame: None,
+        Body::Activation(a) => Body::Activation(Activation {
+            frame: a.frame,
             method: resolve(e[0])?,
             receiver: resolve(e[1])?,
             closure: resolve(e[2])?,
-            detached: None,
+            detached: match a.detached {
+                Some(_) => Some(Detached {
+                    sender: resolve(e[3])?,
+                    bci: resolve(e[4])?,
+                    temps: all(&e[5..])?,
+                }),
+                None => None,
+            },
         }),
         Body::FarRef { actor, .. } => Body::FarRef {
             actor,
