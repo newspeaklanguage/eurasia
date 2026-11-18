@@ -112,6 +112,10 @@ pub enum Completion {
     Returned(Value),
     /// The program sent `vm exit:` with this code.
     Exited(i32),
+    /// Nothing can run before this monotonic time (in nanoseconds), the next
+    /// timer, and the host does not block ([`Host::blocks`]): it calls
+    /// [`Vm::resume`] once that time has come.
+    Waiting(u64),
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +164,8 @@ pub struct Vm {
     collections: u64,
     /// Set when a turn ends with `finish:`: the next timer's time (0: none).
     finished_turn: Option<u64>,
+    /// Whether the image runs a message loop (the MessageLoop role is set).
+    has_loop: bool,
     /// The cohort's actors (`EURASIA_ACTORS_DESIGN_2026-11-17.md` section
     /// 5); actor 0 runs the image's own platform.
     actors: Vec<Actor>,
@@ -203,6 +209,7 @@ impl Vm {
             gc_stress: None,
             collections: 0,
             finished_turn: None,
+            has_loop: false,
             actors: Vec::new(),
             current: 0,
         }
@@ -333,6 +340,7 @@ impl Vm {
             wakeup: 0,
         }];
         self.current = 0;
+        self.has_loop = has_loop;
         if has_loop {
             if let Some(done) = self.dispatch(args_array, host)? {
                 return Ok(done);
@@ -346,6 +354,22 @@ impl Vm {
                 return Ok(done);
             }
         }
+        self.event_loop(host)
+    }
+
+    /// Continues a run that answered [`Completion::Waiting`], once the time
+    /// it named has come (a host that does not block calls it from a timer).
+    pub fn resume(&mut self, host: &mut dyn Host) -> Result<Completion, VmError> {
+        if let Some(done) = self.next_turn(host)? {
+            return Ok(done);
+        }
+        self.event_loop(host)
+    }
+
+    /// Runs steps and turns until the run is over, or, for a host that does
+    /// not block, until nothing can run before the next timer.
+    fn event_loop(&mut self, host: &mut dyn Host) -> Result<Completion, VmError> {
+        let has_loop = self.has_loop;
         let mut steps: u64 = 0;
         loop {
             if let Some(limit) = self.step_limit {
@@ -1257,6 +1281,9 @@ impl Vm {
             .filter(|&a| self.actors[a].wakeup > 0)
             .min_by_key(|&a| (self.actors[a].wakeup, a));
         match earliest {
+            Some(a) if !host.blocks() && host.monotonic_nanos() < self.actors[a].wakeup => {
+                Ok(Some(Completion::Waiting(self.actors[a].wakeup)))
+            }
             Some(a) => {
                 host.wait_until(self.actors[a].wakeup);
                 self.actors[a].wakeup = 0;

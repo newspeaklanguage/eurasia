@@ -26,7 +26,11 @@ The snapshot format is [docs/SNAPSHOT_FORMAT.md](docs/SNAPSHOT_FORMAT.md).
 | `eurasia-snapshot` | The snapshot format. `no_std`. |
 | `eurasia-host` | The host interface: every input and output effect. `no_std`. |
 | `eurasia-native` | The `eurasia` command-line VM. |
-| `eurasia-web` | The wasm32 build. |
+| `eurasia-web` | The wasm32 build: exports to load a snapshot and run it without blocking. |
+
+`web/` holds the JavaScript side: `eurasia.mjs` (the loader and host
+imports, for browsers and Node), `index.html` (runs a snapshot in a page)
+and `run-node.mjs` (runs one under Node).
 
 ## Building and checking
 
@@ -37,7 +41,10 @@ scripts/check.sh
 ```
 
 which checks formatting, runs clippy and the tests natively, and builds and
-lints the libraries for wasm32. Every change must pass it.
+lints the libraries for wasm32. Every change must pass it. The scripts that
+need psoup and the newspeak checkout run in this order: `genesis.sh`,
+`kernel-tests.sh`, then `web-tests.sh` (the wasm32 VM under Node, through
+the browser's loader, must match the native VM).
 
 ## Status
 
@@ -66,7 +73,7 @@ with `cannotReturn:` and `aboutToReturn:through:`), activation handles,
 `nonBooleanReceiver:`, and the value-native catalog: SmallIntegers and
 LargeIntegers (in-house arbitrary precision), Floats (bundled `libm`, so
 bit-identical on every host), allocation, indexed access, copying, strings
-and `perform:withArguments:`. A running program can save the whole heap (`vm snapshot`, `vm writeBytes:toFile:`) and choose the saved image's entry (`vm setRole:to:`); running the saved image continues from the saved state. **Genesis works:** `scripts/genesis.sh` packages the kernel fork (`kernel/fork-kernel.py` derives it from psoup's kernel; `kernel/natives.tsv` maps its methods to natives) with a smoke-test application, runs genesis on Eurasia to save the base image, and checks the base image's output, including psoup's own exception handling and an unhandled-exception trace. Images are build artifacts, always recreatable from source; genesis is reproducible byte for byte, and the script checks it. Classes are created at run time (`vm applyMixin:superclass:enclosingObject:`), and psoup's `KernelTests` and `AccessModifierTesting` give the same outcome on Eurasia as on psoup: `scripts/kernel-tests.sh` runs them on both and fails on any difference not explained in `docs/EXPECTED_DIFFERENCES.md` (there are none). That completes M2. **The collector (M3):** `crates/eurasia-core/src/gc.rs` collects at safepoints, keeping survivors' allocation order and identity hashes, clearing weak arrays and mourning ephemerons; snapshots save only what the roles reach. psoup's `KernelWeakTests` agree too (377 tests in all), also under GC stress (`EURASIA_GC_STRESS=n` collects after every `n` allocations; `genesis.sh` runs the base image with `n` = 1). **Actors (M4):** every actor (`Actor named:`, `vm spawn: mixin`) is a VM actor with its own heap, mailbox and clone of the platform, in one arena. References cross actors only as far references, and promises as promise records (snapshot kinds 15 and 16). psoup's actors module is forked (`kernel/fork-actors.py`). 444 of the 445 differential tests agree; `TwoActorTests>>testPipelining` is an expected difference. Ports are next, with M5.
+and `perform:withArguments:`. A running program can save the whole heap (`vm snapshot`, `vm writeBytes:toFile:`) and choose the saved image's entry (`vm setRole:to:`); running the saved image continues from the saved state. **Genesis works:** `scripts/genesis.sh` packages the kernel fork (`kernel/fork-kernel.py` derives it from psoup's kernel; `kernel/natives.tsv` maps its methods to natives) with a smoke-test application, runs genesis on Eurasia to save the base image, and checks the base image's output, including psoup's own exception handling and an unhandled-exception trace. Images are build artifacts, always recreatable from source; genesis is reproducible byte for byte, and the script checks it. Classes are created at run time (`vm applyMixin:superclass:enclosingObject:`), and psoup's `KernelTests` and `AccessModifierTesting` give the same outcome on Eurasia as on psoup: `scripts/kernel-tests.sh` runs them on both and fails on any difference not explained in `docs/EXPECTED_DIFFERENCES.md` (there are none). That completes M2. **The collector (M3):** `crates/eurasia-core/src/gc.rs` collects at safepoints, keeping survivors' allocation order and identity hashes, clearing weak arrays and mourning ephemerons; snapshots save only what the roles reach. psoup's `KernelWeakTests` agree too (377 tests in all), also under GC stress (`EURASIA_GC_STRESS=n` collects after every `n` allocations; `genesis.sh` runs the base image with `n` = 1). **Actors (M4):** every actor (`Actor named:`, `vm spawn: mixin`) is a VM actor with its own heap, mailbox and clone of the platform, in one arena. References cross actors only as far references, and promises as promise records (snapshot kinds 15 and 16). psoup's actors module is forked (`kernel/fork-actors.py`). 444 of the 445 differential tests agree; `TwoActorTests>>testPipelining` is an expected difference. Ports come later (`newspeak/EURASIA_ACTORS_DESIGN_2026-11-17.md` section 10). **The web host (M5, begun):** the wasm32 VM runs images in the browser and under Node, giving the native VM's output and test outcomes; a run returns to the host's event loop to wait for a timer instead of blocking. The JS FFI, expats and callbacks are next, then CounterApp.
 and packager, and differential tests against psoup
 ([docs/EXPECTED_DIFFERENCES.md](docs/EXPECTED_DIFFERENCES.md)). M1b is the packager
 (Newspeak, in the newspeak repository), which builds images from source.

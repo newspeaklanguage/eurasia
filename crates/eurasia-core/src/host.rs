@@ -31,6 +31,13 @@ pub trait Host {
         let _ = nanos;
     }
 
+    /// Whether [`Host::wait_until`] may block. A host that cannot (the
+    /// browser's, whose event loop must keep running) answers false: the VM
+    /// then returns [`crate::Completion::Waiting`] instead of waiting.
+    fn blocks(&self) -> bool {
+        true
+    }
+
     /// Input (`vm hostDescription`): a short description of the host.
     fn description(&self) -> &str;
 

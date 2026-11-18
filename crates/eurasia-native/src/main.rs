@@ -124,6 +124,7 @@ fn main() -> ExitCode {
     match outcome {
         Ok(Completion::Returned(_)) => ExitCode::SUCCESS,
         Ok(Completion::Exited(code)) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+        Ok(Completion::Waiting(_)) => unreachable!("this host blocks"),
         Err(e) => {
             eprintln!("eurasia: {e}");
             ExitCode::from(70)

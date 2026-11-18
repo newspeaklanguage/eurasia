@@ -1,0 +1,46 @@
+<!doctype html>
+<!-- Copyright (c) 2026-2027, Gilad Bracha. All rights reserved. Use of this source
+     code is governed by a BSD-style license that can be found in the LICENSE file. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Eurasia</title>
+<style>
+  body { font-family: ui-monospace, Menlo, monospace; margin: 16px; background: #fff; color: #222; }
+  #status { color: #666; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<!-- Runs a snapshot on Eurasia's wasm32 build. Query parameters: wasm (default
+     eurasia_web.wasm) and snapshot (default base.eus), both relative to this
+     page. scripts/web-tests.sh copies the build and images beside it. -->
+<div id="status">loading</div>
+<pre id="output"></pre>
+<script type="module">
+  import { run } from './eurasia.mjs';
+  const params = new URLSearchParams(location.search);
+  const status = document.getElementById('status');
+  const output = document.getElementById('output');
+  const fetchBytes = async (url) => {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`cannot fetch ${url}: ${response.status}`);
+    return new Uint8Array(await response.arrayBuffer());
+  };
+  try {
+    const [wasm, snapshot] = await Promise.all([
+      fetchBytes(params.get('wasm') ?? 'eurasia_web.wasm'),
+      fetchBytes(params.get('snapshot') ?? 'base.eus'),
+    ]);
+    status.textContent = 'running';
+    const result = await run(wasm, snapshot, {
+      print: (line) => output.append(line + '\n'),
+    });
+    status.textContent = result.status === 'exited' ? `exited ${result.code}` : 'returned';
+  } catch (e) {
+    status.textContent = `failed: ${e.message}`;
+  }
+</script>
+</body>
+</html>
