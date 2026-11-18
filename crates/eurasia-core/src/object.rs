@@ -135,6 +135,35 @@ pub struct Behavior {
     pub library: Value,
 }
 
+/// A closure (hidden layout: reached only through natives and kernel
+/// operations).
+#[derive(Clone, Debug)]
+pub struct Closure {
+    /// The activation that created it.
+    pub defining: Value,
+    /// The bytecode index where its body starts, in the defining method.
+    pub initial_ip: u32,
+    /// The number of parameters.
+    pub num_args: u32,
+    /// The copied values, which become its frame's first locals.
+    pub copied: Vec<Value>,
+}
+
+/// An activation handle (hidden layout). A frame's handle is created when
+/// something needs it (a closure, reflection, a VM upcall) and is marked dead
+/// when the frame returns or is unwound.
+#[derive(Clone, Debug)]
+pub struct Activation {
+    /// The live frame's serial number, or `None` once the frame is gone.
+    pub frame: Option<u64>,
+    /// The method running in the frame.
+    pub method: Value,
+    /// The method receiver (`self`).
+    pub receiver: Value,
+    /// For a closure frame, the closure; nil for a method frame.
+    pub closure: Value,
+}
+
 /// An object's contents.
 #[derive(Clone, Debug)]
 pub enum Body {
@@ -174,6 +203,10 @@ pub enum Body {
     Class(Behavior),
     /// A metaclass.
     Metaclass(Behavior),
+    /// A closure.
+    Closure(Closure),
+    /// An activation handle.
+    Activation(Activation),
 }
 
 /// An object.
@@ -331,6 +364,22 @@ impl Heap {
     pub fn mixin(&self, v: Value) -> Option<&Mixin> {
         match &self.get(v)?.body {
             Body::Mixin(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// The closure record of a Closure object.
+    pub fn closure(&self, v: Value) -> Option<&Closure> {
+        match &self.get(v)?.body {
+            Body::Closure(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// The activation record of an activation handle.
+    pub fn activation(&self, v: Value) -> Option<&Activation> {
+        match &self.get(v)?.body {
+            Body::Activation(a) => Some(a),
             _ => None,
         }
     }

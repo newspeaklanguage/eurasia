@@ -68,6 +68,12 @@ natives! {
     StringSize = 14 / 0: "`String>>size`.",
     VmPrint = 20 / 1: "`vm print:` (output).",
     VmExit = 21 / 1: "`vm exit:`.",
+    ClosureValue = 30 / 0: "`Closure>>value`.",
+    ClosureValue1 = 31 / 1: "`Closure>>value:`.",
+    ClosureValue2 = 32 / 2: "`Closure>>value:value:`.",
+    ClosureValue3 = 33 / 3: "`Closure>>value:value:value:`.",
+    ClosureValueWithArguments = 34 / 1: "`Closure>>valueWithArguments:`.",
+    ClosureNumArgs = 35 / 0: "`Closure>>numArgs`.",
 }
 
 /// A resource whose bound can be exceeded.
@@ -159,6 +165,14 @@ pub enum Outcome {
     Fail(Reason),
     /// `vm exit:` ended the program.
     Exit(i32),
+    /// A closure's `value` family: run `closure` with `args` in a new frame.
+    /// The arity has been checked.
+    ActivateClosure {
+        /// The closure.
+        closure: Value,
+        /// Its arguments.
+        args: Vec<Value>,
+    },
 }
 
 /// What a native may touch.
@@ -223,6 +237,17 @@ fn comparison(
         (Some(a), Some(b)) => Outcome::Answer(ctx.boolean(op(a, b))),
         (Some(_), None) => Outcome::Fail(Reason::WrongKind(1)),
         (None, _) => Outcome::Fail(Reason::Unsupported),
+    }
+}
+
+fn activate_closure(receiver: Value, args: Vec<Value>, ctx: &NativeContext<'_>) -> Outcome {
+    match ctx.heap.closure(receiver) {
+        Some(c) if c.num_args as usize == args.len() => Outcome::ActivateClosure {
+            closure: receiver,
+            args,
+        },
+        Some(_) => Outcome::Fail(Reason::Arity),
+        None => Outcome::Fail(Reason::WrongKind(0)),
     }
 }
 
@@ -322,6 +347,21 @@ pub fn invoke(
                 Outcome::Answer(receiver)
             }
             None => Outcome::Fail(Reason::WrongKind(1)),
+        },
+        Native::ClosureValue
+        | Native::ClosureValue1
+        | Native::ClosureValue2
+        | Native::ClosureValue3 => activate_closure(receiver, args.to_vec(), ctx),
+        Native::ClosureValueWithArguments => match ctx.heap.array_elements(arg.unwrap()) {
+            Some(elements) => {
+                let elements = elements.to_vec();
+                activate_closure(receiver, elements, ctx)
+            }
+            None => Outcome::Fail(Reason::WrongKind(1)),
+        },
+        Native::ClosureNumArgs => match ctx.heap.closure(receiver) {
+            Some(c) => Outcome::Answer(small(i64::from(c.num_args))),
+            None => Outcome::Fail(Reason::WrongKind(0)),
         },
         Native::VmExit => match arg
             .unwrap()

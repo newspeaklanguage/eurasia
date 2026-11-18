@@ -112,3 +112,51 @@ fn corrupted_bytes_never_panic() {
         }
     }
 }
+
+#[test]
+fn closures_and_dead_activations_round_trip() {
+    use eurasia_core::Value;
+    use eurasia_core::builder::ImageBuilder;
+    use eurasia_core::object::{Activation, Body, Closure, Space};
+
+    let mut b = ImageBuilder::new();
+    let activation_class = b.role(Role::ActivationClass).unwrap();
+    let closure_class = b.role(Role::ClosureClass).unwrap();
+    let nil = b.nil;
+    let activation = b.heap.allocate(
+        activation_class,
+        Space::Actor(0),
+        Body::Activation(Activation {
+            frame: None,
+            method: nil,
+            receiver: nil,
+            closure: nil,
+        }),
+    );
+    let closure = b.heap.allocate(
+        closure_class,
+        Space::Actor(0),
+        Body::Closure(Closure {
+            defining: activation,
+            initial_ip: 4,
+            num_args: 1,
+            copied: vec![Value::small_integer(7).unwrap(), nil],
+        }),
+    );
+    let (heap, roles) = b.finish();
+    let first = write_image(&heap, &roles);
+    let (loaded, roles2) = read_image(&first).expect("loads");
+    assert_eq!(write_image(&loaded, &roles2), first);
+    let c = loaded
+        .closure(closure)
+        .expect("the closure, at the same index");
+    assert_eq!((c.initial_ip, c.num_args, c.copied.len()), (4, 1, 2));
+    assert_eq!(c.copied[0], Value::small_integer(7).unwrap());
+    assert!(
+        loaded
+            .activation(c.defining)
+            .expect("activation")
+            .frame
+            .is_none()
+    );
+}

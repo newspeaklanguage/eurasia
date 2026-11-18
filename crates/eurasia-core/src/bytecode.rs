@@ -216,6 +216,32 @@ impl Assembler {
     pub fn return_top(&mut self) -> &mut Assembler {
         self.byte(op::RETURN_TOP)
     }
+
+    /// Non-local return of the top of stack (from inside a closure).
+    pub fn non_local_return_top(&mut self) -> &mut Assembler {
+        self.byte(175)
+    }
+
+    /// Push a closure with `copied` copied values (popped from the stack)
+    /// and `args` parameters, whose body is `body`.
+    pub fn push_closure(&mut self, copied: u8, args: u8, body: &[u8]) -> &mut Assembler {
+        assert!(copied <= 15 && args <= 15, "closure operand out of range");
+        let [lo, hi] = u16::try_from(body.len())
+            .expect("closure body too long")
+            .to_le_bytes();
+        self.byte(op::PUSH_CLOSURE)
+            .byte((copied << 4) | args)
+            .byte(lo)
+            .byte(hi);
+        self.code.extend_from_slice(body);
+        self
+    }
+
+    /// Branch forward by `delta` bytes if the popped value is false.
+    pub fn branch_if_false(&mut self, delta: u16) -> &mut Assembler {
+        let [lo, hi] = delta.to_le_bytes();
+        self.byte(op::BRANCH_IF_FALSE).byte(lo).byte(hi)
+    }
 }
 
 /// The common-selector table of V5 (opcodes 176-207), as (selector, arity).

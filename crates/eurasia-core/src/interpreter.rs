@@ -63,6 +63,8 @@ pub enum VmError {
     StackExhausted,
     /// The step limit set by [`Vm::set_step_limit`] was reached.
     StepLimitReached,
+    /// The image has no method for a VM upcall (named by its role).
+    MissingUpcall(&'static str),
 }
 
 impl fmt::Display for VmError {
@@ -80,6 +82,7 @@ impl fmt::Display for VmError {
             VmError::BadNative(id) => write!(f, "bad native method (catalog id {id})"),
             VmError::StackExhausted => write!(f, "stack exhausted"),
             VmError::StepLimitReached => write!(f, "step limit reached"),
+            VmError::MissingUpcall(role) => write!(f, "the image has no method for {role}"),
         }
     }
 }
@@ -95,12 +98,20 @@ pub enum Completion {
 
 #[derive(Clone, Debug)]
 struct Frame {
+    /// A number unique to this frame for the life of the VM.
+    serial: u64,
     method: Value,
     receiver: Value,
+    /// Index of the message receiver; the arguments follow it.
     bp: usize,
     arg_count: usize,
+    /// Index of the first local.
     lp: usize,
     ip: usize,
+    /// The frame's activation handle, once something has asked for it.
+    activation: Option<Value>,
+    /// For a closure frame, the closure.
+    closure: Option<Value>,
 }
 
 enum Step {
@@ -118,6 +129,7 @@ pub struct Vm {
     frames: Vec<Frame>,
     symbols: BTreeMap<&'static str, Value>,
     step_limit: Option<u64>,
+    next_serial: u64,
 }
 
 impl Vm {
@@ -130,6 +142,7 @@ impl Vm {
             frames: Vec::new(),
             symbols: BTreeMap::new(),
             step_limit: None,
+            next_serial: 0,
         }
     }
 
@@ -489,13 +502,18 @@ impl Vm {
                 let nil = self.nil();
                 self.stack
                     .extend(core::iter::repeat_n(nil, header.local_count as usize));
+                let serial = self.next_serial;
+                self.next_serial += 1;
                 self.frames.push(Frame {
+                    serial,
                     method,
                     receiver,
                     bp: base,
                     arg_count: n,
                     lp,
                     ip: 0,
+                    activation: None,
+                    closure: None,
                 });
                 Ok(None)
             }
@@ -547,7 +565,191 @@ impl Vm {
                 self.ordinary_send(signal, 0, host)
             }
             Outcome::Exit(code) => Ok(Some(Completion::Exited(code))),
+            Outcome::ActivateClosure { closure, args } => {
+                self.stack.push(closure);
+                let n = args.len();
+                self.stack.extend(args);
+                self.activate_closure(closure, n)?;
+                Ok(None)
+            }
         }
+    }
+
+    /// Pushes a frame running `closure`, which is on the stack below its `n`
+    /// arguments. Its method and receiver are its defining activation's; its
+    /// copied values become its first locals.
+    fn activate_closure(&mut self, closure: Value, n: usize) -> Result<(), VmError> {
+        if self.frames.len() >= MAX_FRAMES {
+            return Err(VmError::StackExhausted);
+        }
+        let c = self
+            .heap
+            .closure(closure)
+            .ok_or(VmError::Malformed("closure expected"))?
+            .clone();
+        let defining = self
+            .heap
+            .activation(c.defining)
+            .ok_or(VmError::Malformed("activation expected"))?;
+        let (method, receiver) = (defining.method, defining.receiver);
+        let code_len = self
+            .heap
+            .method(method)
+            .ok_or(VmError::Malformed("method expected"))?
+            .bytecode
+            .len();
+        if c.initial_ip as usize >= code_len {
+            return Err(VmError::Malformed("closure body outside its method"));
+        }
+        let base = self.stack.len() - 1 - n;
+        let lp = self.stack.len();
+        self.stack.extend(c.copied.iter().copied());
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        self.frames.push(Frame {
+            serial,
+            method,
+            receiver,
+            bp: base,
+            arg_count: n,
+            lp,
+            ip: c.initial_ip as usize,
+            activation: None,
+            closure: Some(closure),
+        });
+        Ok(())
+    }
+
+    /// The activation handle of frame `index`, created on first request.
+    fn ensure_activation(&mut self, index: usize) -> Value {
+        if let Some(a) = self.frames[index].activation {
+            return a;
+        }
+        let f = &self.frames[index];
+        let nil = self.nil();
+        let record = crate::object::Activation {
+            frame: Some(f.serial),
+            method: f.method,
+            receiver: f.receiver,
+            closure: f.closure.unwrap_or(nil),
+        };
+        let class = self.roles.get(Role::ActivationClass);
+        let a = self
+            .heap
+            .allocate(class, Space::Actor(0), Body::Activation(record));
+        self.frames[index].activation = Some(a);
+        a
+    }
+
+    /// Marks the handle of a frame that has returned or been unwound as dead.
+    fn retire(&mut self, frame: &Frame) {
+        if let Some(a) = frame.activation
+            && let Some(Body::Activation(record)) = self.heap.get_mut(a).map(|o| &mut o.body)
+        {
+            record.frame = None;
+        }
+    }
+
+    /// Sends `selector` (a role) to the current frame's activation with
+    /// `args`, as psoup does for #cannotReturn:, #aboutToReturn:through: and
+    /// #nonBooleanReceiver:. Lookup ignores access, like DNU.
+    fn upcall(
+        &mut self,
+        selector: Role,
+        args: &[Value],
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
+        let _ = host;
+        let top = self.ensure_activation(self.frames.len() - 1);
+        let sel = self.selector_bytes(self.roles.get(selector))?;
+        let mut class = Some(self.class_of(top));
+        let mut method = None;
+        while let Some(c) = class {
+            if let Some(m) = self.method_at(c, &sel)? {
+                method = Some(m);
+                break;
+            }
+            class = self.superclass(c)?;
+        }
+        let method = method.ok_or(VmError::MissingUpcall(selector.name()))?;
+        self.stack.push(top);
+        self.stack.extend(args.iter().copied());
+        self.activate(method, args.len(), host)
+    }
+
+    /// The home method activation of a closure: its defining activation,
+    /// followed outward through enclosing closures.
+    fn home_of(&self, closure: Value) -> Result<Value, VmError> {
+        let nil = self.nil();
+        let mut home = self
+            .heap
+            .closure(closure)
+            .ok_or(VmError::Malformed("closure expected"))?
+            .defining;
+        for _ in 0..MAX_FRAMES {
+            let a = self
+                .heap
+                .activation(home)
+                .ok_or(VmError::Malformed("activation expected"))?;
+            if a.closure == nil {
+                return Ok(home);
+            }
+            home = self
+                .heap
+                .closure(a.closure)
+                .ok_or(VmError::Malformed("closure expected"))?
+                .defining;
+        }
+        Err(VmError::Malformed("closure chain too deep"))
+    }
+
+    /// `^result` inside a closure: return from the home method, following
+    /// psoup's protocol. An intervening ensure: frame gets
+    /// #aboutToReturn:through:; a dead home, or a simulation-root or
+    /// callback-dispatch frame in between, gets #cannotReturn:.
+    fn non_local_return(
+        &mut self,
+        result: Value,
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
+        let closure = self.frames.last().expect("a frame").closure;
+        let Some(closure) = closure else {
+            // In a method frame, ^ is a local return.
+            self.local_return(result);
+            return Ok(None);
+        };
+        let home = self.home_of(closure)?;
+        let home_serial = self.heap.activation(home).and_then(|a| a.frame);
+        let Some(home_serial) = home_serial else {
+            return self.upcall(Role::CannotReturnSelector, &[result], host);
+        };
+        let ensure = self.roles.get(Role::EnsureMethod);
+        let blockers = [
+            self.roles.get(Role::SimulationRootMethod),
+            self.roles.get(Role::CallbackDispatchMethod),
+        ];
+        let nil = self.nil();
+        let top = self.frames.len() - 1;
+        for i in (0..top).rev() {
+            if self.frames[i].serial == home_serial {
+                let popped = self.frames.split_off(i);
+                for f in &popped {
+                    self.retire(f);
+                }
+                self.stack.truncate(popped[0].bp);
+                self.stack.push(result);
+                return Ok(None);
+            }
+            let method = self.frames[i].method;
+            if method == ensure && ensure != nil {
+                let unwind = self.ensure_activation(i);
+                return self.upcall(Role::AboutToReturnThroughSelector, &[result, unwind], host);
+            }
+            if blockers.iter().any(|&b| b == method && b != nil) {
+                break;
+            }
+        }
+        self.upcall(Role::CannotReturnSelector, &[result], host)
     }
 
     /// The failure object of `eq:native-failure-reification`: an instance of
@@ -622,6 +824,7 @@ impl Vm {
 
     fn local_return(&mut self, result: Value) -> Step {
         let frame = self.frames.pop().expect("a frame");
+        self.retire(&frame);
         self.stack.truncate(frame.bp);
         self.stack.push(result);
         Step::Continue
@@ -773,19 +976,27 @@ impl Vm {
         Ok(receiver)
     }
 
-    fn branch_if(&mut self, condition: bool, forward: usize) -> Result<(), VmError> {
+    /// A conditional branch. A non-Boolean sends #nonBooleanReceiver: to the
+    /// current activation, as psoup does; its answer stays on the stack and
+    /// the branch is not taken (the kernel's handler normally raises).
+    fn branch_if(
+        &mut self,
+        condition: bool,
+        forward: usize,
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
         let v = self.pop()?;
         let taken = if v == self.roles.get(Role::True) {
             condition
         } else if v == self.roles.get(Role::False) {
             !condition
         } else {
-            return Err(self.unimplemented("#nonBooleanReceiver:"));
+            return self.upcall(Role::NonBooleanReceiverSelector, &[v], host);
         };
         if taken {
             self.frames.last_mut().expect("a frame").ip += forward;
         }
-        Ok(())
+        Ok(None)
     }
 
     fn step(&mut self, host: &mut dyn Host) -> Result<Step, VmError> {
@@ -828,14 +1039,8 @@ impl Vm {
                 self.frames.last_mut().expect("a frame").ip += (opcode & 15) as usize;
                 None
             }
-            32..=47 => {
-                self.branch_if(true, (opcode & 15) as usize)?;
-                None
-            }
-            48..=63 => {
-                self.branch_if(false, (opcode & 15) as usize)?;
-                None
-            }
+            32..=47 => self.branch_if(true, (opcode & 15) as usize, host)?,
+            48..=63 => self.branch_if(false, (opcode & 15) as usize, host)?,
             64..=111 => {
                 let kind = match opcode {
                     64..=79 => SendKind::Ordinary,
@@ -924,7 +1129,16 @@ impl Vm {
                 let v = self.pop()?;
                 return Ok(self.local_return(v));
             }
-            171..=175 => return Err(self.unimplemented("non-local return")),
+            171..=175 => {
+                let result = match opcode {
+                    171 => self.nil(),
+                    172 => self.roles.get(Role::False),
+                    173 => self.roles.get(Role::True),
+                    174 => self.frames.last().expect("a frame").receiver,
+                    _ => self.pop()?,
+                };
+                self.non_local_return(result, host)?
+            }
             176..=207 => {
                 let k = (opcode - 176) as usize;
                 let table = self.roles.get(Role::CommonSelectors);
@@ -1004,14 +1218,8 @@ impl Vm {
                 self.frames.last_mut().expect("a frame").ip += wide();
                 None
             }
-            op::BRANCH_IF_TRUE => {
-                self.branch_if(true, wide())?;
-                None
-            }
-            op::BRANCH_IF_FALSE => {
-                self.branch_if(false, wide())?;
-                None
-            }
+            op::BRANCH_IF_TRUE => self.branch_if(true, wide(), host)?,
+            op::BRANCH_IF_FALSE => self.branch_if(false, wide(), host)?,
             op::PUSH_INDIRECT_LOCAL
             | op::POP_INTO_INDIRECT_LOCAL
             | op::STORE_INTO_INDIRECT_LOCAL => {
@@ -1067,7 +1275,34 @@ impl Vm {
             op::OUTER_SEND => {
                 self.outer_send(ext_selector(), ext_args(), bytes[3] as usize, host)?
             }
-            op::PUSH_CLOSURE => return Err(self.unimplemented("closures")),
+            op::PUSH_CLOSURE => {
+                let copied_count = (bytes[1] >> 4) as usize;
+                let num_args = u32::from(bytes[1] & 15);
+                let length = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
+                let code_len = self.heap.method(method).expect("method").bytecode.len();
+                if self.stack.len() - self.frames.last().expect("a frame").lp < copied_count
+                    || next + length > code_len
+                {
+                    return Err(self.invalid());
+                }
+                let copied = self.stack.split_off(self.stack.len() - copied_count);
+                let top = self.frames.len() - 1;
+                let defining = self.ensure_activation(top);
+                let class = self.roles.get(Role::ClosureClass);
+                let closure = self.heap.allocate(
+                    class,
+                    Space::Actor(0),
+                    Body::Closure(crate::object::Closure {
+                        defining,
+                        initial_ip: next as u32,
+                        num_args,
+                        copied,
+                    }),
+                );
+                self.stack.push(closure);
+                self.frames.last_mut().expect("a frame").ip = next + length;
+                None
+            }
             _ => return Err(self.invalid()),
         };
         Ok(match sent {

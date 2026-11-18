@@ -102,6 +102,13 @@ cycles need no special handling.
 | 10 | mixin | `uv` slot-declaration count | class value, name, methods array, enclosing mixin, slot-declaration names array, library field |
 | 11 | class | none | class value (its metaclass), mixin, superclass, enclosing object, name, library field |
 | 12 | metaclass | none | class value, mixin, superclass, enclosing object, this class, library field |
+| 13 | closure | `uv` initial bytecode index, `uv` argument count, `uv` copied count | class value, defining activation, then the copied values |
+| 14 | activation | none | class value, method, receiver, closure (nil for a method activation) |
+
+Kinds 13 and 14 are hidden layouts: their encoding belongs to the format,
+not to a layout the image may read. A saved activation is always **dead**:
+snapshots are saved from an idle heap, which has no frames. (Paused stacks,
+M7, will add live frame records.)
 
 Kinds 9–12 are the contract layouts of the implementation plan (section 4
 of the operation list): the VM reads those fields and no others. Everything

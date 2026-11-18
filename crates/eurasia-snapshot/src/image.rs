@@ -9,8 +9,8 @@ use core::fmt;
 
 use eurasia_core::Value;
 use eurasia_core::object::{
-    Access, Behavior, Body, FROZEN, Heap, HeapError, Method, MethodHeader, MethodKind, Mixin,
-    Object, Space,
+    Access, Activation, Behavior, Body, Closure, FROZEN, Heap, HeapError, Method, MethodHeader,
+    MethodKind, Mixin, Object, Space,
 };
 use eurasia_core::roles::{Role, Roles, RolesError};
 
@@ -33,6 +33,8 @@ const KIND_METHOD: u8 = 9;
 const KIND_MIXIN: u8 = 10;
 const KIND_CLASS: u8 = 11;
 const KIND_METACLASS: u8 = 12;
+const KIND_CLOSURE: u8 = 13;
+const KIND_ACTIVATION: u8 = 14;
 
 /// Why an image could not be loaded.
 #[derive(Debug, Clone, PartialEq)]
@@ -202,6 +204,8 @@ fn write_node(w: &mut Writer, o: &Object) {
         Body::Mixin(_) => KIND_MIXIN,
         Body::Class(_) => KIND_CLASS,
         Body::Metaclass(_) => KIND_METACLASS,
+        Body::Closure(_) => KIND_CLOSURE,
+        Body::Activation(_) => KIND_ACTIVATION,
     };
     w.u8(kind);
     w.u8(o.header.flags);
@@ -254,6 +258,13 @@ fn write_node(w: &mut Writer, o: &Object) {
             w.bytes(&m.bytecode);
         }
         Body::Mixin(m) => w.uv(m.slot_count.into()),
+        Body::Closure(c) => {
+            w.uv(c.initial_ip.into());
+            w.uv(c.num_args.into());
+            w.uv(c.copied.len() as u64);
+        }
+        // Saved activations are dead: an idle heap has no frames.
+        Body::Activation(_) => {}
     }
 }
 
@@ -295,6 +306,11 @@ fn write_edges(w: &mut Writer, o: &Object, to_node: &dyn Fn(Value) -> Value) {
         ]
         .into_iter()
         .for_each(v),
+        Body::Closure(c) => {
+            v(c.defining);
+            c.copied.iter().for_each(|&x| v(x));
+        }
+        Body::Activation(a) => [a.method, a.receiver, a.closure].into_iter().for_each(v),
         Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => {}
     }
 }
@@ -551,6 +567,25 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
                 Body::Metaclass(b)
             }
         }
+        KIND_CLOSURE => {
+            let initial_ip =
+                u32::try_from(r.uv()?).map_err(|_| LoadError::UnknownKind { node, kind })?;
+            let num_args =
+                u32::try_from(r.uv()?).map_err(|_| LoadError::UnknownKind { node, kind })?;
+            let copied = len(r)?;
+            Body::Closure(Closure {
+                defining: p,
+                initial_ip,
+                num_args,
+                copied: alloc::vec![p; copied],
+            })
+        }
+        KIND_ACTIVATION => Body::Activation(Activation {
+            frame: None,
+            method: p,
+            receiver: p,
+            closure: p,
+        }),
         _ => return Err(LoadError::UnknownKind { node, kind }),
     };
     Ok((flags, body))
@@ -561,6 +596,8 @@ fn edge_count(body: &Body) -> usize {
         Body::Regular(e) | Body::Array(e) | Body::WeakArray(e) => e.len(),
         Body::Ephemeron { .. } => 3,
         Body::Method(_) | Body::Mixin(_) | Body::Class(_) | Body::Metaclass(_) => 5,
+        Body::Closure(c) => 1 + c.copied.len(),
+        Body::Activation(_) => 3,
         Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => 0,
     }
 }
@@ -621,6 +658,17 @@ fn fill_body(
             name: Value::small_integer(0).expect("small"),
             this_class: resolve(e[3])?,
             library: resolve(e[4])?,
+        }),
+        Body::Closure(c) => Body::Closure(Closure {
+            defining: resolve(e[0])?,
+            copied: all(&e[1..])?,
+            ..c
+        }),
+        Body::Activation(_) => Body::Activation(Activation {
+            frame: None,
+            method: resolve(e[0])?,
+            receiver: resolve(e[1])?,
+            closure: resolve(e[2])?,
         }),
         other => other,
     })

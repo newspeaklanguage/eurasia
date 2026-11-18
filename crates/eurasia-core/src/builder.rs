@@ -94,6 +94,8 @@ impl ImageBuilder {
         let string = b.define_class("String", b.object);
         let array = b.define_class("Array", b.object);
         let message = b.define_class("Message", b.object);
+        let closure = b.define_class("Closure", b.object);
+        let activation = b.define_class("Activation", b.object);
         b.roles.extend([
             (Role::Nil, nil),
             (Role::True, b.true_),
@@ -102,6 +104,8 @@ impl ImageBuilder {
             (Role::StringClass, string),
             (Role::ArrayClass, array),
             (Role::MessageClass, message),
+            (Role::ClosureClass, closure),
+            (Role::ActivationClass, activation),
         ]);
         // Strings and arrays allocated before their classes existed get them now.
         let fix: Vec<(Value, bool)> = b
@@ -124,8 +128,15 @@ impl ImageBuilder {
         }
         let table = b.array(table);
         b.roles.push((Role::CommonSelectors, table));
-        let dnu = b.string("doesNotUnderstand:");
-        b.roles.push((Role::DoesNotUnderstandSelector, dnu));
+        for (role, selector) in [
+            (Role::DoesNotUnderstandSelector, "doesNotUnderstand:"),
+            (Role::CannotReturnSelector, "cannotReturn:"),
+            (Role::AboutToReturnThroughSelector, "aboutToReturn:through:"),
+            (Role::NonBooleanReceiverSelector, "nonBooleanReceiver:"),
+        ] {
+            let s = b.string(selector);
+            b.roles.push((role, s));
+        }
         b
     }
 
