@@ -550,6 +550,10 @@ impl Vm {
             natives::invoke(native, receiver, &args, &mut ctx)
         };
         self.stack.truncate(base);
+        let outcome = match outcome {
+            Outcome::Frame(op) => self.frame_native(op, receiver, &args),
+            other => other,
+        };
         match outcome {
             // Rule Native-Answer.
             Outcome::Answer(v) => {
@@ -577,6 +581,7 @@ impl Vm {
                 self.ordinary_send(signal, 0, host)
             }
             Outcome::Exit(code) => Ok(Some(Completion::Exited(code))),
+            Outcome::Frame(_) => unreachable!("frame natives are resolved above"),
             Outcome::Snapshot => match self.snapshot_writer {
                 Some(write) => {
                     let bytes = write(&self.heap, &self.roles);
@@ -684,6 +689,115 @@ impl Vm {
             .allocate(class, Space::Actor(0), Body::Activation(record));
         self.frames[index].activation = Some(a);
         a
+    }
+
+    /// The index of the live frame an activation handle names.
+    fn frame_index(&self, activation: Value) -> Option<usize> {
+        let serial = self.heap.activation(activation)?.frame?;
+        self.frames.iter().rposition(|f| f.serial == serial)
+    }
+
+    /// The stack range a frame's temps and operands occupy: after its
+    /// message receiver, up to the next frame's receiver (or the top).
+    fn frame_extent(&self, index: usize) -> core::ops::Range<usize> {
+        let start = self.frames[index].bp + 1;
+        let end = match self.frames.get(index + 1) {
+            Some(above) => above.bp,
+            None => self.stack.len(),
+        };
+        start..end
+    }
+
+    /// An activation native (genesis plan, section 2). The current frame is
+    /// the one that sent the message; the native's receiver and arguments
+    /// are already off the stack.
+    fn frame_native(&mut self, native: Native, receiver: Value, args: &[Value]) -> Outcome {
+        let nil = self.nil();
+        if native == Native::CurrentActivation {
+            let top = self.frames.len() - 1;
+            return Outcome::Answer(self.ensure_activation(top));
+        }
+        let Some(record) = self.heap.activation(receiver).cloned() else {
+            return Outcome::Fail(Reason::WrongKind(0));
+        };
+        match native {
+            Native::ActivationMethod => return Outcome::Answer(record.method),
+            Native::ActivationReceiver => return Outcome::Answer(record.receiver),
+            Native::ActivationClosure => return Outcome::Answer(record.closure),
+            _ => {}
+        }
+        let Some(k) = self.frame_index(receiver) else {
+            // A dead activation: no sender, no bci, no temps.
+            return match native {
+                Native::ActivationSender | Native::ActivationBci => Outcome::Answer(nil),
+                Native::ActivationSize => Outcome::Answer(Value::small_integer(0).expect("small")),
+                _ => Outcome::Fail(Reason::Dead),
+            };
+        };
+        let extent = self.frame_extent(k);
+        let temp = |v: Value| -> Result<usize, Reason> {
+            match v.as_small_integer() {
+                Some(i) if i >= 1 && (i as u64) <= extent.len() as u64 => {
+                    Ok(extent.start + i as usize - 1)
+                }
+                Some(_) => Err(Reason::OutOfRange(1)),
+                None => Err(Reason::WrongKind(1)),
+            }
+        };
+        match native {
+            Native::ActivationSender => Outcome::Answer(if k == 0 {
+                nil
+            } else {
+                self.ensure_activation(k - 1)
+            }),
+            Native::ActivationBci => {
+                Outcome::Answer(Value::small_integer(self.frames[k].ip as i64 + 1).expect("small"))
+            }
+            Native::ActivationSize => {
+                Outcome::Answer(Value::small_integer(extent.len() as i64).expect("small"))
+            }
+            Native::ActivationTempAt => match temp(args[0]) {
+                Ok(slot) => Outcome::Answer(self.stack[slot]),
+                Err(r) => Outcome::Fail(r),
+            },
+            Native::ActivationTempAtPut => match temp(args[0]) {
+                Ok(slot) => {
+                    self.stack[slot] = args[1];
+                    Outcome::Answer(args[1])
+                }
+                Err(r) => Outcome::Fail(r),
+            },
+            Native::ActivationSetSender => match self.frame_index(args[0]) {
+                Some(j) if j < k => {
+                    self.cut_back(k, j);
+                    Outcome::Answer(receiver)
+                }
+                _ => Outcome::Fail(Reason::WrongKind(1)),
+            },
+            _ => Outcome::Fail(Reason::Unsupported),
+        }
+    }
+
+    /// Makes frame `j` the sender of frame `k` (j < k): the frames in between
+    /// are retired and their stack contents removed, so a return from `k`
+    /// lands in `j`, which receives the answer where its pending send's
+    /// receiver was.
+    fn cut_back(&mut self, k: usize, j: usize) {
+        if j + 1 == k {
+            return;
+        }
+        let from = self.frames[j + 1].bp;
+        let to = self.frames[k].bp;
+        let removed: Vec<Frame> = self.frames.drain(j + 1..k).collect();
+        for f in &removed {
+            self.retire(f);
+        }
+        self.stack.drain(from..to);
+        let delta = to - from;
+        for f in &mut self.frames[j + 1..] {
+            f.bp -= delta;
+            f.lp -= delta;
+        }
     }
 
     /// Marks the handle of a frame that has returned or been unwound as dead.

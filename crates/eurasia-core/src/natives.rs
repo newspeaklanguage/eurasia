@@ -140,6 +140,28 @@ natives! {
     VmWriteFile = 91 / 2: "`vm writeBytes:toFile:` (output; interim host operation).",
     VmReadFile = 92 / 1: "`vm readFile:` (input; interim host operation).",
     VmSetRole = 93 / 2: "`vm setRole:to:`: assign a role by its snapshot id.",
+    CurrentActivation = 100 / 0: "The activation of the frame that sent this message.",
+    ActivationSender = 101 / 0: "`Activation>>sender`: the frame below, or nil.",
+    ActivationSetSender = 102 / 1: "`Activation>>sender:`, restricted to cutting back to a live frame below.",
+    ActivationMethod = 103 / 0: "`Activation>>method`.",
+    ActivationReceiver = 104 / 0: "`Activation>>receiver`.",
+    ActivationClosure = 105 / 0: "`Activation>>closure`: nil for a method activation.",
+    ActivationTempAt = 106 / 1: "`Activation>>tempAt:`: arguments, then locals, then operands.",
+    ActivationTempAtPut = 107 / 2: "`Activation>>tempAt:put:`.",
+    ActivationSize = 108 / 0: "`Activation>>size`: the number of temps and operands.",
+    ActivationBci = 109 / 0: "`Activation>>bci`: one-based, or nil once dead.",
+    DefiningActivationOf = 110 / 1: "The activation that created a closure.",
+    VmSlotOfAt = 111 / 2: "`vm slotOf:at:`: a slot of a regular object or ephemeron, or a contract field (format order).",
+    VmSlotOfAtPut = 112 / 3: "`vm slotOf:at:put:`: regular objects and ephemerons only, not frozen.",
+    VmClassOf = 113 / 1: "`vm classOf:`: the real class, whatever the object answers to `class`.",
+    VmIsIdenticalTo = 114 / 2: "`vm is:identicalTo:`.",
+    VmIdentityHashOf = 115 / 1: "`vm identityHashOf:`.",
+    VmInstantiate = 116 / 1: "`vm instantiate:`: `basicNew` of the argument.",
+    VmIsCanonical = 117 / 1: "`vm isCanonical:`: whether the object is frozen.",
+    VmSetCanonical = 118 / 1: "`vm setCanonical:`: freeze the object.",
+    VmPerformWith = 119 / 3: "`vm object:perform:with:`: an ordinary send, whatever the receiver overrides.",
+    VmGarbageCollect = 120 / 0: "`vm garbageCollect`: nothing until the collector (M3).",
+    VmMonotonicNanos = 121 / 0: "`vm monotonicNanos` (input).",
 }
 
 /// The largest shift `<<` performs; beyond it the result would exhaust
@@ -246,6 +268,9 @@ pub enum Outcome {
     },
     /// `vm snapshot`: the interpreter serializes the heap and answers it.
     Snapshot,
+    /// An activation native: the interpreter, which owns the frames, carries
+    /// it out and answers or fails.
+    Frame(Native),
     /// `vm setRole:to:`: the interpreter assigns the role.
     SetRole {
         /// The role.
@@ -586,6 +611,37 @@ fn bytes_of(heap: &Heap, v: Value) -> Option<&[u8]> {
         Body::String(b) | Body::Bytes(b) => Some(b),
         _ => None,
     }
+}
+
+/// The fields `vm slotOf:at:` reads: a regular object's slots, an
+/// ephemeron's key, value and finalizer, or a contract object's fields in the
+/// snapshot format's edge order (format section 5).
+fn readable_fields(body: &Body) -> Option<Vec<Value>> {
+    Some(match body {
+        Body::Regular(slots) => slots.clone(),
+        Body::Ephemeron {
+            key,
+            value,
+            finalizer,
+        } => alloc::vec![*key, *value, *finalizer],
+        Body::Class(b) => alloc::vec![b.mixin, b.superclass, b.enclosing_object, b.name, b.library],
+        Body::Metaclass(b) => alloc::vec![
+            b.mixin,
+            b.superclass,
+            b.enclosing_object,
+            b.this_class,
+            b.library
+        ],
+        Body::Mixin(m) => alloc::vec![
+            m.name,
+            m.methods,
+            m.enclosing_mixin,
+            m.slot_names,
+            m.library
+        ],
+        Body::Method(m) => alloc::vec![m.literals, m.mixin, m.selector, m.source, m.library],
+        _ => return None,
+    })
 }
 
 /// The number of instance slots of `class`: every mixin's slot declarations
@@ -1138,6 +1194,20 @@ pub fn invoke(
             Outcome::Answer(small(i as i64))
         }
         Native::VmSnapshot => Outcome::Snapshot,
+        Native::CurrentActivation
+        | Native::ActivationSender
+        | Native::ActivationSetSender
+        | Native::ActivationMethod
+        | Native::ActivationReceiver
+        | Native::ActivationClosure
+        | Native::ActivationTempAt
+        | Native::ActivationTempAtPut
+        | Native::ActivationSize
+        | Native::ActivationBci => Outcome::Frame(native),
+        Native::DefiningActivationOf => match ctx.heap.closure(arg(0)) {
+            Some(c) => Outcome::Answer(c.defining),
+            None => Outcome::Fail(Reason::WrongKind(1)),
+        },
         Native::VmWriteFile => {
             let (Some(bytes), Some(path)) =
                 (bytes_of(ctx.heap, arg(0)), ctx.heap.string_bytes(arg(1)))
@@ -1184,6 +1254,91 @@ pub fn invoke(
                 },
                 None => Outcome::Fail(Reason::OutOfRange(1)),
             }
+        }
+        Native::VmSlotOfAt => {
+            let (object, i) = (arg(0), arg(1));
+            match ctx.heap.get(object).and_then(|o| readable_fields(&o.body)) {
+                Some(fields) => match index(i, fields.len()) {
+                    Ok(k) => Outcome::Answer(fields[k]),
+                    Err(Reason::WrongKind(_)) => Outcome::Fail(Reason::WrongKind(2)),
+                    Err(_) => Outcome::Fail(Reason::OutOfRange(2)),
+                },
+                None => Outcome::Fail(Reason::WrongKind(1)),
+            }
+        }
+        Native::VmSlotOfAtPut => {
+            let (object, i, value) = (arg(0), arg(1), arg(2));
+            let Some(o) = ctx.heap.get_mut(object) else {
+                return Outcome::Fail(Reason::WrongKind(1));
+            };
+            if o.header.flags & FROZEN != 0 {
+                return Outcome::Fail(Reason::WrongKind(1));
+            }
+            let slot = match &mut o.body {
+                Body::Regular(slots) => index(i, slots.len()).map(|k| &mut slots[k]),
+                Body::Ephemeron {
+                    key,
+                    value: v,
+                    finalizer,
+                } => match i.as_small_integer() {
+                    Some(1) => Ok(key),
+                    Some(2) => Ok(v),
+                    Some(3) => Ok(finalizer),
+                    Some(_) => Err(Reason::OutOfRange(2)),
+                    None => Err(Reason::WrongKind(2)),
+                },
+                _ => Err(Reason::WrongKind(1)),
+            };
+            match slot {
+                Ok(s) => {
+                    *s = value;
+                    Outcome::Answer(value)
+                }
+                Err(Reason::WrongKind(1)) => Outcome::Fail(Reason::WrongKind(1)),
+                Err(Reason::WrongKind(_)) => Outcome::Fail(Reason::WrongKind(2)),
+                Err(_) => Outcome::Fail(Reason::OutOfRange(2)),
+            }
+        }
+        Native::VmClassOf => Outcome::Answer(match ctx.heap.get(arg(0)) {
+            Some(o) => o.header.class,
+            None => ctx.roles.get(Role::SmallIntegerClass),
+        }),
+        Native::VmIsIdenticalTo => Outcome::Answer(ctx.boolean(arg(0) == arg(1))),
+        Native::VmIdentityHashOf => match ctx.heap.get(arg(0)) {
+            Some(o) => Outcome::Answer(small((o.header.seq & ((1 << 62) - 1)) as i64)),
+            None => Outcome::Answer(arg(0)),
+        },
+        Native::VmInstantiate => invoke(Native::ClassBasicNew, arg(0), &[], ctx),
+        Native::VmIsCanonical => {
+            let frozen = match ctx.heap.get(arg(0)) {
+                Some(o) => o.header.flags & FROZEN != 0,
+                // Immediates are values.
+                None => true,
+            };
+            Outcome::Answer(ctx.boolean(frozen))
+        }
+        Native::VmSetCanonical => {
+            if let Some(o) = ctx.heap.get_mut(arg(0)) {
+                o.header.flags |= FROZEN;
+            }
+            Outcome::Answer(arg(0))
+        }
+        Native::VmPerformWith => {
+            match invoke(
+                Native::ObjectPerformWithArguments,
+                arg(0),
+                &[arg(1), arg(2)],
+                ctx,
+            ) {
+                // Shift argument numbers: the object is argument 1 here.
+                Outcome::Fail(Reason::WrongKind(i)) => Outcome::Fail(Reason::WrongKind(i + 1)),
+                other => other,
+            }
+        }
+        Native::VmGarbageCollect => Outcome::Answer(receiver),
+        Native::VmMonotonicNanos => {
+            let t = ctx.host.monotonic_nanos();
+            Outcome::Answer(ctx.integer(BigInt::from_i128(i128::from(t))))
         }
         Native::ObjectPerformWithArguments => {
             let selector = arg(0);

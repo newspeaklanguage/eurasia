@@ -500,3 +500,63 @@ fn every_catalog_entry_has_a_unique_id() {
         assert_eq!(Native::from_id(id).unwrap().arity(), arity);
     }
 }
+
+#[test]
+fn mirror_slot_access_reads_contract_fields_and_writes_only_regular_objects() {
+    let mut b = ImageBuilder::new();
+    let object = b.object;
+    let a = b.define_class("A", object);
+    b.set_slot_count(a, 2);
+    let (heap, roles) = b.finish();
+    let mut w = World { heap, roles };
+    let vm = w.roles.get(Role::Nil); // the receiver is not consulted
+    // A class's contract fields: mixin, superclass, enclosing, name, library.
+    assert_eq!(w.answer(Native::VmSlotOfAt, vm, &[a, si(2)]), object);
+    let name = w.answer(Native::VmSlotOfAt, vm, &[a, si(4)]);
+    assert_eq!(w.text(name), "A");
+    assert_eq!(
+        w.fails(Native::VmSlotOfAt, vm, &[a, si(6)]),
+        Reason::OutOfRange(2)
+    );
+    assert_eq!(
+        w.fails(Native::VmSlotOfAtPut, vm, &[a, si(1), si(0)]),
+        Reason::WrongKind(1)
+    );
+    // A regular instance.
+    let instance = w.answer(Native::VmInstantiate, vm, &[a]);
+    assert_eq!(
+        w.answer(Native::VmSlotOfAtPut, vm, &[instance, si(2), si(9)]),
+        si(9)
+    );
+    assert_eq!(w.answer(Native::VmSlotOfAt, vm, &[instance, si(2)]), si(9));
+    assert_eq!(w.answer(Native::VmClassOf, vm, &[instance]), a);
+    let v = w.answer(Native::VmIsCanonical, vm, &[instance]);
+    assert!(!w.truth(v));
+    w.answer(Native::VmSetCanonical, vm, &[instance]);
+    let v = w.answer(Native::VmIsCanonical, vm, &[instance]);
+    assert!(w.truth(v));
+    assert_eq!(
+        w.fails(Native::VmSlotOfAtPut, vm, &[instance, si(1), si(1)]),
+        Reason::WrongKind(1)
+    );
+    let v = w.answer(Native::VmIsCanonical, vm, &[si(3)]);
+    assert!(w.truth(v), "immediates are values");
+}
+
+#[test]
+fn mirror_perform_numbers_its_arguments_from_the_object() {
+    let mut w = world();
+    let vm = w.roles.get(Role::Nil);
+    let plus = w.string("+");
+    let nil = w.roles.get(Role::Nil);
+    assert_eq!(
+        w.fails(Native::VmPerformWith, vm, &[si(3), plus, nil]),
+        Reason::WrongKind(3)
+    );
+    let array_class = w.roles.get(Role::ArrayClass);
+    let args = w.answer(Native::IndexedNew, array_class, &[si(1)]);
+    assert!(matches!(
+        w.call(Native::VmPerformWith, vm, &[si(3), plus, args]),
+        Outcome::Perform { .. }
+    ));
+}
