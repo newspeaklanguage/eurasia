@@ -41,6 +41,6 @@ fn a_bad_snapshot_exits_65_with_a_message() {
 fn version_names_the_supported_versions() {
     let out = eurasia().arg("--version").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("snapshot format 3"));
+    assert!(text.contains("snapshot format 4"));
     assert!(text.contains("kernel 1"));
 }

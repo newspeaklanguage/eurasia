@@ -221,6 +221,8 @@ def main():
 		)
 		public currentMessageLoop = (
 		)
+		public spawn: mixin = (
+		)
 		public classOf: object = (
 		)
 		public currentActivation = (

@@ -1,6 +1,6 @@
 # Eurasia snapshot format
 
-**Status:** Draft, format version 3. Written before the code (implementation
+**Status:** Draft, format version 4. Written before the code (implementation
 plan M0); the packager (Newspeak) and `eurasia-snapshot` (Rust) are tested
 against each other.
 
@@ -32,7 +32,7 @@ psoup groups objects by class instead, which loses that order.
 | Field | Type | Meaning |
 |---|---|---|
 | magic | `bytes(4)` | `EURA` (0x45 0x55 0x52 0x41) |
-| format version | `u16` | This document: 3 (2026-11-17: version 2 gave mixins the class-side mixin field, version 3 the value flag bits and the Value role) |
+| format version | `u16` | This document: 4 (2026-11-17: version 2 gave mixins the class-side mixin field, version 3 the value flag bits and the Value role; 2026-11-18: version 4 far references, promise records, the shared bit and roles 35–37) |
 | kernel version | `u16` | Must equal the VM's `KERNEL_VERSION` |
 | bytecode version | `u16` | Must equal the VM's `BYTECODE_VERSION` |
 | word size | `u8` | Always 64 |
@@ -85,7 +85,7 @@ cycles need no special handling.
 |---|---|---|
 | sequence delta | `uv` | Sequence number minus the previous node's in the same section (the section's first node's is absolute). Gaps are objects in other spaces, or collected before the save. |
 | kind | `u8` | Below |
-| flags | `u8` | Bit 0: frozen (installed or canonical). Bit 1: a value (deeply immutable; actors may share it). Bit 2: on a class, a value class (its instances are values). Others reserved. |
+| flags | `u8` | Bit 0: frozen (installed or canonical). Bit 1: a value (deeply immutable; actors may share it). Bit 2: on a class, a value class (its instances are values). Bit 3: shared by every actor though mutable (the kernel module, the VM mirror): cloning a platform does not copy it. Others reserved. |
 | shape | depends on kind | Below |
 
 | Kind | Name | Shape in the node record | Edge record |
@@ -104,6 +104,16 @@ cycles need no special handling.
 | 12 | metaclass | none | class value, mixin, superclass, enclosing object, this class, library field |
 | 13 | closure | `uv` initial bytecode index, `uv` argument count, `uv` copied count | class value, defining activation, then the copied values |
 | 14 | activation | none | class value, method, receiver, closure (nil for a method activation) |
+| 15 | far reference | `uv` actor number | class value, target (in that actor's heap) |
+| 16 | promise record | `uv` state (0 pending, 1 fulfilled, 2 broken, 3 forwarded), `uv` waiter count, `uv` queue length | class value, value (resolution, problem or record forwarded to; nil while pending), owner (far reference or nil), the waiters (far references), the queued sends (Arrays `{sending actor. selector. result record. arguments...}`) |
+
+Kinds 15 and 16 (`EURASIA_ACTORS_DESIGN_2026-11-17.md`) are hidden too:
+the semantics' tables Φ and Π. A far reference is the only place a
+reference into another actor's heap may be held. A promise record holds
+nothing in any actor's terms: values, far references and records only. Both
+use the FarReference class (role 35). A snapshot saves only what the roles
+reach, so today only the actor whose message loop is the role is saved;
+saving every actor of a cohort is open.
 
 Kinds 13 and 14 are hidden layouts: their encoding belongs to the format,
 not to a layout the image may read. A saved activation is always **dead**:
@@ -154,6 +164,9 @@ Role ids for kernel version 1 (the operation list, section 2):
 | 15 | Method class | 32 | entry object (sent `main:args:` with the VM mirror and an Array of argument Strings when the message loop is nil) |
 | 16 | Expat class | 33 | Alien class |
 | 17 | message loop (when not nil, the VM starts the image by sending it `dispatchMessage:port:`) | 34 | Value class (its subclasses are value classes) |
+| | | 35 | FarReference class (of far references and promise records) |
+| | | 36 | platform template: the message loop a new actor's platform is cloned from |
+| | | 37 | Object class (`vm spawn:` applies its mixin to it) |
 
 Every role must be present. Unknown role ids are an error.
 

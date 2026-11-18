@@ -804,6 +804,59 @@ impl Vm {
             }
             Outcome::Exit(code) => Ok(Some(Completion::Exited(code))),
             Outcome::Frame(_) => unreachable!("frame natives are resolved above"),
+            Outcome::Spawn(mixin) => {
+                // The semantics' create-actor: a fresh actor whose heap has
+                // the new class, applying the mixin to Object with a nil
+                // enclosing object; the answer is a far reference to it.
+                let template = self.roles.get(Role::PlatformTemplate);
+                let object = self.roles.get(Role::ObjectClass);
+                if template == self.nil() || object == self.nil() {
+                    let failure =
+                        self.new_failure(native, receiver, args, Reason::Unsupported, host);
+                    self.stack.push(failure);
+                    let signal = self.symbol("signal");
+                    return self.ordinary_send(signal, 0, host);
+                }
+                let id = self.actors.len() as u32;
+                let nil = self.nil();
+                let applied = {
+                    let mut ctx = NativeContext {
+                        heap: &mut self.heap,
+                        roles: &self.roles,
+                        host,
+                        space: Space::Actor(id),
+                    };
+                    natives::apply_mixin(mixin, object, nil, &mut ctx)
+                };
+                let class = match applied {
+                    Outcome::Answer(class) => class,
+                    Outcome::Fail(reason) => {
+                        let failure = self.new_failure(native, receiver, args, reason, host);
+                        self.stack.push(failure);
+                        let signal = self.symbol("signal");
+                        return self.ordinary_send(signal, 0, host);
+                    }
+                    _ => unreachable!("applyMixin answers or fails"),
+                };
+                let message_loop = self.heap.clone_graph(template, Space::Actor(id));
+                self.actors.push(Actor {
+                    message_loop,
+                    mailbox: VecDeque::new(),
+                    wakeup: 0,
+                });
+                let far_class = self.roles.get(Role::FarReferenceClass);
+                let r = self.heap.allocate(
+                    far_class,
+                    Space::Actor(self.current as u32),
+                    Body::FarRef {
+                        actor: id,
+                        target: class,
+                    },
+                );
+                self.heap.get_mut(r).expect("new").header.flags |= VALUE;
+                self.stack.push(r);
+                Ok(None)
+            }
             Outcome::NewActor => {
                 // A new actor runs a clone of the platform template.
                 let template = self.roles.get(Role::PlatformTemplate);

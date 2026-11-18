@@ -75,6 +75,7 @@ roles! {
     ValueClass = 34: "The Value class: classes whose chain includes it are value classes.",
     FarReferenceClass = 35: "The FarReference class, of far references.",
     PlatformTemplate = 36: "The platform template: the message loop a new actor's platform is cloned from.",
+    ObjectClass = 37: "The platform's Object class, the superclass `vm spawn:` applies a mixin to.",
 }
 
 /// A complete assignment of values to roles.

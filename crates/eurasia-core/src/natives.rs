@@ -174,6 +174,7 @@ natives! {
     VmPromiseState = 135 / 1: "`vm promiseState: record`: `{state. payload}` at the end of its forwarding chain, in the running actor's terms: 0 and the owner's promise if that is in the running actor, else the last record; 1 and the resolution; 2 and the problem.",
     VmPromiseAddWaiter = 136 / 2: "`vm promise: record addWaiter: localPromise`: the argument is sent resolveRemotely: or breakRemotely: (in a packet) when the record, at the end of its chain, settles; at once if it has.",
     VmIsPromise = 137 / 1: "`vm isPromise:`: whether the object is a promise record.",
+    VmSpawn = 139 / 1: "`vm spawn: mixin`: a new actor running a clone of the platform template, with the mixin applied to Object (role 37) in its heap, enclosing object nil; answers a far reference to the new class (`actor-semantics.tex`, eq. `create-actor`).",
     VmPromiseSend = 138 / 2: "`vm promise: record send: {selector. resultRecord. arguments...}`: an eventual send to the promise (Route-Pending): queued in the record, at the end of its chain, until it settles; delivered at once if it has.",
     VmIsValue = 125 / 1: "`vm isValue:`: whether the object is a value (immediates, nil, booleans, strings, numbers, instances of value classes, classes with a value enclosing object).",
     SlotStore = 124 / 1: "Not a native: the failure of a slot setter, for a frozen receiver or a non-value stored into a value.",
@@ -189,7 +190,7 @@ natives! {
 /// convention (in the genesis kernel, every metaclass's superclass is
 /// `Class`). Nothing is installed: the pair is ordinary heap objects, and
 /// instances get their layout from the mixins along the chain.
-fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Outcome {
+pub fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Outcome {
     // An instance-side mixin: one whose class-side mixin is a mixin.
     let Some((name, cm)) = ctx.heap.mixin(m).map(|x| (x.name, x.class_mixin)) else {
         return Outcome::Fail(Reason::WrongKind(1));
@@ -432,6 +433,9 @@ pub enum Outcome {
     },
     /// `vm currentMessageLoop`.
     CurrentMessageLoop,
+    /// `vm spawn:`: the interpreter creates the actor and applies the mixin
+    /// in its heap.
+    Spawn(Value),
     /// `vm resolvePromise:with:` and `vm breakPromise:with:`: the
     /// interpreter settles the record and notifies its waiters.
     Settle {
@@ -1630,6 +1634,7 @@ pub fn invoke(
             Outcome::Answer(ctx.heap.clone_graph(arg(0), space))
         }
         Native::VmNewActor => Outcome::NewActor,
+        Native::VmSpawn => Outcome::Spawn(arg(0)),
         Native::VmFarReferenceTo => {
             let Some(Body::FarRef { actor, .. }) = ctx.heap.get(arg(0)).map(|o| &o.body) else {
                 return Outcome::Fail(Reason::WrongKind(1));

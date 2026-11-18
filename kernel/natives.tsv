@@ -119,6 +119,7 @@ VMMirror	instance	farReference:to:	VmFarReferenceTo	128
 VMMirror	instance	post:to:	VmPost	129
 VMMirror	instance	isFarReference:	VmIsFarReference	130
 VMMirror	instance	currentMessageLoop	VmCurrentMessageLoop	131
+VMMirror	instance	spawn:	VmSpawn	139
 VMMirror	instance	currentActivation	CurrentActivation	100
 VMMirror	instance	definingActivationOf:	DefiningActivationOf	110
 VMMirror	instance	print:	VmPrint	20
