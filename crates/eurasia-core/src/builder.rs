@@ -223,6 +223,14 @@ impl ImageBuilder {
         v
     }
 
+    /// Declares `count` slots in `class`'s mixin.
+    pub fn set_slot_count(&mut self, class: Value, count: u32) {
+        let mixin = self.mixin_of(class);
+        if let Some(Body::Mixin(m)) = self.heap.get_mut(mixin).map(|o| &mut o.body) {
+            m.slot_count = count;
+        }
+    }
+
     /// The mixin of `class`.
     pub fn mixin_of(&self, class: Value) -> Value {
         self.heap.behavior(class).expect("class").mixin

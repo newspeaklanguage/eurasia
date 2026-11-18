@@ -118,7 +118,7 @@ get kinds when M7 defines how a paused actor is saved.
 | argument count | `uv` | |
 | local count | `uv` | |
 | native id | `uv` | Kind 1 only: the catalog entry, valid for this kernel version |
-| slot index | `uv` | Kinds 2 and 3 only |
+| slot index | `uv` | Kinds 2 and 3 only: the index among the slot declarations of the method's **own mixin**, from 0. The VM adds the number of slots of the superclasses of that mixin's application in the receiver's class, so one method serves every application (the application-qualified slots `(C, j)` of the formal semantics). |
 
 A native method has bytecode length 0.
 

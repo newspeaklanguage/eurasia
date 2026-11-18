@@ -260,6 +260,48 @@ impl Vm {
         }
     }
 
+    /// The number of slots an instance of `class` has: the slot declarations
+    /// of every mixin application in its chain.
+    fn instance_slot_count(&self, class: Value) -> Result<usize, VmError> {
+        let mut total = 0usize;
+        let mut c = Some(class);
+        let mut guard = 0usize;
+        while let Some(k) = c {
+            guard += 1;
+            if guard > MAX_FRAMES {
+                return Err(VmError::Malformed("cyclic superclass chain"));
+            }
+            let b = self
+                .heap
+                .behavior(k)
+                .ok_or(VmError::Malformed("class expected"))?;
+            let mixin = self
+                .heap
+                .mixin(b.mixin)
+                .ok_or(VmError::Malformed("mixin expected"))?;
+            total += mixin.slot_count as usize;
+            c = self.superclass(k)?;
+        }
+        Ok(total)
+    }
+
+    /// The absolute index of slot `relative` of `method`'s mixin in
+    /// `receiver`: the slots of the application's superclasses come first
+    /// (the application-qualified slot `(C, j)` of the formal semantics).
+    fn slot_index(&self, method: Value, receiver: Value, relative: u32) -> Result<usize, VmError> {
+        let mixin = self
+            .heap
+            .method(method)
+            .ok_or(VmError::Malformed("method expected"))?
+            .mixin;
+        let application = self.find_application_of(mixin, self.class_of(receiver))?;
+        let above = match self.superclass(application)? {
+            Some(s) => self.instance_slot_count(s)?,
+            None => 0,
+        };
+        Ok(above + relative as usize)
+    }
+
     fn selector_bytes(&self, selector: Value) -> Result<Vec<u8>, VmError> {
         self.heap
             .string_bytes(selector)
@@ -411,8 +453,9 @@ impl Vm {
             }
             MethodKind::Getter => {
                 let receiver = self.stack[base];
+                let index = self.slot_index(method, receiver, header.slot)?;
                 let value = match self.heap.get(receiver).map(|o| &o.body) {
-                    Some(Body::Regular(slots)) => slots.get(header.slot as usize).copied(),
+                    Some(Body::Regular(slots)) => slots.get(index).copied(),
                     _ => None,
                 }
                 .ok_or(VmError::Malformed("getter on an object without that slot"))?;
@@ -423,9 +466,10 @@ impl Vm {
             MethodKind::Setter => {
                 let receiver = self.stack[base];
                 let value = self.stack[base + 1];
+                let index = self.slot_index(method, receiver, header.slot)?;
                 match self.heap.get_mut(receiver).map(|o| &mut o.body) {
-                    Some(Body::Regular(slots)) if (header.slot as usize) < slots.len() => {
-                        slots[header.slot as usize] = value;
+                    Some(Body::Regular(slots)) if index < slots.len() => {
+                        slots[index] = value;
                     }
                     _ => return Err(VmError::Malformed("setter on an object without that slot")),
                 }

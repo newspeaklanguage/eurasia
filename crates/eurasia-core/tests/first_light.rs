@@ -361,3 +361,60 @@ fn identity_hash_is_the_allocation_sequence_number() {
     assert_eq!(seqs.len(), heap.len());
     let _ = Value::small_integer(0);
 }
+
+#[test]
+fn accessor_slots_are_relative_to_their_mixin() {
+    // A declares one slot; B (a subclass) declares one. B's getter for its
+    // slot 0 reads absolute slot 1 of a B instance.
+    let mut k = kernel();
+    let object = k.b.object;
+    let a = k.b.define_class("A", object);
+    k.b.set_slot_count(a, 1);
+    k.b.method(a, "first", Access::Public, MethodSpec::Getter(0));
+    let b = k.b.define_class("B", a);
+    k.b.set_slot_count(b, 1);
+    k.b.method(b, "second", Access::Public, MethodSpec::Getter(0));
+    k.b.method(b, "second:", Access::Public, MethodSpec::Setter(0));
+    let ten = Value::small_integer(10).unwrap();
+    let twenty = Value::small_integer(20).unwrap();
+    let instance =
+        k.b.heap
+            .allocate(b, Space::Actor(0), Body::Regular(vec![ten, twenty]));
+    // main: vm print: (instance second: (instance first + instance second)) second asString
+    let mut m = Assembler::new();
+    m.push_parameter(VM)
+        .push_literal(4) // instance
+        .push_literal(4)
+        .send(SendKind::Ordinary, 1, 0) // first
+        .push_literal(4)
+        .send(SendKind::Ordinary, 2, 0) // second
+        .common_send(0) // +
+        .send(SendKind::Ordinary, 3, 1) // second:
+        .send(SendKind::Ordinary, 2, 0) // second
+        .send(SendKind::Ordinary, 5, 0) // asString
+        .send(SendKind::Ordinary, 0, 1) // print:
+        .byte(op::RETURN_NIL);
+    let mut lits: Vec<Value> = ["print:", "first", "second", "second:"]
+        .iter()
+        .map(|s| k.b.string(s))
+        .collect();
+    lits.push(instance);
+    lits.push(k.b.string("asString"));
+    k.b.method(
+        k.entry_class,
+        "main:args:",
+        Access::Public,
+        MethodSpec::Bytecode {
+            args: 2,
+            locals: 0,
+            code: m.finish(),
+            literals: lits,
+        },
+    );
+    let (heap, roles) = k.b.finish();
+    let mut vm = Vm::new(heap, roles);
+    let mut host = TestHost::default();
+    let result = vm.run(&mut host, &[]);
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(host.printed, ["30"]);
+}

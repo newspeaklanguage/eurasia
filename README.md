@@ -53,6 +53,14 @@ cargo run -p eurasia-native --example write_first_light -- first-light.eus
 cargo run -p eurasia-native -- first-light.eus      # prints 7
 ```
 
+**M1b (first light from source) done.** `EurasiaPackager.ns` (in the
+newspeak repository) runs on psoup, compiles a module with the V5 compiler,
+and writes a snapshot; Eurasia runs it. `scripts/first-light-from-source.sh`
+does the whole round trip with `EurasiaFirstLight.ns` and checks the output.
+M1b builds classes statically from the module's nested classes and does not
+run the module's initializer; how a module-structured kernel is instantiated
+on Eurasia is still open.
+
 Not yet (M2): closures, non-local return, `ensure:`/`on:do:`,
 `nonBooleanReceiver:`, LargeIntegers and the rest of the native catalog, and
 stack exhaustion as a failure rather than a VM error. M1b is the packager
