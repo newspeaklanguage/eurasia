@@ -66,5 +66,18 @@ if ! cmp -s "$OUT/js/failing.txt" "$OUT/js/expected.txt"; then
   echo "JS tests not succeeding, against those expected:"; diff "$OUT/js/failing.txt" "$OUT/js/expected.txt" || true; exit 1
 fi
 
+echo "== CounterApp: packaged with Hopscotch, genesis on the command line"
+# Hopscotch needs a DOM, so CounterApp runs only in a browser: open
+# index.html?snapshot=counter/base.eus from a server for target/web.
+COUNTERMODULES="$P/Kernel.ns $P/CollectionsForPrimordialSoup.ns $NEWSPEAK/EurasiaActors.ns $NEWSPEAK/EurasiaRuntime.ns $NEWSPEAK/Ducts.ns $NEWSPEAK/GraphicsForHTML5.ns $NEWSPEAK/FontsForHTML5.ns $NEWSPEAK/TextModule.ns $NEWSPEAK/HopscotchForHTML5.ns $NEWSPEAK/VoiceController.ns $NEWSPEAK/AIAccess.ns $NEWSPEAK/EurasiaWebRuntime.ns $NEWSPEAK/CounterUI.ns"
+mkdir -p "$OUT/counter"
+# shellcheck disable=SC2086
+"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel \
+  "$NEWSPEAK/EurasiaKernel.ns" kernel/natives.tsv "$NEWSPEAK/EurasiaCounterApp.ns" \
+  $COUNTERMODULES "$OUT/counter/genesis.eus" > "$OUT/counter/package.log"
+(cd "$OUT/counter" && "$EURASIA/target/release/eurasia" genesis.eus base.eus)
+ls -l "$OUT/counter/base.eus"
+cp "$NEWSPEAK"/*.png "$OUT/"
+
 cp web/index.html web/eurasia.mjs "$WASM" target/genesis/base.eus "$OUT/"
-echo "Web host: wasm32 output matches native. For a browser, serve $OUT and open index.html."
+echo "Web host: wasm32 output matches native. For a browser, serve $OUT and open index.html (?snapshot=counter/base.eus for CounterApp)."
