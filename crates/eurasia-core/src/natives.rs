@@ -1528,7 +1528,7 @@ pub fn invoke(
                             native: 0,
                             slot: 0,
                         },
-                        bytecode: Vec::new(),
+                        bytecode: alloc::rc::Rc::from([]),
                         literals: nil,
                         mixin: nil,
                         selector: nil,
@@ -2129,7 +2129,7 @@ pub fn invoke(
             let Some(Body::Method(m)) = ctx.heap.get(receiver).map(|o| &o.body) else {
                 return Outcome::Fail(Reason::WrongKind(0));
             };
-            let bytes = m.bytecode.clone();
+            let bytes = m.bytecode.to_vec();
             let class = ctx.roles.get(Role::ByteArrayClass);
             let space = ctx.space;
             Outcome::Answer(ctx.heap.allocate(class, space, Body::Bytes(bytes)))
@@ -2144,7 +2144,7 @@ pub fn invoke(
             }
             match unfrozen_method(ctx, receiver) {
                 Some(m) => {
-                    m.bytecode = bytes;
+                    m.bytecode = bytes.into();
                     Outcome::Answer(receiver)
                 }
                 None => Outcome::Fail(Reason::WrongKind(0)),

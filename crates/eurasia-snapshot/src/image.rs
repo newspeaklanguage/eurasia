@@ -788,7 +788,7 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
                 _ => (0, 0),
             };
             let n = len(r)?;
-            let bytecode = r.bytes(n)?.to_vec();
+            let bytecode: alloc::rc::Rc<[u8]> = r.bytes(n)?.into();
             let consistent = match kind {
                 MethodKind::Ordinary => !bytecode.is_empty(),
                 MethodKind::Getter => bytecode.is_empty() && arg_count == 0,

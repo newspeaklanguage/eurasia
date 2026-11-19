@@ -21,3 +21,10 @@ eurasia-snapshot = { path = "crates/eurasia-snapshot" }
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
+
+# Interpreter speed (EURASIA_PERFORMANCE_2026-11-19.md): whole-program
+# optimization across the crates.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

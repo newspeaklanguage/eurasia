@@ -10,6 +10,7 @@
 //! messages have the contract layouts of the implementation plan; everything
 //! the VM derives from them is computed, never stored in these records.
 
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use crate::value::Value;
@@ -106,7 +107,7 @@ pub struct Method {
     /// The header.
     pub header: MethodHeader,
     /// V5 bytecode; empty for every kind but ordinary.
-    pub bytecode: Vec<u8>,
+    pub bytecode: Rc<[u8]>,
     /// The literal Array.
     pub literals: Value,
     /// The defining mixin.

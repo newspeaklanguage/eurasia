@@ -311,7 +311,7 @@ impl ImageBuilder {
                     native,
                     slot,
                 },
-                bytecode: code,
+                bytecode: code.into(),
                 literals,
                 mixin,
                 selector: selector_string,

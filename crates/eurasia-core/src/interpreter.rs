@@ -17,7 +17,13 @@
 //! arrays. Closures, non-local return, eventual sends and
 //! `nonBooleanReceiver:` arrive in M2 and are reported as unimplemented.
 
+// Errors are built lazily (`ok_or_else`) on the hot paths: building one
+// eagerly and dropping it cost about a fifth of the run time
+// (EURASIA_PERFORMANCE_2026-11-19.md).
+#![allow(clippy::unnecessary_lazy_evaluations)]
+
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
@@ -129,6 +135,10 @@ struct Frame {
     /// A number unique to this frame for the life of the VM.
     serial: u64,
     method: Value,
+    /// The method's bytecode, so that an instruction fetch does not look
+    /// the method up. A method's bytecode can change only while it is
+    /// unfrozen (`Method>>bytecode:`); a frame keeps the code it began with.
+    code: Rc<[u8]>,
     receiver: Value,
     /// Index of the message receiver; the arguments follow it.
     bp: usize,
@@ -145,6 +155,79 @@ struct Frame {
 enum Step {
     Continue,
     Done(Completion),
+}
+
+/// How a send looks its method up: the key of the lookup cache besides the
+/// receiver's class and the selector (and, for every rule but `Ordinary`,
+/// the sending method's mixin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rule {
+    Ordinary,
+    SelfSend,
+    Super,
+    ImplicitReceiver,
+    /// An outer send this many levels out.
+    Outer(usize),
+}
+
+impl Rule {
+    fn code(self) -> u64 {
+        match self {
+            Rule::Ordinary => 0,
+            Rule::SelfSend => 1,
+            Rule::Super => 2,
+            Rule::ImplicitReceiver => 3,
+            Rule::Outer(depth) => 4 + depth as u64,
+        }
+    }
+}
+
+/// Where a send's receiver comes from, once its method is found.
+#[derive(Clone, Copy, Debug)]
+enum TargetReceiver {
+    /// Already on the stack, below the arguments (an ordinary send).
+    Present,
+    /// The sending frame's receiver, inserted below the arguments.
+    Frame,
+    /// An enclosing object, inserted below the arguments; it depends only on
+    /// the receiver's class and the sending mixin, so it can be cached.
+    Fixed(Value),
+}
+
+/// What a send runs: the method, its receiver and, for an accessor, the
+/// absolute index of its slot in that receiver.
+#[derive(Clone, Copy, Debug)]
+struct Target {
+    method: Value,
+    receiver: TargetReceiver,
+    slot: Option<usize>,
+}
+
+/// An entry of the lookup cache: a send's key and what it runs. Only sends
+/// that find a method are cached; a #doesNotUnderstand: takes the full
+/// lookup every time.
+#[derive(Clone, Copy, Debug)]
+struct CacheEntry {
+    class: Value,
+    selector: Value,
+    mixin: Value,
+    rule: Rule,
+    target: Target,
+}
+
+/// The common selectors (0 to 13: `+` to `=`) with SmallInteger fast paths.
+const SMALL_INTEGER_FAST_PATHS: usize = 14;
+
+/// The lookup cache's size, a power of two. It is direct-mapped.
+const LOOKUP_CACHE_SIZE: usize = 4096;
+
+/// The lookup cache slot of a key.
+fn cache_index(class: Value, selector: Value, mixin: Value, rule: Rule) -> usize {
+    let h =
+        (class.to_bits() ^ selector.to_bits().rotate_left(21) ^ mixin.to_bits().rotate_left(42))
+            .wrapping_add(rule.code())
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h >> (64 - LOOKUP_CACHE_SIZE.trailing_zeros())) as usize
 }
 
 /// A VM: a heap, its roles, and the execution state of its one actor (M1).
@@ -200,6 +283,15 @@ pub struct Vm {
     /// Restored into a new host: the next [`Vm::continue_run`] begins a new
     /// incarnation.
     incarnation_pending: bool,
+    /// The global lookup cache. It holds references, so it is cleared
+    /// whenever objects move or are forwarded (a collection, a commit) and
+    /// whenever a method or mixin is written; like psoup's, it is not
+    /// cleared when an element of a mixin's (unfrozen) method array is.
+    lookup_cache: Vec<Option<CacheEntry>>,
+    /// For each arithmetic or comparison common selector (0 to 13), whether
+    /// SmallInteger's method for it is the native the fast path computes:
+    /// 0 not yet known, 1 yes, 2 no. Cleared with the lookup cache.
+    small_integer_fast: [u8; SMALL_INTEGER_FAST_PATHS],
 }
 
 /// A VM actor: its message loop (in its platform), its mailbox of packets
@@ -261,7 +353,126 @@ impl Vm {
             save_pending: None,
             interrupt_countdown: INTERRUPT_INTERVAL,
             incarnation_pending: false,
+            lookup_cache: alloc::vec![None; LOOKUP_CACHE_SIZE],
+            small_integer_fast: [0; SMALL_INTEGER_FAST_PATHS],
         }
+    }
+
+    fn flush_lookup_cache(&mut self) {
+        self.lookup_cache.fill(None);
+        self.small_integer_fast = [0; SMALL_INTEGER_FAST_PATHS];
+    }
+
+    /// Common send `k` (0 to 13) to two SmallIntegers, computed without a
+    /// send when SmallInteger's method for it is the expected native and
+    /// that native would answer: `None` otherwise (overflow, a zero
+    /// divisor, a shift out of range), and the send happens as usual.
+    fn small_integer_fast_path(&mut self, k: usize) -> Option<Value> {
+        let len = self.stack.len();
+        if k >= SMALL_INTEGER_FAST_PATHS || len < self.frames.last()?.lp + 2 {
+            return None;
+        }
+        let a = self.stack[len - 2].as_small_integer()?;
+        let b = self.stack[len - 1].as_small_integer()?;
+        if self.small_integer_fast[k] == 0 {
+            self.small_integer_fast[k] = if self.small_integer_native_is(k) {
+                1
+            } else {
+                2
+            };
+        }
+        if self.small_integer_fast[k] != 1 {
+            return None;
+        }
+        let boolean =
+            |vm: &Vm, t: bool| Some(vm.roles.get(if t { Role::True } else { Role::False }));
+        let n = match k {
+            0 => a.checked_add(b)?,
+            1 => a.checked_sub(b)?,
+            2 => a.checked_mul(b)?,
+            3 => {
+                if b == 0 {
+                    return None;
+                }
+                let q = a.checked_div(b)?;
+                if a % b != 0 && ((a < 0) != (b < 0)) {
+                    q - 1
+                } else {
+                    q
+                }
+            }
+            4 => {
+                if b == 0 {
+                    return None;
+                }
+                let r = a.checked_rem(b)?;
+                if r != 0 && ((r < 0) != (b < 0)) {
+                    r + b
+                } else {
+                    r
+                }
+            }
+            5 => {
+                if !(0..=62).contains(&b) {
+                    return None;
+                }
+                let r = a << b;
+                if r >> b != a {
+                    return None;
+                }
+                r
+            }
+            6 => {
+                if a < 0 || !(0..=63).contains(&b) {
+                    return None;
+                }
+                a >> b
+            }
+            7 => a & b,
+            8 => a | b,
+            9 => return boolean(self, a < b),
+            10 => return boolean(self, a > b),
+            11 => return boolean(self, a <= b),
+            12 => return boolean(self, a >= b),
+            _ => return boolean(self, a == b),
+        };
+        Value::small_integer(n)
+    }
+
+    /// Whether SmallInteger's method for common selector `k` is the native
+    /// [`Vm::small_integer_fast_path`] computes.
+    fn small_integer_native_is(&self, k: usize) -> bool {
+        let expected = [
+            Native::IntegerAdd,
+            Native::IntegerSubtract,
+            Native::IntegerMultiply,
+            Native::NumberFloorDivide,
+            Native::NumberFloorModulo,
+            Native::IntegerShiftLeft,
+            Native::IntegerShiftRight,
+            Native::IntegerBitAnd,
+            Native::IntegerBitOr,
+            Native::IntegerLess,
+            Native::IntegerGreater,
+            Native::IntegerLessEqual,
+            Native::IntegerGreaterEqual,
+            Native::NumberEqual,
+        ][k];
+        let table = self.roles.get(Role::CommonSelectors);
+        let Some(&selector) = self.heap.array_elements(table).and_then(|e| e.get(2 * k)) else {
+            return false;
+        };
+        let class = self.roles.get(Role::SmallIntegerClass);
+        let Some(sel) = self.heap.string_bytes(selector) else {
+            return false;
+        };
+        let Ok(Some(m)) = self.lookup_ordinary(class, sel) else {
+            return false;
+        };
+        self.heap.method(m).is_some_and(|m| {
+            m.header.kind == MethodKind::Native
+                && Native::from_id(m.header.native) == Some(expected)
+        })
     }
 
     /// Stress mode: with `Some(n)`, collect at the first safepoint after
@@ -291,6 +502,7 @@ impl Vm {
         let roots = self.roots();
         let nil = self.roles.get(Role::Nil);
         let (fwd, statistics) = self.heap.collect(&roots, nil);
+        self.flush_lookup_cache();
         for e in &mut self.expats {
             e.0 = fwd.forward(e.0);
         }
@@ -428,6 +640,10 @@ impl Vm {
             .map(|fr| Frame {
                 serial: fr.serial,
                 method: fr.method,
+                code: vm
+                    .heap
+                    .method(fr.method)
+                    .map_or_else(|| Rc::from([]), |m| m.bytecode.clone()),
                 receiver: fr.receiver,
                 bp: fr.bp as usize,
                 arg_count: fr.arg_count as usize,
@@ -763,7 +979,10 @@ impl Vm {
                         return Err(VmError::Malformed("a turn returned without finish:"));
                     }
                     None => {
-                        let result = self.stack.pop().ok_or(VmError::Malformed("empty stack"))?;
+                        let result = self
+                            .stack
+                            .pop()
+                            .ok_or_else(|| VmError::Malformed("empty stack"))?;
                         return Ok(Completion::Returned(result));
                     }
                 }
@@ -821,7 +1040,7 @@ impl Vm {
         let b = self
             .heap
             .behavior(class)
-            .ok_or(VmError::Malformed("class expected"))?;
+            .ok_or_else(|| VmError::Malformed("class expected"))?;
         Ok(if b.superclass == self.nil() {
             None
         } else {
@@ -834,20 +1053,20 @@ impl Vm {
         let b = self
             .heap
             .behavior(class)
-            .ok_or(VmError::Malformed("class expected"))?;
+            .ok_or_else(|| VmError::Malformed("class expected"))?;
         let mixin = self
             .heap
             .mixin(b.mixin)
-            .ok_or(VmError::Malformed("mixin expected"))?;
+            .ok_or_else(|| VmError::Malformed("mixin expected"))?;
         let methods = self
             .heap
             .array_elements(mixin.methods)
-            .ok_or(VmError::Malformed("method array expected"))?;
+            .ok_or_else(|| VmError::Malformed("method array expected"))?;
         for &m in methods {
             let method = self
                 .heap
                 .method(m)
-                .ok_or(VmError::Malformed("method expected"))?;
+                .ok_or_else(|| VmError::Malformed("method expected"))?;
             if self.heap.string_bytes(method.selector) == Some(selector) {
                 return Ok(Some(m));
             }
@@ -864,13 +1083,13 @@ impl Vm {
             let b = self
                 .heap
                 .behavior(class)
-                .ok_or(VmError::MixinApplicationNotFound)?;
+                .ok_or_else(|| VmError::MixinApplicationNotFound)?;
             if b.mixin == mixin {
                 return Ok(class);
             }
             class = self
                 .superclass(class)?
-                .ok_or(VmError::MixinApplicationNotFound)?;
+                .ok_or_else(|| VmError::MixinApplicationNotFound)?;
         }
     }
 
@@ -888,11 +1107,11 @@ impl Vm {
             let b = self
                 .heap
                 .behavior(k)
-                .ok_or(VmError::Malformed("class expected"))?;
+                .ok_or_else(|| VmError::Malformed("class expected"))?;
             let mixin = self
                 .heap
                 .mixin(b.mixin)
-                .ok_or(VmError::Malformed("mixin expected"))?;
+                .ok_or_else(|| VmError::Malformed("mixin expected"))?;
             total += mixin.slot_count as usize;
             c = self.superclass(k)?;
         }
@@ -906,7 +1125,7 @@ impl Vm {
         let mixin = self
             .heap
             .method(method)
-            .ok_or(VmError::Malformed("method expected"))?
+            .ok_or_else(|| VmError::Malformed("method expected"))?
             .mixin;
         let application = self.find_application_of(mixin, self.class_of(receiver))?;
         let above = match self.superclass(application)? {
@@ -920,7 +1139,7 @@ impl Vm {
         self.heap
             .string_bytes(selector)
             .map(<[u8]>::to_vec)
-            .ok_or(VmError::Malformed("selector must be a String"))
+            .ok_or_else(|| VmError::Malformed("selector must be a String"))
     }
 
     // ----- Sends -----
@@ -933,6 +1152,306 @@ impl Vm {
         host: &mut dyn Host,
     ) -> Result<Option<Completion>, VmError> {
         let receiver = self.stack[self.stack.len() - 1 - n];
+        let nil = self.nil();
+        self.send(Rule::Ordinary, selector, n, receiver, nil, host)
+    }
+
+    /// A send through the lookup cache. For an ordinary send `receiver` is
+    /// the one on the stack and `mixin` is unused; for the others they are
+    /// the sending frame's receiver and its method's mixin.
+    fn send(
+        &mut self,
+        rule: Rule,
+        selector: Value,
+        n: usize,
+        receiver: Value,
+        mixin: Value,
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
+        let class = self.class_of(receiver);
+        let i = cache_index(class, selector, mixin, rule);
+        let target = match self.lookup_cache[i] {
+            Some(e)
+                if e.class == class
+                    && e.selector == selector
+                    && e.mixin == mixin
+                    && e.rule == rule =>
+            {
+                e.target
+            }
+            _ => match self.resolve(rule, selector, receiver, class, mixin)? {
+                Some(target) => {
+                    self.lookup_cache[i] = Some(CacheEntry {
+                        class,
+                        selector,
+                        mixin,
+                        rule,
+                        target,
+                    });
+                    target
+                }
+                // Not found: the full lookup, which sends #doesNotUnderstand:.
+                None => return self.uncached_send(rule, selector, n, receiver, mixin, host),
+            },
+        };
+        match target.receiver {
+            TargetReceiver::Present => {}
+            TargetReceiver::Frame => self.insert_receiver(receiver, n),
+            TargetReceiver::Fixed(r) => self.insert_receiver(r, n),
+        }
+        self.activate_at(target.method, n, host, target.slot)
+    }
+
+    /// What a send runs, as [`Vm::uncached_send`] finds it, or `None` when
+    /// that would be a #doesNotUnderstand:.
+    fn resolve(
+        &self,
+        rule: Rule,
+        selector: Value,
+        receiver: Value,
+        class: Value,
+        mixin: Value,
+    ) -> Result<Option<Target>, VmError> {
+        let sel = self
+            .heap
+            .string_bytes(selector)
+            .ok_or_else(|| VmError::Malformed("selector must be a String"))?;
+        let found = match rule {
+            Rule::Ordinary => self
+                .lookup_ordinary(class, sel)?
+                .map(|m| (m, TargetReceiver::Present, receiver)),
+            Rule::SelfSend => self
+                .lookup_lexical(class, mixin, sel)?
+                .map(|m| (m, TargetReceiver::Frame, receiver)),
+            Rule::Super => {
+                let application = self.find_application_of(mixin, class)?;
+                match self.superclass(application)? {
+                    Some(start) => self
+                        .lookup_protected(start, sel)?
+                        .map(|m| (m, TargetReceiver::Frame, receiver)),
+                    None => None,
+                }
+            }
+            Rule::ImplicitReceiver => {
+                let mut candidate_receiver = receiver;
+                let mut candidate_mixin = mixin;
+                let mut depth = 0usize;
+                let mut found = None;
+                loop {
+                    let candidate_class = self.class_of(candidate_receiver);
+                    let application = self.find_application_of(candidate_mixin, candidate_class)?;
+                    if self.method_at(application, sel)?.is_some() {
+                        let how = if depth == 0 {
+                            TargetReceiver::Frame
+                        } else {
+                            TargetReceiver::Fixed(candidate_receiver)
+                        };
+                        found = Some(
+                            self.lookup_lexical(candidate_class, candidate_mixin, sel)?
+                                .map(|m| (m, how, candidate_receiver)),
+                        );
+                        break;
+                    }
+                    let enclosing = self
+                        .heap
+                        .mixin(candidate_mixin)
+                        .ok_or_else(|| VmError::Malformed("mixin expected"))?
+                        .enclosing_mixin;
+                    if enclosing == self.nil() {
+                        break;
+                    }
+                    candidate_mixin = enclosing;
+                    candidate_receiver = self
+                        .heap
+                        .behavior(application)
+                        .expect("class")
+                        .enclosing_object;
+                    depth += 1;
+                }
+                match found {
+                    Some(f) => f,
+                    None => self
+                        .lookup_protected(class, sel)?
+                        .map(|m| (m, TargetReceiver::Frame, receiver)),
+                }
+            }
+            Rule::Outer(depth) => {
+                let (r, m) = self.enclosing_at(receiver, mixin, depth)?;
+                let how = if depth == 0 {
+                    TargetReceiver::Frame
+                } else {
+                    TargetReceiver::Fixed(r)
+                };
+                self.lookup_lexical(self.class_of(r), m, sel)?
+                    .map(|method| (method, how, r))
+            }
+        };
+        let Some((method, how, target_receiver)) = found else {
+            return Ok(None);
+        };
+        let header = &self
+            .heap
+            .method(method)
+            .ok_or_else(|| VmError::Malformed("method expected"))?
+            .header;
+        // An accessor's slot index, if it has one; if not, activation
+        // reports the error.
+        let slot = match header.kind {
+            MethodKind::Getter | MethodKind::Setter => {
+                self.slot_index(method, target_receiver, header.slot).ok()
+            }
+            _ => None,
+        };
+        Ok(Some(Target {
+            method,
+            receiver: how,
+            slot,
+        }))
+    }
+
+    /// The method an ordinary send of `sel` to an instance of `class` runs:
+    /// the first public one up the chain. A protected one, or none, is a
+    /// #doesNotUnderstand:; a private one is passed over.
+    fn lookup_ordinary(&self, class: Value, sel: &[u8]) -> Result<Option<Value>, VmError> {
+        let mut c = Some(class);
+        while let Some(k) = c {
+            if let Some(m) = self.method_at(k, sel)? {
+                match self.access(m) {
+                    Access::Public => return Ok(Some(m)),
+                    Access::Protected => return Ok(None),
+                    Access::Private => {}
+                }
+            }
+            c = self.superclass(k)?;
+        }
+        Ok(None)
+    }
+
+    /// The first method `sel` that is not private, from `start` up.
+    fn lookup_protected(&self, start: Value, sel: &[u8]) -> Result<Option<Value>, VmError> {
+        let mut c = Some(start);
+        while let Some(k) = c {
+            if let Some(m) = self.method_at(k, sel)?
+                && self.access(m) != Access::Private
+            {
+                return Ok(Some(m));
+            }
+            c = self.superclass(k)?;
+        }
+        Ok(None)
+    }
+
+    /// A lexical send's method: the private `sel` of `mixin`'s application
+    /// in `class`, or else the protected lookup from `class`.
+    fn lookup_lexical(
+        &self,
+        class: Value,
+        mixin: Value,
+        sel: &[u8],
+    ) -> Result<Option<Value>, VmError> {
+        let application = self.find_application_of(mixin, class)?;
+        if let Some(m) = self.method_at(application, sel)?
+            && self.access(m) == Access::Private
+        {
+            return Ok(Some(m));
+        }
+        self.lookup_protected(class, sel)
+    }
+
+    /// The object and mixin `depth` levels out from `receiver` in `mixin`.
+    fn enclosing_at(
+        &self,
+        mut receiver: Value,
+        mut mixin: Value,
+        depth: usize,
+    ) -> Result<(Value, Value), VmError> {
+        for _ in 0..depth {
+            let application = self.find_application_of(mixin, self.class_of(receiver))?;
+            receiver = self
+                .heap
+                .behavior(application)
+                .expect("class")
+                .enclosing_object;
+            mixin = self
+                .heap
+                .mixin(mixin)
+                .ok_or_else(|| VmError::Malformed("mixin expected"))?
+                .enclosing_mixin;
+        }
+        Ok((receiver, mixin))
+    }
+
+    /// A send by the full lookup: every rule, #doesNotUnderstand: included.
+    fn uncached_send(
+        &mut self,
+        rule: Rule,
+        selector: Value,
+        n: usize,
+        receiver: Value,
+        mixin: Value,
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
+        match rule {
+            Rule::Ordinary => self.ordinary_send_uncached(selector, n, receiver, host),
+            Rule::SelfSend => self.lexical_send(selector, n, receiver, mixin, host),
+            Rule::Super => {
+                let class = self.class_of(receiver);
+                let application = self.find_application_of(mixin, class)?;
+                match self.superclass(application)? {
+                    Some(start) => self.protected_send(selector, n, receiver, start, host),
+                    None => {
+                        self.does_not_understand(selector, n, receiver, application, false, host)
+                    }
+                }
+            }
+            Rule::ImplicitReceiver => {
+                let sel = self.selector_bytes(selector)?;
+                let mut candidate_receiver = receiver;
+                let mut candidate_mixin = mixin;
+                loop {
+                    let application = self
+                        .find_application_of(candidate_mixin, self.class_of(candidate_receiver))?;
+                    if self.method_at(application, &sel)?.is_some() {
+                        return self.lexical_send(
+                            selector,
+                            n,
+                            candidate_receiver,
+                            candidate_mixin,
+                            host,
+                        );
+                    }
+                    let enclosing = self
+                        .heap
+                        .mixin(candidate_mixin)
+                        .ok_or_else(|| VmError::Malformed("mixin expected"))?
+                        .enclosing_mixin;
+                    if enclosing == self.nil() {
+                        break;
+                    }
+                    candidate_mixin = enclosing;
+                    candidate_receiver = self
+                        .heap
+                        .behavior(application)
+                        .expect("class")
+                        .enclosing_object;
+                }
+                let class = self.class_of(receiver);
+                self.protected_send(selector, n, receiver, class, host)
+            }
+            Rule::Outer(depth) => {
+                let (r, m) = self.enclosing_at(receiver, mixin, depth)?;
+                self.lexical_send(selector, n, r, m, host)
+            }
+        }
+    }
+
+    fn ordinary_send_uncached(
+        &mut self,
+        selector: Value,
+        n: usize,
+        receiver: Value,
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
         let receiver_class = self.class_of(receiver);
         let sel = self.selector_bytes(selector)?;
         let mut class = Some(receiver_class);
@@ -960,8 +1479,13 @@ impl Vm {
 
     /// Inserts an absent receiver below the top `n` arguments.
     fn insert_receiver(&mut self, receiver: Value, n: usize) {
-        let at = self.stack.len() - n;
-        self.stack.insert(at, receiver);
+        // By hand: `Vec::insert` is a call to memmove, and `n` is small.
+        self.stack.push(receiver);
+        let top = self.stack.len() - 1;
+        for i in (top - n..top).rev() {
+            self.stack[i + 1] = self.stack[i];
+        }
+        self.stack[top - n] = receiver;
     }
 
     fn lexical_send(
@@ -1026,7 +1550,7 @@ impl Vm {
             }
             class = self.superclass(c)?;
         }
-        let method = method.ok_or(VmError::RecursiveDoesNotUnderstand)?;
+        let method = method.ok_or_else(|| VmError::RecursiveDoesNotUnderstand)?;
         let args = self.stack.split_off(self.stack.len() - n);
         let array_class = self.roles.get(Role::ArrayClass);
         let arguments = self.heap.allocate(
@@ -1054,22 +1578,36 @@ impl Vm {
         n: usize,
         host: &mut dyn Host,
     ) -> Result<Option<Completion>, VmError> {
+        self.activate_at(method, n, host, None)
+    }
+
+    /// [`Vm::activate`], given an accessor's slot index if it is known.
+    fn activate_at(
+        &mut self,
+        method: Value,
+        n: usize,
+        host: &mut dyn Host,
+        slot: Option<usize>,
+    ) -> Result<Option<Completion>, VmError> {
         let m = self
             .heap
             .method(method)
-            .ok_or(VmError::Malformed("method expected"))?;
+            .ok_or_else(|| VmError::Malformed("method expected"))?;
         let header = m.header.clone();
         let base = self.stack.len() - 1 - n;
         match header.kind {
             MethodKind::Native => {
                 let native = Native::from_id(header.native)
                     .filter(|nat| nat.arity() == n)
-                    .ok_or(VmError::BadNative(header.native))?;
+                    .ok_or_else(|| VmError::BadNative(header.native))?;
                 self.run_native(native, base, n, host)
             }
             MethodKind::Getter => {
                 let receiver = self.stack[base];
-                let index = self.slot_index(method, receiver, header.slot)?;
+                let index = match slot {
+                    Some(i) => i,
+                    None => self.slot_index(method, receiver, header.slot)?,
+                };
                 // A contract object (class, metaclass, mixin, method) answers
                 // its contract field at that position, as `vm slotOf:at:` does.
                 let value = match self.heap.get(receiver).map(|o| &o.body) {
@@ -1087,7 +1625,10 @@ impl Vm {
             MethodKind::Setter => {
                 let receiver = self.stack[base];
                 let value = self.stack[base + 1];
-                let index = self.slot_index(method, receiver, header.slot)?;
+                let index = match slot {
+                    Some(i) => i,
+                    None => self.slot_index(method, receiver, header.slot)?,
+                };
                 // A frozen object is never written; a value only by its init
                 // setters, and only with values (design doc section 5).
                 let flags = self.heap.get(receiver).map_or(0, |o| o.header.flags);
@@ -1132,9 +1673,11 @@ impl Vm {
                     .extend(core::iter::repeat_n(nil, header.local_count as usize));
                 let serial = self.next_serial;
                 self.next_serial += 1;
+                let code = self.heap.method(method).expect("method").bytecode.clone();
                 self.frames.push(Frame {
                     serial,
                     method,
+                    code,
                     receiver,
                     bp: base,
                     arg_count: n,
@@ -1156,7 +1699,6 @@ impl Vm {
         host: &mut dyn Host,
     ) -> Result<Option<Completion>, VmError> {
         let receiver = self.stack[base];
-        let args: Vec<Value> = self.stack[base + 1..base + 1 + n].to_vec();
         let outcome = {
             let mut ctx = NativeContext {
                 heap: &mut self.heap,
@@ -1164,8 +1706,23 @@ impl Vm {
                 host,
                 space: Space::Actor(self.current as u32),
             };
-            natives::invoke(native, receiver, &args, &mut ctx)
+            natives::invoke(
+                native,
+                receiver,
+                &self.stack[base + 1..base + 1 + n],
+                &mut ctx,
+            )
         };
+        if native == Native::MethodHeaderPut {
+            self.flush_lookup_cache();
+        }
+        // Rule Native-Answer, the common case, without copying the arguments.
+        if let Outcome::Answer(v) = outcome {
+            self.stack.truncate(base);
+            self.stack.push(v);
+            return Ok(None);
+        }
+        let args: Vec<Value> = self.stack[base + 1..base + 1 + n].to_vec();
         self.stack.truncate(base);
         let outcome = match outcome {
             Outcome::Frame(op) => self.frame_native(op, receiver, &args),
@@ -1605,20 +2162,20 @@ impl Vm {
         let c = self
             .heap
             .closure(closure)
-            .ok_or(VmError::Malformed("closure expected"))?
+            .ok_or_else(|| VmError::Malformed("closure expected"))?
             .clone();
         let defining = self
             .heap
             .activation(c.defining)
-            .ok_or(VmError::Malformed("activation expected"))?;
+            .ok_or_else(|| VmError::Malformed("activation expected"))?;
         let (method, receiver) = (defining.method, defining.receiver);
-        let code_len = self
+        let code = self
             .heap
             .method(method)
-            .ok_or(VmError::Malformed("method expected"))?
+            .ok_or_else(|| VmError::Malformed("method expected"))?
             .bytecode
-            .len();
-        if c.initial_ip as usize >= code_len {
+            .clone();
+        if c.initial_ip as usize >= code.len() {
             return Err(VmError::Malformed("closure body outside its method"));
         }
         let base = self.stack.len() - 1 - n;
@@ -1629,6 +2186,7 @@ impl Vm {
         self.frames.push(Frame {
             serial,
             method,
+            code,
             receiver,
             bp: base,
             arg_count: n,
@@ -1832,6 +2390,12 @@ impl Vm {
     /// object's slot, an ephemeron's key, value or finalizer, or an unfrozen
     /// method's or mixin's contract field. Answers whether there was one.
     fn store_slot(&mut self, receiver: Value, index: usize, value: Value) -> bool {
+        if matches!(
+            self.heap.get(receiver).map(|o| &o.body),
+            Some(Body::Method(_) | Body::Mixin(_))
+        ) {
+            self.flush_lookup_cache();
+        }
         match self.heap.get_mut(receiver).map(|o| &mut o.body) {
             Some(Body::Regular(slots)) if index < slots.len() => {
                 slots[index] = value;
@@ -2004,9 +2568,11 @@ impl Vm {
             let bp = self.stack.len();
             self.stack.push(closure.unwrap_or(receiver));
             self.stack.extend(d.temps.iter().copied());
+            let code = self.heap.method(method).expect("checked").bytecode.clone();
             self.frames.push(Frame {
                 serial,
                 method,
+                code,
                 receiver,
                 bp,
                 arg_count: arity,
@@ -2094,6 +2660,9 @@ impl Vm {
                     };
                     natives::invoke(native, receiver, &args, &mut ctx)
                 };
+                if native == Native::MethodHeaderPut {
+                    self.flush_lookup_cache();
+                }
                 let outcome = match outcome {
                     Outcome::Frame(op) => self.frame_native(op, receiver, &args),
                     other => other,
@@ -2501,6 +3070,7 @@ impl Vm {
                 None => v,
             };
             self.heap.forward_identities(&forward);
+            self.flush_lookup_cache();
             for v in &mut self.stack {
                 *v = forward(*v);
             }
@@ -2566,6 +3136,7 @@ impl Vm {
             }
         }
         self.program_version += 1;
+        self.flush_lookup_cache();
         Ok(())
     }
 
@@ -2689,13 +3260,16 @@ impl Vm {
                 return Err(VmError::Malformed("a callback exited"));
             }
         }
-        let answer = self.stack.pop().ok_or(VmError::Malformed("empty stack"))?;
+        let answer = self
+            .stack
+            .pop()
+            .ok_or_else(|| VmError::Malformed("empty stack"))?;
         let pair = self
             .heap
             .array_elements(answer)
             .filter(|e| e.len() == 2)
             .map(<[Value]>::to_vec)
-            .ok_or(VmError::Malformed("the callback boundary answered no pair"))?;
+            .ok_or_else(|| VmError::Malformed("the callback boundary answered no pair"))?;
         Ok((pair[0] == self.roles.get(Role::True), pair[1]))
     }
 
@@ -2720,7 +3294,7 @@ impl Vm {
             }
             class = self.superclass(c)?;
         }
-        let method = method.ok_or(VmError::MissingUpcall(selector.name()))?;
+        let method = method.ok_or_else(|| VmError::MissingUpcall(selector.name()))?;
         self.stack.push(top);
         self.stack.extend(args.iter().copied());
         self.activate(method, args.len(), host)
@@ -2733,20 +3307,20 @@ impl Vm {
         let mut home = self
             .heap
             .closure(closure)
-            .ok_or(VmError::Malformed("closure expected"))?
+            .ok_or_else(|| VmError::Malformed("closure expected"))?
             .defining;
         for _ in 0..MAX_FRAMES {
             let a = self
                 .heap
                 .activation(home)
-                .ok_or(VmError::Malformed("activation expected"))?;
+                .ok_or_else(|| VmError::Malformed("activation expected"))?;
             if a.closure == nil {
                 return Ok(home);
             }
             home = self
                 .heap
                 .closure(a.closure)
-                .ok_or(VmError::Malformed("closure expected"))?
+                .ok_or_else(|| VmError::Malformed("closure expected"))?
                 .defining;
         }
         Err(VmError::Malformed("closure chain too deep"))
@@ -2963,55 +3537,16 @@ impl Vm {
         if available < needed {
             return Err(self.invalid());
         }
-        let mixin = self.heap.method(method).expect("method").mixin;
-        match kind {
-            SendKind::Ordinary => self.ordinary_send(selector, n, host),
-            SendKind::SelfSend => self.lexical_send(selector, n, receiver, mixin, host),
-            SendKind::Super => {
-                let class = self.class_of(receiver);
-                let application = self.find_application_of(mixin, class)?;
-                match self.superclass(application)? {
-                    Some(start) => self.protected_send(selector, n, receiver, start, host),
-                    None => {
-                        self.does_not_understand(selector, n, receiver, application, false, host)
-                    }
-                }
-            }
-            SendKind::ImplicitReceiver => {
-                let sel = self.selector_bytes(selector)?;
-                let mut candidate_receiver = receiver;
-                let mut candidate_mixin = mixin;
-                loop {
-                    let application = self
-                        .find_application_of(candidate_mixin, self.class_of(candidate_receiver))?;
-                    if self.method_at(application, &sel)?.is_some() {
-                        return self.lexical_send(
-                            selector,
-                            n,
-                            candidate_receiver,
-                            candidate_mixin,
-                            host,
-                        );
-                    }
-                    let enclosing = self
-                        .heap
-                        .mixin(candidate_mixin)
-                        .ok_or(VmError::Malformed("mixin expected"))?
-                        .enclosing_mixin;
-                    if enclosing == self.nil() {
-                        break;
-                    }
-                    candidate_mixin = enclosing;
-                    candidate_receiver = self
-                        .heap
-                        .behavior(application)
-                        .expect("class")
-                        .enclosing_object;
-                }
-                let class = self.class_of(receiver);
-                self.protected_send(selector, n, receiver, class, host)
-            }
+        if kind == SendKind::Ordinary {
+            return self.ordinary_send(selector, n, host);
         }
+        let mixin = self.heap.method(method).expect("method").mixin;
+        let rule = match kind {
+            SendKind::SelfSend => Rule::SelfSend,
+            SendKind::Super => Rule::Super,
+            _ => Rule::ImplicitReceiver,
+        };
+        self.send(rule, selector, n, receiver, mixin, host)
     }
 
     fn outer_send(
@@ -3021,28 +3556,15 @@ impl Vm {
         depth: usize,
         host: &mut dyn Host,
     ) -> Result<Option<Completion>, VmError> {
-        let (method, mut receiver) = {
+        let (method, receiver) = {
             let f = self.frames.last().expect("a frame");
             (f.method, f.receiver)
         };
         let selector = self
             .literal(method, selector_index)
             .ok_or_else(|| self.invalid())?;
-        let mut mixin = self.heap.method(method).expect("method").mixin;
-        for _ in 0..depth {
-            let application = self.find_application_of(mixin, self.class_of(receiver))?;
-            receiver = self
-                .heap
-                .behavior(application)
-                .expect("class")
-                .enclosing_object;
-            mixin = self
-                .heap
-                .mixin(mixin)
-                .ok_or(VmError::Malformed("mixin expected"))?
-                .enclosing_mixin;
-        }
-        self.lexical_send(selector, n, receiver, mixin, host)
+        let mixin = self.heap.method(method).expect("method").mixin;
+        self.send(Rule::Outer(depth), selector, n, receiver, mixin, host)
     }
 
     fn enclosing_object(&self, depth: usize) -> Result<Value, VmError> {
@@ -3059,7 +3581,7 @@ impl Vm {
             mixin = self
                 .heap
                 .mixin(mixin)
-                .ok_or(VmError::Malformed("mixin expected"))?
+                .ok_or_else(|| VmError::Malformed("mixin expected"))?
                 .enclosing_mixin;
         }
         Ok(receiver)
@@ -3089,16 +3611,9 @@ impl Vm {
     }
 
     fn step(&mut self, host: &mut dyn Host) -> Result<Step, VmError> {
-        let (method, ip) = {
+        let (method, ip, bytes) = {
             let f = self.frames.last().expect("a frame");
-            (f.method, f.ip)
-        };
-        let bytes: [u8; 4] = {
-            let code = &self
-                .heap
-                .method(method)
-                .ok_or(VmError::Malformed("method expected"))?
-                .bytecode;
+            let (code, ip) = (&f.code, f.ip);
             let Some(&first) = code.get(ip) else {
                 return Err(self.invalid());
             };
@@ -3108,7 +3623,7 @@ impl Vm {
             }
             let mut b = [0u8; 4];
             b[..len].copy_from_slice(&code[ip..ip + len]);
-            b
+            (f.method, ip, b)
         };
         let opcode = bytes[0];
         let next = ip + instruction_length(opcode);
@@ -3228,13 +3743,19 @@ impl Vm {
                 };
                 self.non_local_return(result, host)?
             }
+            176..=207 if let Some(v) = self.small_integer_fast_path((opcode - 176) as usize) => {
+                let len = self.stack.len();
+                self.stack.truncate(len - 2);
+                self.stack.push(v);
+                None
+            }
             176..=207 => {
                 let k = (opcode - 176) as usize;
                 let table = self.roles.get(Role::CommonSelectors);
                 let entries = self
                     .heap
                     .array_elements(table)
-                    .ok_or(VmError::Malformed("common selectors must be an Array"))?;
+                    .ok_or_else(|| VmError::Malformed("common selectors must be an Array"))?;
                 let (Some(&selector), Some(&arity)) = (entries.get(2 * k), entries.get(2 * k + 1))
                 else {
                     return Err(VmError::Malformed("common-selector table too short"));
@@ -3242,7 +3763,7 @@ impl Vm {
                 let n = arity
                     .as_small_integer()
                     .and_then(|a| usize::try_from(a).ok())
-                    .ok_or(VmError::Malformed("common-selector arity"))?;
+                    .ok_or_else(|| VmError::Malformed("common-selector arity"))?;
                 if self.stack.len() - self.frames.last().expect("a frame").lp < n + 1 {
                     return Err(self.invalid());
                 }
@@ -3347,8 +3868,7 @@ impl Vm {
                     op::POP_INTO_INDIRECT_LOCAL => Some(self.pop()?),
                     _ => Some(self.top()?),
                 };
-                let invalid = self.invalid();
-                match self
+                let ok = match self
                     .heap
                     .get_mut(vector)
                     .map(|o| (&mut o.body, o.header.flags))
@@ -3357,11 +3877,18 @@ impl Vm {
                         None => {
                             let v = elements[index];
                             self.stack.push(v);
+                            true
                         }
-                        Some(_) if flags & FROZEN != 0 => return Err(invalid),
-                        Some(v) => elements[index] = v,
+                        Some(_) if flags & FROZEN != 0 => false,
+                        Some(v) => {
+                            elements[index] = v;
+                            true
+                        }
                     },
-                    _ => return Err(invalid),
+                    _ => false,
+                };
+                if !ok {
+                    return Err(self.invalid());
                 }
                 None
             }
@@ -3395,7 +3922,7 @@ impl Vm {
                 let copied_count = (bytes[1] >> 4) as usize;
                 let num_args = u32::from(bytes[1] & 15);
                 let length = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
-                let code_len = self.heap.method(method).expect("method").bytecode.len();
+                let code_len = self.frames.last().expect("a frame").code.len();
                 if self.stack.len() - self.frames.last().expect("a frame").lp < copied_count
                     || next + length > code_len
                 {
