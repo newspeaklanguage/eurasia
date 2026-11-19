@@ -140,9 +140,64 @@ pub struct Log {
     /// Checkpoints: snapshot bytes. The first is the image the run started
     /// from, when the recording began at a start.
     pub checkpoints: Vec<Vec<u8>>,
-    /// The position of each checkpoint in `events`: the index just after
-    /// its [`Event::Checkpoint`]; 0 for the starting image.
+    /// The position of each checkpoint: the position just after its
+    /// [`Event::Checkpoint`]; 0 for the starting image.
     pub checkpoint_positions: Vec<u64>,
+    /// The position of `events[0]`. Positions are absolute: they count every
+    /// event recorded, kept or dropped, so a VM's `vm logPosition` and a
+    /// checkpoint's position mean the same in a trimmed log.
+    pub base: u64,
+    /// The number of `checkpoints[0]` among every checkpoint recorded.
+    pub first_checkpoint: u32,
+    /// How many checkpoints the log keeps (0: all). Recording a checkpoint
+    /// beyond them drops the oldest, and the events before the oldest one
+    /// kept ([`Log::trim`]), so that a long session's log stays bounded;
+    /// it still starts at a checkpoint, from which it replays.
+    pub keep_checkpoints: u32,
+}
+
+impl Log {
+    /// The position after the last event.
+    pub fn end(&self) -> u64 {
+        self.base + self.events.len() as u64
+    }
+
+    /// The event at `position`, if the log has it.
+    pub fn event_at(&self, position: u64) -> Option<&Event> {
+        let index = position.checked_sub(self.base)?;
+        self.events.get(usize::try_from(index).ok()?)
+    }
+
+    /// Checkpoint number `k` (counting every checkpoint recorded) and its
+    /// position, if the log still has it.
+    pub fn checkpoint(&self, k: u32) -> Option<(&[u8], u64)> {
+        let index = k.checked_sub(self.first_checkpoint)? as usize;
+        Some((
+            self.checkpoints.get(index)?.as_slice(),
+            self.checkpoint_positions[index],
+        ))
+    }
+
+    /// The numbers of the checkpoints the log has.
+    pub fn checkpoint_numbers(&self) -> core::ops::Range<u32> {
+        self.first_checkpoint..self.first_checkpoint + self.checkpoints.len() as u32
+    }
+
+    /// Drops the oldest checkpoints beyond [`Log::keep_checkpoints`], and
+    /// the events before the oldest checkpoint kept.
+    pub fn trim(&mut self) {
+        let keep = self.keep_checkpoints as usize;
+        if keep == 0 || self.checkpoints.len() <= keep {
+            return;
+        }
+        let dropped = self.checkpoints.len() - keep;
+        let new_base = self.checkpoint_positions[dropped];
+        self.events.drain(..(new_base - self.base) as usize);
+        self.checkpoints.drain(..dropped);
+        self.checkpoint_positions.drain(..dropped);
+        self.first_checkpoint += dropped as u32;
+        self.base = new_base;
+    }
 }
 
 /// A 64-bit FNV-1a digest, for outputs the log keeps by digest.
@@ -250,15 +305,15 @@ impl Host for Recorder<'_> {
     }
 
     fn checkpoint(&mut self, bytes: Vec<u8>) {
-        let index = self.log.checkpoints.len() as u32;
+        let index = self.log.first_checkpoint + self.log.checkpoints.len() as u32;
         self.log.events.push(Event::Checkpoint {
             index,
             digest: digest(&bytes),
         });
-        self.log
-            .checkpoint_positions
-            .push(self.log.events.len() as u64);
+        let position = self.log.end();
+        self.log.checkpoint_positions.push(position);
         self.log.checkpoints.push(bytes);
+        self.log.trim();
     }
 
     fn wants_checkpoints(&self) -> bool {
@@ -266,7 +321,7 @@ impl Host for Recorder<'_> {
     }
 
     fn log_position(&self) -> Option<u64> {
-        Some(self.log.events.len() as u64)
+        Some(self.log.end())
     }
 
     fn description(&self) -> &str {
@@ -415,12 +470,12 @@ impl<'a> Replayer<'a> {
         if self.divergence.is_some() {
             return None;
         }
-        self.log.events.get(self.position as usize)
+        self.log.event_at(self.position)
     }
 
     fn diverge(&mut self, found: String) {
         if self.divergence.is_none() {
-            let expected = match self.log.events.get(self.position as usize) {
+            let expected = match self.log.event_at(self.position) {
                 Some(e) => format!("{e:?}"),
                 None => String::from("the end of the log"),
             };
@@ -735,7 +790,7 @@ pub fn replay(
             _ => unreachable!("top-level events only"),
         }
     }
-    if r.divergence.is_none() && (r.position as usize) < log.events.len() {
+    if r.divergence.is_none() && r.position < log.end() {
         r.diverge(String::from("nothing more"));
     }
     ReplayReport {
@@ -750,7 +805,7 @@ pub fn replay(
 /// The log file's magic number.
 pub const LOG_MAGIC: [u8; 4] = *b"EURL";
 /// The log format's version.
-pub const LOG_VERSION: u16 = 1;
+pub const LOG_VERSION: u16 = 2;
 
 /// Why a log could not be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -864,6 +919,9 @@ impl Log {
         o.str(&self.description);
         o.u8(u8::from(self.blocks));
         o.uv(self.checkpoint_every);
+        o.uv(self.base);
+        o.uv(self.first_checkpoint.into());
+        o.uv(self.keep_checkpoints.into());
         o.uv(self.events.len() as u64);
         for e in &self.events {
             match e {
@@ -979,9 +1037,11 @@ impl Log {
             return Err(LogError(String::from("not a Eurasia log")));
         }
         let version = u16::from_le_bytes(i.take(2)?.try_into().expect("2 bytes"));
-        if version != LOG_VERSION {
+        // Version 1 had no base, first checkpoint or retention: it kept
+        // every event and checkpoint.
+        if version != 1 && version != LOG_VERSION {
             return Err(LogError(format!(
-                "log format {version}; this VM reads {LOG_VERSION}"
+                "log format {version}; this VM reads 1 and {LOG_VERSION}"
             )));
         }
         let mut log = Log {
@@ -990,6 +1050,13 @@ impl Log {
             checkpoint_every: i.uv()?,
             ..Log::default()
         };
+        if version >= 2 {
+            log.base = i.uv()?;
+            log.first_checkpoint = u32::try_from(i.uv()?)
+                .map_err(|_| LogError(String::from("a first checkpoint out of range")))?;
+            log.keep_checkpoints = u32::try_from(i.uv()?)
+                .map_err(|_| LogError(String::from("a retention out of range")))?;
+        }
         let n = i.uv()?;
         for _ in 0..n {
             let event = match i.u8()? {
@@ -1199,8 +1266,59 @@ mod tests {
                 Event::IdleResult(Ok(HostValue::Null)),
             ],
             checkpoints: alloc::vec![alloc::vec![9, 9]],
-            checkpoint_positions: alloc::vec![10],
+            checkpoint_positions: alloc::vec![10 + 40],
+            base: 40,
+            first_checkpoint: 3,
+            keep_checkpoints: 2,
         };
+        assert_eq!(Log::decode(&log.encode()), Ok(log));
+    }
+
+    /// A recorder that keeps two checkpoints: the log starts at the older
+    /// one kept, positions and checkpoint numbers stay absolute.
+    #[test]
+    fn a_log_keeps_its_last_checkpoints() {
+        let mut log = Log {
+            keep_checkpoints: 2,
+            checkpoints: alloc::vec![alloc::vec![0]],
+            checkpoint_positions: alloc::vec![0],
+            ..Log::default()
+        };
+        struct Quiet;
+        impl Host for Quiet {
+            fn print(&mut self, _: &str) {}
+            fn monotonic_nanos(&mut self) -> u64 {
+                0
+            }
+            fn utc_nanos(&mut self) -> i64 {
+                0
+            }
+            fn random_bytes(&mut self, _: &mut [u8]) {}
+            fn description(&self) -> &str {
+                "quiet"
+            }
+        }
+        let mut host = Quiet;
+        let mut r = Recorder {
+            inner: &mut host,
+            log: &mut log,
+        };
+        for k in 1..=3u8 {
+            r.print("a");
+            r.print("b");
+            r.checkpoint(alloc::vec![k]);
+        }
+        r.print("c");
+        assert_eq!(r.log_position(), Some(10));
+        assert_eq!(log.checkpoint_numbers(), 2..4);
+        assert_eq!(log.base, 6);
+        assert_eq!(log.checkpoint(2), Some((&[2u8][..], 6)));
+        assert_eq!(log.checkpoint(3), Some((&[3u8][..], 9)));
+        assert_eq!(log.checkpoint(1), None);
+        assert_eq!(log.event_at(5), None);
+        assert_eq!(log.event_at(6), Some(&Event::Print(String::from("a"))));
+        assert_eq!(log.event_at(9), Some(&Event::Print(String::from("c"))));
+        assert_eq!(log.end(), 10);
         assert_eq!(Log::decode(&log.encode()), Ok(log));
     }
 }

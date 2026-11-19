@@ -12,7 +12,7 @@ use crate::encoding::{DecodeError, Reader, Writer};
 /// The four magic bytes, `EURA`.
 pub const MAGIC: [u8; 4] = *b"EURA";
 /// The version of `docs/SNAPSHOT_FORMAT.md` this crate implements.
-pub const FORMAT_VERSION: u16 = 6;
+pub const FORMAT_VERSION: u16 = 7;
 /// The word size of every snapshot, on every target.
 pub const WORD_SIZE: u8 = 64;
 

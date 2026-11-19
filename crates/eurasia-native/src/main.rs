@@ -7,12 +7,16 @@
 //! - `eurasia SNAPSHOT [ARGS...]` runs a snapshot. A checkpoint (M7) is
 //!   restored into this new host instead: its Aliens are dead, and it
 //!   continues where it was taken.
-//! - `eurasia --record LOG [--checkpoint-every N] SNAPSHOT [ARGS...]` runs a
-//!   snapshot and writes the session's log (M7 design, section 3.1), with
-//!   a checkpoint after every `N` allocations.
+//! - `eurasia --record LOG [--checkpoint-every N] [--keep-checkpoints K]
+//!   SNAPSHOT [ARGS...]` runs a snapshot and writes the session's log (M7
+//!   design, section 3.1), with a checkpoint after every `N` allocations.
+//!   With `K`, the log keeps only the last `K` checkpoints and the events
+//!   after the oldest of them, so that it stays bounded.
 //! - `eurasia --replay LOG [CHECKPOINT]` replays a log (recorded here or in
-//!   a browser) from its starting image, or from its checkpoint number
-//!   `CHECKPOINT`, and reports the first divergence.
+//!   a browser) from its first checkpoint (its starting image, unless the
+//!   log was trimmed), or from its checkpoint number `CHECKPOINT`, and
+//!   reports the first divergence. Checkpoints are numbered in the order
+//!   they were taken, the dropped ones included.
 //! - `eurasia --checkpoint LOG CHECKPOINT FILE` writes a log's checkpoint to
 //!   a file, to be run (restored) on its own.
 //! - `eurasia --version`.
@@ -96,7 +100,7 @@ fn version() -> String {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: eurasia SNAPSHOT [ARGS...]\n       eurasia --record LOG [--checkpoint-every N] SNAPSHOT [ARGS...]\n       eurasia --replay LOG [CHECKPOINT]\n       eurasia --checkpoint LOG CHECKPOINT FILE\n       eurasia --version"
+        "usage: eurasia SNAPSHOT [ARGS...]\n       eurasia --record LOG [--checkpoint-every N] [--keep-checkpoints K] SNAPSHOT [ARGS...]\n       eurasia --replay LOG [CHECKPOINT]\n       eurasia --checkpoint LOG CHECKPOINT FILE\n       eurasia --version"
     );
     ExitCode::from(2)
 }
@@ -188,6 +192,14 @@ fn record(args: &[String]) -> Result<ExitCode, ExitCode> {
         };
         rest = &rest[2..];
     }
+    let mut keep = 0;
+    if rest.first().map(String::as_str) == Some("--keep-checkpoints") {
+        keep = match rest.get(1).and_then(|n| n.parse().ok()) {
+            Some(n) if rest.len() > 2 => n,
+            _ => return Err(usage()),
+        };
+        rest = &rest[2..];
+    }
     let path = &rest[0];
     let bytes = read(path)?;
     let (mut vm, restored) = load(path, &bytes)?;
@@ -200,6 +212,7 @@ fn record(args: &[String]) -> Result<ExitCode, ExitCode> {
         checkpoint_every: every,
         checkpoints: vec![bytes],
         checkpoint_positions: vec![0],
+        keep_checkpoints: keep,
         ..Log::default()
     };
     let program_args: Vec<&str> = rest[1..].iter().map(String::as_str).collect();
@@ -211,19 +224,33 @@ fn record(args: &[String]) -> Result<ExitCode, ExitCode> {
     Ok(exit_status(outcome))
 }
 
-fn checkpoint_of(log: &Log, arg: Option<&String>) -> Result<usize, ExitCode> {
+/// The checkpoint numbered `arg` (by default the log's first), its bytes
+/// and its position.
+fn checkpoint_of<'a>(log: &'a Log, arg: Option<&String>) -> Result<(u32, &'a [u8], u64), ExitCode> {
     let k = match arg {
-        None => 0,
+        None => log.first_checkpoint,
         Some(a) => a.parse().map_err(|_| usage())?,
     };
-    if k >= log.checkpoints.len() {
-        eprintln!(
-            "eurasia: the log has {} checkpoints (0 is its starting image)",
-            log.checkpoints.len()
-        );
-        return Err(ExitCode::from(2));
+    match log.checkpoint(k) {
+        Some((bytes, position)) => Ok((k, bytes, position)),
+        None => {
+            let numbers = log.checkpoint_numbers();
+            if numbers.start == 0 {
+                eprintln!(
+                    "eurasia: the log has {} checkpoints (0 is its starting image)",
+                    numbers.len()
+                );
+            } else {
+                eprintln!(
+                    "eurasia: the log has {} checkpoints, {} to {} (it was trimmed)",
+                    numbers.len(),
+                    numbers.start,
+                    numbers.end - 1
+                );
+            }
+            Err(ExitCode::from(2))
+        }
     }
-    Ok(k)
 }
 
 fn echo(text: &str) {
@@ -235,16 +262,15 @@ fn replay_log(args: &[String]) -> Result<ExitCode, ExitCode> {
         return Err(usage());
     };
     let log = read_log(log_path)?;
-    let k = checkpoint_of(&log, args.get(1))?;
-    let position = log.checkpoint_positions[k];
-    let (mut vm, restored) = load(log_path, &log.checkpoints[k])?;
+    let (k, bytes, position) = checkpoint_of(&log, args.get(1))?;
+    let (mut vm, restored) = load(log_path, bytes)?;
     vm.set_gc_stress(gc_stress());
     let report = replay(&mut vm, &log, position, restored, Some(echo));
     eprintln!(
         "eurasia: replayed {} top-level events from checkpoint {k}, to log position {} of {}",
         report.top_level_events,
         report.position,
-        log.events.len()
+        log.end()
     );
     match report.divergence {
         None => {
@@ -266,8 +292,8 @@ fn extract(args: &[String]) -> Result<ExitCode, ExitCode> {
         return Err(usage());
     };
     let log = read_log(log_path)?;
-    let k = checkpoint_of(&log, Some(k))?;
-    std::fs::write(out, &log.checkpoints[k]).map_err(|e| {
+    let (_, bytes, _) = checkpoint_of(&log, Some(k))?;
+    std::fs::write(out, bytes).map_err(|e| {
         eprintln!("eurasia: cannot write {out}: {e}");
         ExitCode::from(70)
     })?;

@@ -213,6 +213,8 @@ natives! {
     VmCheckpointNow = 174 / 0: "`vm checkpointNow`: a checkpoint at the next safepoint with no host operation under way, handed to the host (M7). Answers nil.",
     VmCheckpointPolicy = 175 / 1: "`vm checkpointPolicy: n`: a checkpoint at the first safepoint after every `n` allocations; 0 is none. Answers the receiver.",
     VmLogPosition = 176 / 0: "`vm logPosition`: the position in the host's input log (recording or replaying), or nil when there is none.",
+    VmIncarnation = 177 / 0: "`vm incarnation`: a copy of the running incarnation's id, 16 bytes minted from host entropy at every start (contract design, section 6).",
+    VmLineage = 178 / 0: "`vm lineage`: a copy of the id of the incarnation that saved the image this one started from, or nil (an image from genesis).",
     ClosureIn = 173 / 4: "`newClosureIn: activation initialBCI: bci numArgs: n numCopied: c`, for the Simulator (psoup's primitive 69): a closure defined by the activation, its body at bytecode position `bci` (from 1), with `c` copied values, nil until set.",
     VmSpawn = 139 / 1: "`vm spawn: mixin`: a new actor running a clone of the platform template, with the mixin applied to Object (role 37) in its heap, enclosing object nil; answers a far reference to the new class (`actor-semantics.tex`, eq. `create-actor`).",
     VmPromiseSend = 138 / 2: "`vm promise: record send: {selector. resultRecord. arguments...}`: an eventual send to the promise (Route-Pending): queued in the record, at the end of its chain, until it settles; delivered at once if it has.",
@@ -1904,6 +1906,20 @@ pub fn invoke(
             Some(_) => Outcome::Fail(Reason::OutOfRange(1)),
             None => Outcome::Fail(Reason::WrongKind(1)),
         },
+        Native::VmIncarnation | Native::VmLineage => {
+            let role = if native == Native::VmIncarnation {
+                Role::Incarnation
+            } else {
+                Role::Lineage
+            };
+            match ctx.heap.get(ctx.roles.get(role)).map(|o| &o.body) {
+                Some(Body::Bytes(b)) => {
+                    let copy = b.clone();
+                    Outcome::Answer(ctx.new_bytes_object(Role::ByteArrayClass, Body::Bytes(copy)))
+                }
+                _ => Outcome::Answer(ctx.roles.get(Role::Nil)),
+            }
+        }
         Native::VmLogPosition => match ctx.host.log_position() {
             Some(p) => Outcome::Answer(ctx.integer(BigInt::from_i128(i128::from(p)))),
             None => Outcome::Answer(ctx.roles.get(Role::Nil)),

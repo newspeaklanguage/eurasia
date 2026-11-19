@@ -79,6 +79,8 @@ roles! {
     InstanceMixinClass = 38: "The InstanceMixin class: `basicNew` of it answers an unfrozen mixin.",
     ClassMixinClass = 39: "The ClassMixin class: `basicNew` of it answers an unfrozen class-side mixin.",
     RestoreHandler = 40: "The object sent `restored` after a restore into a new host, or nil.",
+    Incarnation = 41: "The running incarnation's id, a ByteArray of 16 bytes from host entropy, minted at every start (contract design, section 6); in a saved image, the id of the incarnation that saved it. Nil in an image no incarnation saved (genesis).",
+    Lineage = 42: "The id of the incarnation that saved the image this incarnation started from (its Incarnation role then), or nil.",
 }
 
 /// A complete assignment of values to roles.

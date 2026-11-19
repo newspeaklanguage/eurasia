@@ -194,6 +194,9 @@ pub struct Vm {
     checkpoint_pending: bool,
     /// Steps until the event loop next asks the host whether to stop.
     interrupt_countdown: u32,
+    /// Restored into a new host: the next [`Vm::continue_run`] begins a new
+    /// incarnation.
+    incarnation_pending: bool,
 }
 
 /// A VM actor: its message loop (in its platform), its mailbox of packets
@@ -253,6 +256,7 @@ impl Vm {
             last_checkpoint: 0,
             checkpoint_pending: false,
             interrupt_countdown: INTERRUPT_INTERVAL,
+            incarnation_pending: false,
         }
     }
 
@@ -464,6 +468,10 @@ impl Vm {
     /// taken, or, for a checkpoint taken while idle (at a resume), that
     /// resume. Answers as [`Vm::run`] does.
     pub fn continue_run(&mut self, host: &mut dyn Host) -> Result<Completion, VmError> {
+        if self.incarnation_pending {
+            self.incarnation_pending = false;
+            self.begin_incarnation(host);
+        }
         if self.frames.is_empty()
             && let Some(done) = self.next_turn(host)?
         {
@@ -507,6 +515,7 @@ impl Vm {
     /// restore handler, if the program set one, is sent `restored` in a turn
     /// of its own, after the turn under way.
     pub fn restored_into_new_host(&mut self) {
+        self.incarnation_pending = true;
         let alien_class = self.roles.get(Role::AlienClass);
         let nil = self.nil();
         let dead = Value::small_integer(-1).expect("small");
@@ -574,6 +583,23 @@ impl Vm {
         }
     }
 
+    /// Begins an incarnation (contract design, section 6): every start, a
+    /// cold one or a restore into a new host, mints a fresh id from host
+    /// entropy (an input, so a replay reproduces it), and the id the image
+    /// was saved with becomes the lineage. A replay continuing from a
+    /// checkpoint is the same incarnation, and keeps both.
+    fn begin_incarnation(&mut self, host: &mut dyn Host) {
+        let saver = self.roles.get(Role::Incarnation);
+        self.roles.set(Role::Lineage, saver);
+        let mut id = [0u8; 16];
+        host.random_bytes(&mut id);
+        let class = self.roles.get(Role::ByteArrayClass);
+        let v = self
+            .heap
+            .allocate(class, Space::Actor(0), Body::Bytes(id.to_vec()));
+        self.roles.set(Role::Incarnation, v);
+    }
+
     /// The indices of a class's lazy cache slots, in its instances.
     fn lazy_slot_indices(&self, class: Value) -> Vec<usize> {
         let mut chain = Vec::new();
@@ -635,6 +661,7 @@ impl Vm {
     /// An image without one (first light) sends the entry `main:args:` with
     /// the VM mirror, and the run is over when that returns.
     pub fn run(&mut self, host: &mut dyn Host, args: &[&str]) -> Result<Completion, VmError> {
+        self.begin_incarnation(host);
         let strings: Vec<Value> = args.iter().map(|a| self.new_string(a)).collect();
         let array_class = self.roles.get(Role::ArrayClass);
         let args_array = self.heap.allocate(

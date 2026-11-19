@@ -1,6 +1,6 @@
 # Eurasia snapshot format
 
-**Status:** Draft, format version 6. Written before the code (implementation
+**Status:** Draft, format version 7. Written before the code (implementation
 plan M0); the packager (Newspeak) and `eurasia-snapshot` (Rust) are tested
 against each other.
 
@@ -32,7 +32,7 @@ psoup groups objects by class instead, which loses that order.
 | Field | Type | Meaning |
 |---|---|---|
 | magic | `bytes(4)` | `EURA` (0x45 0x55 0x52 0x41) |
-| format version | `u16` | This document: 4 (2026-11-17: version 2 gave mixins the class-side mixin field, version 3 the value flag bits and the Value role; 2026-11-18: version 4 far references, promise records, the shared bit and roles 35–37; version 5 the simulation-root bit and roles 38–39; version 6 checkpoints: the machine section, live and detached activations, and role 40) |
+| format version | `u16` | This document: 7 (2026-11-17: version 2 gave mixins the class-side mixin field, version 3 the value flag bits and the Value role; 2026-11-18: version 4 far references, promise records, the shared bit and roles 35–37; version 5 the simulation-root bit and roles 38–39; version 6 checkpoints: the machine section, live and detached activations, and role 40; version 7 roles 41 and 42, incarnation and lineage) |
 | kernel version | `u16` | Must equal the VM's `KERNEL_VERSION` |
 | bytecode version | `u16` | Must equal the VM's `BYTECODE_VERSION` |
 | word size | `u8` | Always 64 |
@@ -203,6 +203,13 @@ Role ids for kernel version 1 (the operation list, section 2):
 | | | 38 | InstanceMixin class (`basicNew` of it answers an unfrozen mixin) |
 | | | 39 | ClassMixin class (likewise, a class-side mixin) |
 | | | 40 | restore handler: sent `restored`, in a turn of its own, after a checkpoint is restored into a new host; or nil |
+| | | 41 | incarnation: the running incarnation's id (a ByteArray of 16 bytes); in a saved image, the id of the incarnation that saved it; nil in an image no incarnation saved (genesis) |
+| | | 42 | lineage: the id of the incarnation that saved the image the running one started from, or nil |
+
+Every start (a run from a snapshot, or a checkpoint restored into a new
+host) mints a fresh incarnation id from host entropy, and the id the image
+was saved with becomes the lineage (contract design, section 6). A replay
+continuing from a checkpoint is the same incarnation and keeps both.
 
 Every role must be present. Unknown role ids are an error.
 

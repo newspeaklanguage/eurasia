@@ -6,7 +6,8 @@
 # 1. The kernel tests, recorded on the command line with checkpoints, replay
 #    to the same outputs from the start and from a checkpoint taken in the
 #    middle of a turn; recording does not change the outcomes; a log with one
-#    printed line altered diverges there (the negative control).
+#    printed line altered diverges there (the negative control); a log that
+#    keeps only its last two checkpoints is smaller and replays from each.
 # 2. The debugger probe, whose broken thread is a chain of detached
 #    activations kept across turns: its log replays from every checkpoint,
 #    and each checkpoint, run on its own, prints the rest of the output.
@@ -14,7 +15,8 @@
 #    the JS tests, with callbacks) replay on the command line.
 # 4. A checkpoint restored into a new host (EurasiaRestoreProbe, on wasm): an
 #    Alien in a lazy slot is looked up again, one in an ordinary slot is
-#    dead, and the restore handler runs.
+#    dead, and the restore handler runs, in a new incarnation whose lineage
+#    is the first.
 # Needs the images of scripts/kernel-tests.sh, scripts/reflection-tests.sh and
 # scripts/web-tests.sh. Outputs go to target/replay/.
 set -eu
@@ -55,6 +57,19 @@ fi
 grep -q 'recorded: Print("SimulationTests>>testSimulationValue3 sUccess")' "$OUT/tampered.err" \
   || { cat "$OUT/tampered.err"; echo "the tampered log diverged elsewhere"; exit 1; }
 echo "the tampered log diverges at the altered line"
+"$E" --record "$OUT/kernel-kept.log" --checkpoint-every 500000 --keep-checkpoints 2 target/kerneltests/base.eus > "$OUT/kernel-kept.txt" 2>&1 || true
+"$E" --replay "$OUT/kernel-kept.log" 0 > /dev/null 2> "$OUT/kept.err" && { echo "a trimmed log still has its starting image"; exit 1; }
+first=$(sed -n 's/.*checkpoints, \([0-9]*\) to .*/\1/p' "$OUT/kept.err")
+[ -n "$first" ] && [ "$first" -ge 1 ] && [ "$(checkpoints "$OUT/kernel-kept.log")" = 2 ] \
+  || { cat "$OUT/kept.err"; echo "the log did not keep just its last two checkpoints"; exit 1; }
+[ "$(wc -c < "$OUT/kernel-kept.log")" -lt "$(wc -c < "$OUT/kernel.log")" ] || { echo "the trimmed log is not smaller"; exit 1; }
+for k in "$first" $((first + 1)); do
+  replays "$OUT/kernel-kept.log" $k || { echo "trimmed, checkpoint $k:"; cat "$OUT/replay.err"; exit 1; }
+  lines=$(wc -l < "$OUT/replayed.txt")
+  tail -n "$lines" "$OUT/kernel-kept.txt" | cmp - "$OUT/replayed.txt" \
+    || { echo "trimmed, checkpoint $k does not replay the rest of the output"; exit 1; }
+done
+echo "a log keeping its last two checkpoints ($first and $((first + 1))) replays from each"
 
 echo "== the debugger probe: detached activations in checkpoints"
 "$E" --record "$OUT/debugger.log" --checkpoint-every 5 target/reflection/debugger/base.eus > "$OUT/debugger.txt"
@@ -96,11 +111,11 @@ mkdir -p "$OUT/restore"
   "$OUT/restore/genesis.eus" > "$OUT/restore/package.log"
 (cd "$OUT/restore" && "$E" genesis.eus base.eus)
 EURASIA_RECORD="$OUT/restore/session.log" node web/run-node.mjs "$WASM" "$OUT/restore/base.eus" > "$OUT/restore/recorded.txt"
-expected=$(printf '%s\n' 'before lazy 2 ordinary 4' 'after lazy 2 ordinary 4')
+expected=$(printf '%s\n' 'incarnation of 16 bytes, no lineage' 'before lazy 2 ordinary 4' 'after lazy 2 ordinary 4')
 [ "$(cat "$OUT/restore/recorded.txt")" = "$expected" ] || { cat "$OUT/restore/recorded.txt"; echo "unexpected output before the restore"; exit 1; }
 "$E" --checkpoint "$OUT/restore/session.log" 1 "$OUT/restore/checkpoint.eus"
 node web/run-node.mjs "$WASM" "$OUT/restore/checkpoint.eus" > "$OUT/restore/restored.txt"
-expected=$(printf '%s\n' 'after lazy 2 ordinary failed' 'restored lazy 2 ordinary failed')
+expected=$(printf '%s\n' 'after lazy 2 ordinary failed' 'restored lazy 2 ordinary failed' 'restored: a new incarnation, whose lineage is the first')
 [ "$(cat "$OUT/restore/restored.txt")" = "$expected" ] || { cat "$OUT/restore/restored.txt"; echo "unexpected output after the restore"; exit 1; }
 cat "$OUT/restore/restored.txt"
 echo "Replay: logs replay to the same outputs, from the start and from checkpoints, across wasm and native; checkpoints restore into a new host."

@@ -24,7 +24,9 @@
 <!-- Runs the IDE's image (query parameter snapshot, default ide/base.eus) on
      Eurasia's wasm32 build. The IDE draws the page; what the program prints
      goes to the console. With the query parameter record (record=n: a
-     checkpoint after every n allocations), the session is recorded (M7):
+     checkpoint after every n allocations), the session is recorded (M7),
+     keeping the last two checkpoints and the events after the older one, so
+     that the log stays bounded (keep=k keeps k; keep=0 keeps everything):
      eurasiaSaveLog() in the console, or Ctrl-Shift-L, downloads its log, to
      replay with `eurasia --replay`; eurasiaUploadLog() sends it to
      scripts/serve-web.sh's server instead. -->
@@ -42,6 +44,7 @@
       fetchBytes(params.get('snapshot') ?? 'ide/base.eus'),
     ]);
     const record = params.has('record') ? Number(params.get('record') || 0) : undefined;
+    const keep = params.has('keep') ? Number(params.get('keep') || 0) : 2;
     let controls = null;
     if (record !== undefined) {
       window.eurasiaSaveLog = () => {
@@ -74,6 +77,7 @@
     const result = await run(wasm, snapshot, {
       print: (line) => console.log(line),
       record,
+      keep,
       onStart: (c) => { controls = c; },
     });
     console.log('eurasia:', result.status === 'exited' ? `exited ${result.code}` : 'idle');

@@ -134,6 +134,7 @@ VMMirror	instance	setRole:to:	VmSetRole	93
 Actors	instance	classOf:	VmClassOf	113
 Actors	instance	currentMonotonicNanos	VmMonotonicNanos	121
 Actors	instance	newActorHandle	VmNewActor	127
+Actors	instance	setRole:to:	VmSetRole	93
 Actors	instance	farReference:to:	VmFarReferenceTo	128
 Actors	instance	post:to:	VmPost	129
 Actors	instance	isFarReference:	VmIsFarReference	130
@@ -188,6 +189,8 @@ VMMirror	instance	programVersion	VmProgramVersion	161
 VMMirror	instance	checkpointNow	VmCheckpointNow	174
 VMMirror	instance	checkpointPolicy:	VmCheckpointPolicy	175
 VMMirror	instance	logPosition	VmLogPosition	176
+VMMirror	instance	incarnation	VmIncarnation	177
+VMMirror	instance	lineage	VmLineage	178
 Mirrors	instance	subclassesOf:	VmSubclassesOf	160
 Mirrors	instance	commit:	VmCommit	158
 # Activations and the Simulator (M6 step 4).

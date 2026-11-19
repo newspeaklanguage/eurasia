@@ -7,7 +7,8 @@
 // the VM fails). With EURASIA_WEB_STATS set, it reports on stderr how many
 // times the run waited for a timer. With EURASIA_RECORD set to a path, it
 // records the session (with a checkpoint after every EURASIA_RECORD_EVERY
-// allocations, default none) and writes the log there when Node exits.
+// allocations, default none; keeping the last EURASIA_RECORD_KEEP of them,
+// default all) and writes the log there when Node exits.
 // Usage: node run-node.mjs <eurasia_web.wasm> <snapshot>.
 
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -26,6 +27,7 @@ if (logPath) process.on('exit', () => { if (controls) writeFileSync(logPath, con
 try {
   const result = await run(readFileSync(wasmPath), readFileSync(snapshotPath), {
     record: logPath ? Number(process.env.EURASIA_RECORD_EVERY ?? 0) : undefined,
+    keep: Number(process.env.EURASIA_RECORD_KEEP ?? 0),
     onStart: (c) => { controls = c; },
   });
 

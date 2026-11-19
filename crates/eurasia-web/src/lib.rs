@@ -26,9 +26,11 @@
 //! of the running turn; one while the VM is idle starts a turn, after which
 //! the loader resumes the VM.
 //!
-//! Recording (M7): `eurasia_record(n)` before `eurasia_start` records the
+//! Recording (M7): `eurasia_record(n, k)` before `eurasia_start` records the
 //! session (`eurasia_core::replay`), with a checkpoint after every `n`
-//! allocations (0: none); `eurasia_log()` then encodes the log so far into
+//! allocations (0: none), keeping the last `k` checkpoints and the events
+//! after the oldest of them (0: all), so that a long session's log stays
+//! bounded; `eurasia_log()` then encodes the log so far into
 //! the buffer, to be saved and replayed on the command line. A checkpoint
 //! given to `eurasia_start` is restored into this new host and continues.
 
@@ -80,6 +82,8 @@ struct State {
     log: Option<Log>,
     /// The checkpoint policy to record with.
     record_every: Option<u64>,
+    /// How many checkpoints the log keeps (0: all).
+    record_keep: u32,
 }
 
 thread_local! {
@@ -165,10 +169,14 @@ pub extern "C" fn eurasia_wakeup_nanos() -> f64 {
 }
 
 /// Records the session that `eurasia_start` begins, with a checkpoint
-/// after every `every` allocations (0: none).
+/// after every `every` allocations (0: none), keeping the last `keep`
+/// checkpoints (0: all).
 #[unsafe(no_mangle)]
-pub extern "C" fn eurasia_record(every: f64) {
-    STATE.with_borrow_mut(|s| s.record_every = Some(every as u64));
+pub extern "C" fn eurasia_record(every: f64, keep: f64) {
+    STATE.with_borrow_mut(|s| {
+        s.record_every = Some(every as u64);
+        s.record_keep = keep as u32;
+    });
 }
 
 /// Encodes the log recorded so far into the buffer and answers its length
@@ -219,6 +227,7 @@ pub extern "C" fn eurasia_start() -> i32 {
                             checkpoint_every: every,
                             checkpoints: vec![bytes],
                             checkpoint_positions: vec![0],
+                            keep_checkpoints: s.record_keep,
                             ..Log::default()
                         };
                         let outcome = record_run(&mut vm, &mut WebHost, &mut log, &[]);
