@@ -85,7 +85,7 @@ pub enum Access {
 }
 
 /// A method header.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MethodHeader {
     /// How the method runs.
     pub kind: MethodKind,

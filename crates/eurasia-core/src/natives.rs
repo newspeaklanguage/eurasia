@@ -649,6 +649,10 @@ pub enum Outcome {
         /// Its arguments.
         args: Vec<Value>,
     },
+    /// A closure's `value` to `value:value:value:`: run the receiver, a
+    /// closure, with the native's own arguments, which are still on the
+    /// stack, so nothing is copied. The arity has been checked.
+    ActivateReceiver,
     /// `vm snapshot`: the interpreter serializes the heap and answers it.
     Snapshot,
     /// Collect garbage now (`vm garbageCollect`), then answer the receiver.
@@ -895,6 +899,18 @@ fn integer_arithmetic(
     op: fn(&BigInt, &BigInt) -> BigInt,
     tail: &'static str,
 ) -> Outcome {
+    // Two SmallIntegers whose result is one: no BigInt.
+    if let (Some(x), Some(y)) = (receiver.as_small_integer(), arg.as_small_integer()) {
+        let small = match tail {
+            "addFromInteger:" => x.checked_add(y),
+            "subtractFromInteger:" => x.checked_sub(y),
+            "multiplyFromInteger:" => x.checked_mul(y),
+            _ => None,
+        };
+        if let Some(v) = small.and_then(Value::small_integer) {
+            return Outcome::Answer(v);
+        }
+    }
     let Some(a) = integer_of(ctx.heap, receiver) else {
         return Outcome::Fail(Reason::WrongKind(0));
     };
@@ -949,6 +965,9 @@ fn comparison(
     test: fn(Ordering) -> bool,
     reversed: &'static str,
 ) -> Outcome {
+    if let (Some(x), Some(y)) = (receiver.as_small_integer(), arg.as_small_integer()) {
+        return Outcome::Answer(ctx.boolean(test(x.cmp(&y))));
+    }
     let Some(a) = number_of(ctx.heap, receiver) else {
         return Outcome::Fail(Reason::WrongKind(0));
     };
@@ -971,6 +990,32 @@ enum Division {
 }
 
 fn division(ctx: &mut NativeContext<'_>, receiver: Value, arg: Value, kind: Division) -> Outcome {
+    // Two SmallIntegers, a non-zero divisor and a result in range: no BigInt.
+    if let (Some(x), Some(y)) = (receiver.as_small_integer(), arg.as_small_integer())
+        && y != 0
+    {
+        let v = match kind {
+            Division::FloorDivide => x.checked_div(y).map(|q| {
+                if x % y != 0 && ((x < 0) != (y < 0)) {
+                    q - 1
+                } else {
+                    q
+                }
+            }),
+            Division::FloorModulo => x.checked_rem(y).map(|r| {
+                if r != 0 && ((r < 0) != (y < 0)) {
+                    r + y
+                } else {
+                    r
+                }
+            }),
+            Division::Quo => x.checked_div(y),
+            Division::Rem => x.checked_rem(y),
+        };
+        if let Some(v) = v.and_then(Value::small_integer) {
+            return Outcome::Answer(v);
+        }
+    }
     let Some(a) = number_of(ctx.heap, receiver) else {
         return Outcome::Fail(Reason::WrongKind(0));
     };
@@ -1013,7 +1058,14 @@ fn integer_bits(
     receiver: Value,
     arg: Value,
     op: fn(&BigInt, &BigInt) -> BigInt,
+    small: fn(i64, i64) -> i64,
 ) -> Outcome {
+    // Two SmallIntegers: and, or and xor of two are one.
+    if let (Some(x), Some(y)) = (receiver.as_small_integer(), arg.as_small_integer())
+        && let Some(v) = Value::small_integer(small(x, y))
+    {
+        return Outcome::Answer(v);
+    }
     let Some(a) = integer_of(ctx.heap, receiver) else {
         return Outcome::Fail(Reason::WrongKind(0));
     };
@@ -1319,6 +1371,9 @@ pub fn invoke(
         Native::IntegerLessEqual => comparison(ctx, receiver, arg(0), Ordering::is_le, ">="),
         Native::IntegerGreaterEqual => comparison(ctx, receiver, arg(0), Ordering::is_ge, "<="),
         Native::NumberEqual => {
+            if let (Some(x), Some(y)) = (receiver.as_small_integer(), arg(0).as_small_integer()) {
+                return Outcome::Answer(ctx.boolean(x == y));
+            }
             let Some(a) = number_of(ctx.heap, receiver) else {
                 return Outcome::Fail(Reason::WrongKind(0));
             };
@@ -1335,9 +1390,9 @@ pub fn invoke(
         Native::NumberFloorModulo => division(ctx, receiver, arg(0), Division::FloorModulo),
         Native::NumberQuo => division(ctx, receiver, arg(0), Division::Quo),
         Native::NumberRem => division(ctx, receiver, arg(0), Division::Rem),
-        Native::IntegerBitAnd => integer_bits(ctx, receiver, arg(0), BigInt::and),
-        Native::IntegerBitOr => integer_bits(ctx, receiver, arg(0), BigInt::or),
-        Native::IntegerBitXor => integer_bits(ctx, receiver, arg(0), BigInt::xor),
+        Native::IntegerBitAnd => integer_bits(ctx, receiver, arg(0), BigInt::and, |x, y| x & y),
+        Native::IntegerBitOr => integer_bits(ctx, receiver, arg(0), BigInt::or, |x, y| x | y),
+        Native::IntegerBitXor => integer_bits(ctx, receiver, arg(0), BigInt::xor, |x, y| x ^ y),
         Native::IntegerShiftLeft => shift(ctx, receiver, arg(0), true),
         Native::IntegerShiftRight => shift(ctx, receiver, arg(0), false),
         Native::NumberAsFloat => match number_of(ctx.heap, receiver) {
@@ -1398,7 +1453,11 @@ pub fn invoke(
         Native::ClosureValue
         | Native::ClosureValue1
         | Native::ClosureValue2
-        | Native::ClosureValue3 => activate_closure(receiver, args.to_vec(), ctx),
+        | Native::ClosureValue3 => match ctx.heap.closure(receiver) {
+            Some(c) if c.num_args as usize == args.len() => Outcome::ActivateReceiver,
+            Some(_) => Outcome::Fail(Reason::Arity),
+            None => Outcome::Fail(Reason::WrongKind(0)),
+        },
         Native::ClosureValueWithArguments => match ctx.heap.array_elements(arg(0)) {
             Some(elements) => {
                 let elements = elements.to_vec();

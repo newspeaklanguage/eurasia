@@ -34,7 +34,9 @@ use crate::host::Host;
 use crate::host::{HostCallbacks, HostError, HostValue};
 use crate::machine::{ActorState, FrameState, MachineState};
 use crate::natives::{self, Native, NativeContext, Outcome, Reason};
-use crate::object::{Access, Body, FROZEN, Heap, MethodKind, PromiseRecord, Space, VALUE};
+use crate::object::{
+    Access, Body, FROZEN, Heap, MethodHeader, MethodKind, PromiseRecord, Space, VALUE,
+};
 use crate::roles::{Role, Roles};
 use crate::value::Value;
 
@@ -139,6 +141,10 @@ struct Frame {
     /// the method up. A method's bytecode can change only while it is
     /// unfrozen (`Method>>bytecode:`); a frame keeps the code it began with.
     code: Rc<[u8]>,
+    /// The method's literal array and mixin, for the same reason; reloaded
+    /// whenever the lookup cache is cleared.
+    literals: Value,
+    mixin: Value,
     receiver: Value,
     /// Index of the message receiver; the arguments follow it.
     bp: usize,
@@ -194,11 +200,13 @@ enum TargetReceiver {
     Fixed(Value),
 }
 
-/// What a send runs: the method, its receiver and, for an accessor, the
-/// absolute index of its slot in that receiver.
+/// What a send runs: the method and its header (so that activating an
+/// accessor or a native does not look the method up), its receiver and,
+/// for an accessor, the absolute index of its slot in that receiver.
 #[derive(Clone, Copy, Debug)]
 struct Target {
     method: Value,
+    header: MethodHeader,
     receiver: TargetReceiver,
     slot: Option<usize>,
 }
@@ -280,6 +288,11 @@ pub struct Vm {
     save_pending: Option<String>,
     /// Steps until the event loop next asks the host whether to stop.
     interrupt_countdown: u32,
+    /// The allocation count at which the next collection or checkpoint can
+    /// be due, so that a safepoint costs one comparison until then. Any
+    /// change to what decides that sets it to 0, which makes the next
+    /// safepoint check in full and compute it again.
+    safepoint_at: u64,
     /// Restored into a new host: the next [`Vm::continue_run`] begins a new
     /// incarnation.
     incarnation_pending: bool,
@@ -352,15 +365,26 @@ impl Vm {
             checkpoint_pending: false,
             save_pending: None,
             interrupt_countdown: INTERRUPT_INTERVAL,
+            safepoint_at: 0,
             incarnation_pending: false,
             lookup_cache: alloc::vec![None; LOOKUP_CACHE_SIZE],
             small_integer_fast: [0; SMALL_INTEGER_FAST_PATHS],
         }
     }
 
+    /// Clears the lookup cache, after anything that moves, forwards or
+    /// changes program objects, and reloads what each frame keeps of its
+    /// method (its literals and mixin), which such a change may also move.
     fn flush_lookup_cache(&mut self) {
         self.lookup_cache.fill(None);
         self.small_integer_fast = [0; SMALL_INTEGER_FAST_PATHS];
+        let nil = self.nil();
+        for f in &mut self.frames {
+            (f.literals, f.mixin) = self
+                .heap
+                .method(f.method)
+                .map_or((nil, nil), |m| (m.literals, m.mixin));
+        }
     }
 
     /// Common send `k` (0 to 13) to two SmallIntegers, computed without a
@@ -374,6 +398,13 @@ impl Vm {
         }
         let a = self.stack[len - 2].as_small_integer()?;
         let b = self.stack[len - 1].as_small_integer()?;
+        self.small_integer_op(k, a, b)
+    }
+
+    /// Common send `k` (below [`SMALL_INTEGER_FAST_PATHS`]) of SmallIntegers
+    /// `a` and `b`, as [`Vm::small_integer_fast_path`] computes it.
+    #[inline(always)]
+    fn small_integer_op(&mut self, k: usize, a: i64, b: i64) -> Option<Value> {
         if self.small_integer_fast[k] == 0 {
             self.small_integer_fast[k] = if self.small_integer_native_is(k) {
                 1
@@ -481,6 +512,7 @@ impl Vm {
     /// at once (implementation plan, M3). `None` is normal scheduling.
     pub fn set_gc_stress(&mut self, interval: Option<u64>) {
         self.gc_stress = interval.map(|n| n.max(1));
+        self.safepoint_at = 0;
     }
 
     /// The number of collections so far.
@@ -502,7 +534,6 @@ impl Vm {
         let roots = self.roots();
         let nil = self.roles.get(Role::Nil);
         let (fwd, statistics) = self.heap.collect(&roots, nil);
-        self.flush_lookup_cache();
         for e in &mut self.expats {
             e.0 = fwd.forward(e.0);
         }
@@ -528,8 +559,10 @@ impl Vm {
         for v in self.symbols.values_mut() {
             *v = fwd.forward(*v);
         }
+        self.flush_lookup_cache();
         self.gc_counter = self.heap.allocation_counter();
         self.gc_budget = MIN_GC_BUDGET.max(statistics.after as u64);
+        self.safepoint_at = 0;
         self.collections += 1;
         statistics
     }
@@ -633,6 +666,7 @@ impl Vm {
     /// one): [`Vm::continue_run`] continues it.
     pub fn restore(heap: Heap, roles: Roles, state: MachineState) -> Vm {
         let mut vm = Vm::new(heap, roles);
+        let nil = vm.nil();
         vm.stack = state.stack;
         vm.frames = state
             .frames
@@ -644,6 +678,8 @@ impl Vm {
                     .heap
                     .method(fr.method)
                     .map_or_else(|| Rc::from([]), |m| m.bytecode.clone()),
+                literals: vm.heap.method(fr.method).map_or(nil, |m| m.literals),
+                mixin: vm.heap.method(fr.method).map_or(nil, |m| m.mixin),
                 receiver: fr.receiver,
                 bp: fr.bp as usize,
                 arg_count: fr.arg_count as usize,
@@ -705,6 +741,24 @@ impl Vm {
     pub fn set_checkpoint_policy(&mut self, allocations: u64) {
         self.checkpoint_every = allocations;
         self.last_checkpoint = self.heap.allocation_counter();
+        self.safepoint_at = 0;
+    }
+
+    /// The allocation count at which [`Vm::gc_due`] or
+    /// [`Vm::checkpoint_due`] can next be true, if nothing else changes.
+    fn next_safepoint(&self) -> u64 {
+        if self.checkpoint_pending {
+            return 0;
+        }
+        let gc = self
+            .gc_counter
+            .saturating_add(self.gc_stress.unwrap_or(self.gc_budget));
+        let checkpoint = if self.checkpoint_every == 0 {
+            u64::MAX
+        } else {
+            self.last_checkpoint.saturating_add(self.checkpoint_every)
+        };
+        gc.min(checkpoint)
     }
 
     fn checkpoint_due(&self) -> bool {
@@ -724,6 +778,7 @@ impl Vm {
     fn take_checkpoint(&mut self, host: &mut dyn Host) {
         self.checkpoint_pending = false;
         self.last_checkpoint = self.heap.allocation_counter();
+        self.safepoint_at = 0;
         let save = self.save_pending.take();
         let wanted = host.wants_checkpoints();
         if let Some(write) = self.snapshot_writer
@@ -989,11 +1044,14 @@ impl Vm {
             }
             // A safepoint: every value the VM holds is in the roots, and no
             // host operation is under way.
-            if self.gc_due() {
-                self.collect_garbage();
-            }
-            if self.checkpoint_due() {
-                self.take_checkpoint(host);
+            if self.heap.allocation_counter() >= self.safepoint_at {
+                if self.gc_due() {
+                    self.collect_garbage();
+                }
+                if self.checkpoint_due() {
+                    self.take_checkpoint(host);
+                }
+                self.safepoint_at = self.next_safepoint();
             }
             self.interrupt_countdown -= 1;
             if self.interrupt_countdown == 0 {
@@ -1002,7 +1060,12 @@ impl Vm {
                     return Err(VmError::Interrupted);
                 }
             }
-            if let Step::Done(done) = self.step(host)? {
+            let next = if self.step_limit.is_none() {
+                self.run_simple(host)?
+            } else {
+                self.step(host)?
+            };
+            if let Step::Done(done) = next {
                 return Ok(done);
             }
         }
@@ -1199,7 +1262,7 @@ impl Vm {
             TargetReceiver::Frame => self.insert_receiver(receiver, n),
             TargetReceiver::Fixed(r) => self.insert_receiver(r, n),
         }
-        self.activate_at(target.method, n, host, target.slot)
+        self.activate_with(target.method, target.header, n, host, target.slot)
     }
 
     /// What a send runs, as [`Vm::uncached_send`] finds it, or `None` when
@@ -1289,11 +1352,7 @@ impl Vm {
         let Some((method, how, target_receiver)) = found else {
             return Ok(None);
         };
-        let header = &self
-            .heap
-            .method(method)
-            .ok_or_else(|| VmError::Malformed("method expected"))?
-            .header;
+        let header = self.method_header(method)?;
         // An accessor's slot index, if it has one; if not, activation
         // reports the error.
         let slot = match header.kind {
@@ -1304,9 +1363,18 @@ impl Vm {
         };
         Ok(Some(Target {
             method,
+            header,
             receiver: how,
             slot,
         }))
+    }
+
+    fn method_header(&self, method: Value) -> Result<MethodHeader, VmError> {
+        Ok(self
+            .heap
+            .method(method)
+            .ok_or_else(|| VmError::Malformed("method expected"))?
+            .header)
     }
 
     /// The method an ordinary send of `sel` to an instance of `class` runs:
@@ -1589,11 +1657,19 @@ impl Vm {
         host: &mut dyn Host,
         slot: Option<usize>,
     ) -> Result<Option<Completion>, VmError> {
-        let m = self
-            .heap
-            .method(method)
-            .ok_or_else(|| VmError::Malformed("method expected"))?;
-        let header = m.header.clone();
+        let header = self.method_header(method)?;
+        self.activate_with(method, header, n, host, slot)
+    }
+
+    /// [`Vm::activate_at`], given the method's header.
+    fn activate_with(
+        &mut self,
+        method: Value,
+        header: MethodHeader,
+        n: usize,
+        host: &mut dyn Host,
+        slot: Option<usize>,
+    ) -> Result<Option<Completion>, VmError> {
         let base = self.stack.len() - 1 - n;
         match header.kind {
             MethodKind::Native => {
@@ -1673,11 +1749,16 @@ impl Vm {
                     .extend(core::iter::repeat_n(nil, header.local_count as usize));
                 let serial = self.next_serial;
                 self.next_serial += 1;
-                let code = self.heap.method(method).expect("method").bytecode.clone();
+                let (code, literals, mixin) = {
+                    let m = self.heap.method(method).expect("method");
+                    (m.bytecode.clone(), m.literals, m.mixin)
+                };
                 self.frames.push(Frame {
                     serial,
                     method,
                     code,
+                    literals,
+                    mixin,
                     receiver,
                     bp: base,
                     arg_count: n,
@@ -1722,6 +1803,12 @@ impl Vm {
             self.stack.push(v);
             return Ok(None);
         }
+        // A closure's `value`: the closure and its arguments are already in
+        // place on the stack.
+        if let Outcome::ActivateReceiver = outcome {
+            self.activate_closure(receiver, n)?;
+            return Ok(None);
+        }
         let args: Vec<Value> = self.stack[base + 1..base + 1 + n].to_vec();
         self.stack.truncate(base);
         let outcome = match outcome {
@@ -1751,6 +1838,7 @@ impl Vm {
             Outcome::Fail(reason) => self.native_failure(native, receiver, args, reason, host),
             Outcome::Exit(code) => Ok(Some(Completion::Exited(code))),
             Outcome::Frame(_) => unreachable!("frame natives are resolved above"),
+            Outcome::ActivateReceiver => unreachable!("closure activation is handled above"),
             Outcome::Spawn(mixin) => {
                 // The semantics' create-actor: a fresh actor whose heap has
                 // the new class, applying the mixin to Object with a nil
@@ -2018,11 +2106,13 @@ impl Vm {
             Outcome::SaveImage(name) => {
                 self.save_pending = Some(name);
                 self.checkpoint_pending = true;
+                self.safepoint_at = 0;
                 self.stack.push(receiver);
                 Ok(None)
             }
             Outcome::CheckpointNow => {
                 self.checkpoint_pending = true;
+                self.safepoint_at = 0;
                 let nil = self.nil();
                 self.stack.push(nil);
                 Ok(None)
@@ -2162,19 +2252,19 @@ impl Vm {
         let c = self
             .heap
             .closure(closure)
-            .ok_or_else(|| VmError::Malformed("closure expected"))?
-            .clone();
+            .ok_or_else(|| VmError::Malformed("closure expected"))?;
         let defining = self
             .heap
             .activation(c.defining)
             .ok_or_else(|| VmError::Malformed("activation expected"))?;
         let (method, receiver) = (defining.method, defining.receiver);
-        let code = self
-            .heap
-            .method(method)
-            .ok_or_else(|| VmError::Malformed("method expected"))?
-            .bytecode
-            .clone();
+        let (code, literals, mixin) = {
+            let m = self
+                .heap
+                .method(method)
+                .ok_or_else(|| VmError::Malformed("method expected"))?;
+            (m.bytecode.clone(), m.literals, m.mixin)
+        };
         if c.initial_ip as usize >= code.len() {
             return Err(VmError::Malformed("closure body outside its method"));
         }
@@ -2187,6 +2277,8 @@ impl Vm {
             serial,
             method,
             code,
+            literals,
+            mixin,
             receiver,
             bp: base,
             arg_count: n,
@@ -2390,12 +2482,18 @@ impl Vm {
     /// object's slot, an ephemeron's key, value or finalizer, or an unfrozen
     /// method's or mixin's contract field. Answers whether there was one.
     fn store_slot(&mut self, receiver: Value, index: usize, value: Value) -> bool {
-        if matches!(
+        let program = matches!(
             self.heap.get(receiver).map(|o| &o.body),
             Some(Body::Method(_) | Body::Mixin(_))
-        ) {
+        );
+        let stored = self.store_slot_unflushed(receiver, index, value);
+        if stored && program {
             self.flush_lookup_cache();
         }
+        stored
+    }
+
+    fn store_slot_unflushed(&mut self, receiver: Value, index: usize, value: Value) -> bool {
         match self.heap.get_mut(receiver).map(|o| &mut o.body) {
             Some(Body::Regular(slots)) if index < slots.len() => {
                 slots[index] = value;
@@ -2568,11 +2666,16 @@ impl Vm {
             let bp = self.stack.len();
             self.stack.push(closure.unwrap_or(receiver));
             self.stack.extend(d.temps.iter().copied());
-            let code = self.heap.method(method).expect("checked").bytecode.clone();
+            let (code, literals, mixin) = {
+                let m = self.heap.method(method).expect("checked");
+                (m.bytecode.clone(), m.literals, m.mixin)
+            };
             self.frames.push(Frame {
                 serial,
                 method,
                 code,
+                literals,
+                mixin,
                 receiver,
                 bp,
                 arg_count: arity,
@@ -2596,12 +2699,7 @@ impl Vm {
         arguments: Value,
         host: &mut dyn Host,
     ) -> Result<Value, Reason> {
-        let header = self
-            .heap
-            .method(method)
-            .ok_or(Reason::WrongKind(1))?
-            .header
-            .clone();
+        let header = self.heap.method(method).ok_or(Reason::WrongKind(1))?.header;
         let args = self
             .heap
             .array_elements(arguments)
@@ -2695,6 +2793,15 @@ impl Vm {
                             Body::Array(a),
                         );
                         alloc::vec![small(3), closure, a]
+                    }
+                    Outcome::ActivateReceiver => {
+                        let array_class = self.roles.get(Role::ArrayClass);
+                        let a = self.heap.allocate(
+                            array_class,
+                            Space::Actor(self.current as u32),
+                            Body::Array(args.clone()),
+                        );
+                        alloc::vec![small(3), receiver, a]
                     }
                     // A native that changes the VM's own state (turns,
                     // actors, the heap, the program) is not simulated.
@@ -3070,13 +3177,14 @@ impl Vm {
                 None => v,
             };
             self.heap.forward_identities(&forward);
-            self.flush_lookup_cache();
             for v in &mut self.stack {
                 *v = forward(*v);
             }
             for f in &mut self.frames {
                 f.receiver = forward(f.receiver);
                 f.closure = f.closure.map(forward);
+                f.literals = forward(f.literals);
+                f.mixin = forward(f.mixin);
             }
             let pairs: Vec<(Role, Value)> = self.roles.pairs().collect();
             for (role, v) in pairs {
@@ -3480,9 +3588,10 @@ impl Vm {
             .unwrap_or_else(|| String::from("?"))
     }
 
-    fn literal(&self, method: Value, i: usize) -> Option<Value> {
-        let m = self.heap.method(method)?;
-        self.heap.array_elements(m.literals)?.get(i).copied()
+    /// Literal `i` of the running frame's method.
+    fn literal(&self, i: usize) -> Option<Value> {
+        let f = self.frames.last()?;
+        self.heap.array_elements(f.literals)?.get(i).copied()
     }
 
     fn local_return(&mut self, result: Value) -> Step {
@@ -3525,13 +3634,8 @@ impl Vm {
         n: usize,
         host: &mut dyn Host,
     ) -> Result<Option<Completion>, VmError> {
-        let (method, receiver) = {
-            let f = self.frames.last().expect("a frame");
-            (f.method, f.receiver)
-        };
-        let selector = self
-            .literal(method, selector_index)
-            .ok_or_else(|| self.invalid())?;
+        let receiver = self.frames.last().expect("a frame").receiver;
+        let selector = self.literal(selector_index).ok_or_else(|| self.invalid())?;
         let available = self.stack.len() - self.frames.last().expect("a frame").lp;
         let needed = if kind == SendKind::Ordinary { n + 1 } else { n };
         if available < needed {
@@ -3540,7 +3644,7 @@ impl Vm {
         if kind == SendKind::Ordinary {
             return self.ordinary_send(selector, n, host);
         }
-        let mixin = self.heap.method(method).expect("method").mixin;
+        let mixin = self.frames.last().expect("a frame").mixin;
         let rule = match kind {
             SendKind::SelfSend => Rule::SelfSend,
             SendKind::Super => Rule::Super,
@@ -3556,21 +3660,16 @@ impl Vm {
         depth: usize,
         host: &mut dyn Host,
     ) -> Result<Option<Completion>, VmError> {
-        let (method, receiver) = {
-            let f = self.frames.last().expect("a frame");
-            (f.method, f.receiver)
-        };
-        let selector = self
-            .literal(method, selector_index)
-            .ok_or_else(|| self.invalid())?;
-        let mixin = self.heap.method(method).expect("method").mixin;
+        let receiver = self.frames.last().expect("a frame").receiver;
+        let selector = self.literal(selector_index).ok_or_else(|| self.invalid())?;
+        let mixin = self.frames.last().expect("a frame").mixin;
         self.send(Rule::Outer(depth), selector, n, receiver, mixin, host)
     }
 
     fn enclosing_object(&self, depth: usize) -> Result<Value, VmError> {
         let f = self.frames.last().expect("a frame");
         let mut receiver = f.receiver;
-        let mut mixin = self.heap.method(f.method).expect("method").mixin;
+        let mut mixin = f.mixin;
         for _ in 0..depth {
             let application = self.find_application_of(mixin, self.class_of(receiver))?;
             receiver = self
@@ -3610,8 +3709,254 @@ impl Vm {
         Ok(None)
     }
 
+    /// Runs instructions of the current frame, from its instruction, with
+    /// the instruction pointer and the code in locals: the simple ones
+    /// (pushes, stores, branches, SmallInteger arithmetic) here, and the
+    /// first other one by [`Vm::step`], after writing the instruction
+    /// pointer back. Anything out of the ordinary in a simple one (an index
+    /// out of range, a non-Boolean condition) also goes to `step`, which
+    /// does what it always did, errors included.
+    ///
+    /// The event loop's checks before an instruction still hold for each:
+    /// no simple instruction allocates, so no collection or checkpoint can
+    /// come due between two of them, and the interrupt countdown is counted
+    /// down for every instruction, returning to the event loop before the
+    /// one at which it polls the host.
+    #[inline(always)]
+    fn run_simple(&mut self, host: &mut dyn Host) -> Result<Step, VmError> {
+        // The event loop has done its checks for the first instruction.
+        let mut first = true;
+        loop {
+            let (code, mut ip, bp, lp, arg_count, receiver, mixin) = {
+                let f = self.frames.last().expect("a frame");
+                (
+                    f.code.clone(),
+                    f.ip,
+                    f.bp,
+                    f.lp,
+                    f.arg_count,
+                    f.receiver,
+                    f.mixin,
+                )
+            };
+            let (nil, t, fl) = (
+                self.nil(),
+                self.roles.get(Role::True),
+                self.roles.get(Role::False),
+            );
+            let code_len = code.len();
+            let polls = loop {
+                if !first {
+                    // The event loop's countdown for this instruction; at the
+                    // one that polls, let the event loop run it.
+                    if self.interrupt_countdown == 1 {
+                        break true;
+                    }
+                    self.interrupt_countdown -= 1;
+                }
+                first = false;
+                let len = self.stack.len();
+                if ip >= code_len {
+                    break false;
+                }
+                let opcode = code[ip];
+                let ilen = instruction_length(opcode);
+                if ip + ilen > code_len {
+                    break false;
+                }
+                let next = ip + ilen;
+                let b1 = if ilen > 1 { code[ip + 1] } else { 0 };
+                let b2 = if ilen > 2 { code[ip + 2] } else { 0 };
+                let wide = u16::from_le_bytes([b1, b2]) as usize;
+                match opcode {
+                    0..=15 => match next.checked_sub((opcode & 15) as usize) {
+                        Some(target) => ip = target,
+                        None => break false,
+                    },
+                    16..=31 => ip = next + (opcode & 15) as usize,
+                    op::BRANCH_BACK => match next.checked_sub(wide) {
+                        Some(target) => ip = target,
+                        None => break false,
+                    },
+                    op::BRANCH => ip = next + wide,
+                    32..=63 | op::BRANCH_IF_TRUE | op::BRANCH_IF_FALSE => {
+                        if len <= lp {
+                            break false;
+                        }
+                        let v = self.stack[len - 1];
+                        let condition = matches!(opcode, 32..=47 | op::BRANCH_IF_TRUE);
+                        let taken = if v == t {
+                            condition
+                        } else if v == fl {
+                            !condition
+                        } else {
+                            break false;
+                        };
+                        self.stack.pop();
+                        let forward = if opcode < 64 {
+                            (opcode & 15) as usize
+                        } else {
+                            wide
+                        };
+                        ip = if taken { next + forward } else { next };
+                    }
+                    112..=119 | op::PUSH_PARAMETER => {
+                        let p = if opcode == op::PUSH_PARAMETER {
+                            b1 as usize
+                        } else {
+                            (opcode & 7) as usize
+                        };
+                        if p == 0 || p > arg_count || bp + 1 + (arg_count - p) >= len {
+                            break false;
+                        }
+                        self.stack.push(self.stack[bp + 1 + (arg_count - p)]);
+                        ip = next;
+                    }
+                    120..=127 | op::PUSH_LOCAL => {
+                        let i = if opcode == op::PUSH_LOCAL {
+                            b1 as usize
+                        } else {
+                            (opcode & 7) as usize
+                        };
+                        if lp + i >= len {
+                            break false;
+                        }
+                        self.stack.push(self.stack[lp + i]);
+                        ip = next;
+                    }
+                    128..=135 | op::POP_INTO_LOCAL => {
+                        let i = if opcode == op::POP_INTO_LOCAL {
+                            b1 as usize
+                        } else {
+                            (opcode & 7) as usize
+                        };
+                        // `step` checks the slot before popping; a slot at the
+                        // top is left to it as well.
+                        if lp + i + 1 >= len || len <= lp {
+                            break false;
+                        }
+                        let v = self.stack[len - 1];
+                        self.stack.pop();
+                        self.stack[lp + i] = v;
+                        ip = next;
+                    }
+                    136..=143 | op::STORE_INTO_LOCAL => {
+                        let i = if opcode == op::STORE_INTO_LOCAL {
+                            b1 as usize
+                        } else {
+                            (opcode & 7) as usize
+                        };
+                        if lp + i >= len || len <= lp {
+                            break false;
+                        }
+                        self.stack[lp + i] = self.stack[len - 1];
+                        ip = next;
+                    }
+                    144..=151 | op::PUSH_LITERAL => {
+                        let i = if opcode == op::PUSH_LITERAL {
+                            wide
+                        } else {
+                            (opcode & 7) as usize
+                        };
+                        let Some(v) = self.literal(i) else {
+                            break false;
+                        };
+                        self.stack.push(v);
+                        ip = next;
+                    }
+                    op::PUSH_NIL => {
+                        self.stack.push(nil);
+                        ip = next;
+                    }
+                    op::PUSH_FALSE => {
+                        self.stack.push(fl);
+                        ip = next;
+                    }
+                    op::PUSH_TRUE => {
+                        self.stack.push(t);
+                        ip = next;
+                    }
+                    op::PUSH_SELF => {
+                        self.stack.push(receiver);
+                        ip = next;
+                    }
+                    op::PUSH_MIXIN => {
+                        self.stack.push(mixin);
+                        ip = next;
+                    }
+                    op::POP => {
+                        if len <= lp {
+                            break false;
+                        }
+                        self.stack.pop();
+                        ip = next;
+                    }
+                    op::DUP => {
+                        if len <= lp {
+                            break false;
+                        }
+                        self.stack.push(self.stack[len - 1]);
+                        ip = next;
+                    }
+                    160..=163 => {
+                        self.stack
+                            .push(Value::small_integer(i64::from(opcode) - 161).expect("small"));
+                        ip = next;
+                    }
+                    op::PUSH_INTEGER => {
+                        let n = i16::from_le_bytes([b1, b2]);
+                        self.stack
+                            .push(Value::small_integer(n.into()).expect("small"));
+                        ip = next;
+                    }
+                    176..=189 => {
+                        if len < lp + 2 {
+                            break false;
+                        }
+                        let (Some(a), Some(b)) = (
+                            self.stack[len - 2].as_small_integer(),
+                            self.stack[len - 1].as_small_integer(),
+                        ) else {
+                            break false;
+                        };
+                        match self.small_integer_op((opcode - 176) as usize, a, b) {
+                            Some(v) => {
+                                self.stack.pop();
+                                self.stack[len - 2] = v;
+                                ip = next;
+                            }
+                            None => break false,
+                        }
+                    }
+                    _ => break false,
+                }
+            };
+            self.frames.last_mut().expect("a frame").ip = ip;
+            if polls {
+                return Ok(Step::Continue);
+            }
+            // Any other instruction, by `step`.
+            if let Step::Done(done) = self.step(host)? {
+                return Ok(Step::Done(done));
+            }
+            // The event loop's checks for the next instruction: back to it
+            // when it has something to do (no frame left, a collection or
+            // checkpoint that can be due, the countdown's poll); otherwise
+            // count the instruction down here and go on.
+            if self.frames.is_empty()
+                || self.heap.allocation_counter() >= self.safepoint_at
+                || self.interrupt_countdown == 1
+            {
+                return Ok(Step::Continue);
+            }
+            self.interrupt_countdown -= 1;
+            first = true;
+        }
+    }
+
+    #[inline(always)]
     fn step(&mut self, host: &mut dyn Host) -> Result<Step, VmError> {
-        let (method, ip, bytes) = {
+        let (ip, bytes) = {
             let f = self.frames.last().expect("a frame");
             let (code, ip) = (&f.code, f.ip);
             let Some(&first) = code.get(ip) else {
@@ -3623,7 +3968,7 @@ impl Vm {
             }
             let mut b = [0u8; 4];
             b[..len].copy_from_slice(&code[ip..ip + len]);
-            (f.method, ip, b)
+            (ip, b)
         };
         let opcode = bytes[0];
         let next = ip + instruction_length(opcode);
@@ -3681,7 +4026,7 @@ impl Vm {
             }
             144..=151 => {
                 let v = self
-                    .literal(method, (opcode & 7) as usize)
+                    .literal((opcode & 7) as usize)
                     .ok_or_else(|| self.invalid())?;
                 self.stack.push(v);
                 None
@@ -3704,7 +4049,7 @@ impl Vm {
                 None
             }
             op::PUSH_MIXIN => {
-                let mixin = self.heap.method(method).expect("method").mixin;
+                let mixin = self.frames.last().expect("a frame").mixin;
                 self.stack.push(mixin);
                 None
             }
@@ -3825,7 +4170,7 @@ impl Vm {
                 // selector: sel arguments: {args}` (V5 spec, opcode 239).
                 let index = bytes[1] as usize | (((bytes[2] & 15) as usize) << 8);
                 let n = (bytes[2] >> 4) as usize;
-                let selector = self.literal(method, index).ok_or_else(|| self.invalid())?;
+                let selector = self.literal(index).ok_or_else(|| self.invalid())?;
                 if self.stack.len() < self.frames.last().expect("a frame").lp + n + 1 {
                     return Err(self.invalid());
                 }
@@ -3893,7 +4238,7 @@ impl Vm {
                 None
             }
             op::PUSH_LITERAL => {
-                let v = self.literal(method, wide()).ok_or_else(|| self.invalid())?;
+                let v = self.literal(wide()).ok_or_else(|| self.invalid())?;
                 self.stack.push(v);
                 None
             }
