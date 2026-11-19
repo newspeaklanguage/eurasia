@@ -16,14 +16,15 @@ OUT=$EURASIA/target/genesis
 mkdir -p "$OUT"
 # The application's modules: psoup's public kernel, collections and actors,
 # and the platform over them.
-MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $NEWSPEAK/EurasiaValueProbe.ns $NEWSPEAK/EurasiaSpawnProbe.ns"
+MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/platform/PrimordialSoup/Collections.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $NEWSPEAK/EurasiaValueProbe.ns $NEWSPEAK/EurasiaSpawnProbe.ns"
 
 echo "== building EurasiaPackager.vfuel"
 (cd "$PRIMORDIALSOUP" && ./out/ReleaseX64/primordialsoup ./out/snapshots/WebCompiler.vfuel \
   ./newspeak/*.ns \
+  ./newspeak/platform/PrimordialSoup/*.ns \
   "$NEWSPEAK/Newspeak2V5BytecodeCompilation.ns" \
   "$NEWSPEAK/EurasiaPackager.ns" \
-  RuntimeWithMirrorsForPrimordialSoup EurasiaPackager "$OUT/EurasiaPackager.vfuel" > "$OUT/build.log" 2>&1) \
+  PrimordialSoup/RuntimeWithMirrors EurasiaPackager "$OUT/EurasiaPackager.vfuel" > "$OUT/build.log" 2>&1) \
   || { echo "building the packager failed; see $OUT/build.log"; exit 1; }
 
 echo "== packaging the genesis image"

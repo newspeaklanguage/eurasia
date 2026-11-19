@@ -21,11 +21,16 @@ import os
 import re
 import sys
 
+# Modules of psoup's platform that Eurasia uses as its own (it has no
+# collections of its own): packaged from psoup's platform directory, they fill
+# the slot PrimordialSoupX, and the IDE's manifest X answers them.
+BORROWED = ["Collections"]
+
 # The platform's own modules, packaged before the IDE's: N the newspeak
 # checkout, P psoup's newspeak directory, E Eurasia's platform directory
 # (newspeak/platform/Eurasia, PLATFORM_NAMESPACES_DESIGN_2026-11-18.md).
 PLATFORM = [
-    ("P", "Kernel"), ("P", "CollectionsForPrimordialSoup"), ("E", "Actors"),
+    ("P", "Kernel"), ("E", "Actors"),
     ("E", "Runtime"), ("E", "Mirrors"), ("E", "RuntimeWithMirrors"),
     ("E", "WebRuntime"), ("N", "Ducts"), ("N", "GraphicsForHTML5"),
     ("N", "FontsForHTML5"), ("N", "TextModule"), ("N", "HopscotchForHTML5"),
@@ -42,9 +47,15 @@ def main():
     ide = open(os.path.join(newspeak, "HopscotchWebIDE.ns")).read()
     # Another platform's modules, manifest P X (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md):
     # packaged from newspeak/platform/P, they fill the slots named PX.
-    platforms = {}
+    def platform_file(p, n):
+        for root in (newspeak, os.path.join(psoup, "newspeak")):
+            path = os.path.join(root, "platform", p, n + ".ns")
+            if os.path.exists(path):
+                return path
+        return None
+    platforms = {"PrimordialSoup": set(BORROWED)}
     for p, n in re.findall(r"manifest ([A-Za-z_0-9]+) ([A-Za-z_0-9]+)", ide):
-        if os.path.exists(os.path.join(newspeak, "platform", p, n + ".ns")):
+        if platform_file(p, n):
             platforms.setdefault(p, set()).add(n)
     # Comments mention words after 'manifest' too; keep names that are files.
     names = sorted(set(re.findall(r"manifest ([A-Za-z_0-9]+)", ide)) - set(platforms))
@@ -66,6 +77,7 @@ def main():
     foreign = [(p, n) for p in sorted(platforms) for n in sorted(platforms[p])]
     slots = "\n".join([f"\t\t{n}" for _, n in all_modules] + [f"\t\t{p}{n}" for p, n in foreign])
     lookups = "\n".join([f"\t\t\t'{n}' = name ifTrue: [ ^outer EurasiaIDE {n} ]." for _, n in modules]
+                        + [f"\t\t\t'{n}' = name ifTrue: [ ^outer EurasiaIDE PrimordialSoup{n} ]." for n in BORROWED]
                         + [f"\t\t\t'{p}' = name ifTrue: [ ^PlatformManifest named: '{p}' ]." for p in sorted(platforms)])
     platform_lookups = "\n".join(f"\t\t\t('{p}' = platform and: [ '{n}' = name ]) ifTrue: [ ^outer EurasiaIDE {p}{n} ]."
                                   for p, n in foreign)
@@ -111,7 +123,7 @@ class EurasiaIDE usingPlatform: platform = (
 		| base reflective |
 		internalKernel:: ik.
 		base:: (Runtime kernel: Kernel
-			collections: CollectionsForPrimordialSoup
+			collections: PrimordialSoupCollections
 			actors: Actors) Platform internalKernel: ik.
 		reflective:: (RuntimeWithMirrors mirrors: Mirrors
 			asts: NewspeakASTs
@@ -139,7 +151,7 @@ class EurasiaIDE usingPlatform: platform = (
                      "E": os.path.join(newspeak, "platform", "Eurasia")}[where]
         print(os.path.join(directory, n + ".ns"))
     for p, n in foreign:
-        print(os.path.join(newspeak, "platform", p, n + ".ns"))
+        print(platform_file(p, n))
 
 
 main()

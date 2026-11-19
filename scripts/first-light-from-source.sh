@@ -17,9 +17,10 @@ mkdir -p "$OUT"
 echo "== building EurasiaPackager.vfuel"
 (cd "$PRIMORDIALSOUP" && ./out/ReleaseX64/primordialsoup ./out/snapshots/WebCompiler.vfuel \
   ./newspeak/*.ns \
+  ./newspeak/platform/PrimordialSoup/*.ns \
   "$NEWSPEAK/Newspeak2V5BytecodeCompilation.ns" \
   "$NEWSPEAK/EurasiaPackager.ns" \
-  RuntimeWithMirrorsForPrimordialSoup EurasiaPackager "$OUT/EurasiaPackager.vfuel" > "$OUT/build.log" 2>&1) \
+  PrimordialSoup/RuntimeWithMirrors EurasiaPackager "$OUT/EurasiaPackager.vfuel" > "$OUT/build.log" 2>&1) \
   || { echo "building the packager failed; see $OUT/build.log"; exit 1; }
 
 echo "== packaging EurasiaFirstLight.ns"

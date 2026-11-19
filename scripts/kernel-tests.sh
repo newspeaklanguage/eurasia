@@ -18,18 +18,19 @@ PRIMORDIALSOUP=${PRIMORDIALSOUP:-$EURASIA/../primordialsoup}
 PSOUP=$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup
 OUT=$EURASIA/target/kerneltests
 mkdir -p "$OUT"
-MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $PRIMORDIALSOUP/newspeak/Minitest.ns $PRIMORDIALSOUP/newspeak/KernelTests.ns $PRIMORDIALSOUP/newspeak/AccessModifierTesting.ns $PRIMORDIALSOUP/newspeak/KernelWeakTests.ns $PRIMORDIALSOUP/newspeak/ActorsTesting.ns $PRIMORDIALSOUP/newspeak/TestActor.ns $NEWSPEAK/platform/Eurasia/Mirrors.ns $NEWSPEAK/platform/Eurasia/RuntimeWithMirrors.ns $PRIMORDIALSOUP/newspeak/NewspeakASTs.ns $PRIMORDIALSOUP/newspeak/NewspeakPredictiveParsing.ns $PRIMORDIALSOUP/newspeak/IntermediatesForPrimordialSoup.ns $PRIMORDIALSOUP/newspeak/NewspeakCompilation.ns $PRIMORDIALSOUP/newspeak/NewspeakBytecodeCompilation.ns $NEWSPEAK/Newspeak2V5BytecodeCompilation.ns $PRIMORDIALSOUP/newspeak/MetadataParsing.ns $PRIMORDIALSOUP/newspeak/MirrorTesting.ns $PRIMORDIALSOUP/newspeak/MirrorTestingModel.ns $PRIMORDIALSOUP/newspeak/MirrorBuilderTesting.ns $PRIMORDIALSOUP/newspeak/ActivationMirrorTesting.ns"
+MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/platform/PrimordialSoup/Collections.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $PRIMORDIALSOUP/newspeak/Minitest.ns $PRIMORDIALSOUP/newspeak/KernelTests.ns $PRIMORDIALSOUP/newspeak/AccessModifierTesting.ns $PRIMORDIALSOUP/newspeak/KernelWeakTests.ns $PRIMORDIALSOUP/newspeak/ActorsTesting.ns $PRIMORDIALSOUP/newspeak/TestActor.ns $NEWSPEAK/platform/Eurasia/Mirrors.ns $NEWSPEAK/platform/Eurasia/RuntimeWithMirrors.ns $PRIMORDIALSOUP/newspeak/NewspeakASTs.ns $PRIMORDIALSOUP/newspeak/NewspeakPredictiveParsing.ns $PRIMORDIALSOUP/newspeak/IntermediatesForPrimordialSoup.ns $PRIMORDIALSOUP/newspeak/NewspeakCompilation.ns $PRIMORDIALSOUP/newspeak/NewspeakBytecodeCompilation.ns $NEWSPEAK/Newspeak2V5BytecodeCompilation.ns $PRIMORDIALSOUP/newspeak/MetadataParsing.ns $PRIMORDIALSOUP/newspeak/MirrorTesting.ns $PRIMORDIALSOUP/newspeak/MirrorTestingModel.ns $PRIMORDIALSOUP/newspeak/MirrorBuilderTesting.ns $PRIMORDIALSOUP/newspeak/ActivationMirrorTesting.ns"
 
 echo "== building EurasiaPackager.vfuel and EurasiaKernelTestReference.vfuel"
 (cd "$PRIMORDIALSOUP" && "$PSOUP" ./out/snapshots/WebCompiler.vfuel \
   ./newspeak/*.ns \
+  ./newspeak/platform/PrimordialSoup/*.ns \
   "$NEWSPEAK/Newspeak2V5BytecodeCompilation.ns" \
   "$NEWSPEAK/EurasiaPackager.ns" \
-  RuntimeWithMirrorsForPrimordialSoup EurasiaPackager "$OUT/EurasiaPackager.vfuel" > "$OUT/build.log" 2>&1) \
+  PrimordialSoup/RuntimeWithMirrors EurasiaPackager "$OUT/EurasiaPackager.vfuel" > "$OUT/build.log" 2>&1) \
   || { echo "building the packager failed; see $OUT/build.log"; exit 1; }
 (cd "$PRIMORDIALSOUP" && "$PSOUP" ./out/snapshots/WebCompiler.vfuel \
-  ./newspeak/*.ns "$NEWSPEAK/EurasiaKernelTestReference.ns" \
-  RuntimeWithMirrorsForPrimordialSoup EurasiaKernelTestReference "$OUT/Reference.vfuel" > "$OUT/build-reference.log" 2>&1) \
+  ./newspeak/*.ns ./newspeak/platform/PrimordialSoup/*.ns "$NEWSPEAK/EurasiaKernelTestReference.ns" \
+  PrimordialSoup/RuntimeWithMirrors EurasiaKernelTestReference "$OUT/Reference.vfuel" > "$OUT/build-reference.log" 2>&1) \
   || { echo "building the reference failed; see $OUT/build-reference.log"; exit 1; }
 
 echo "== psoup"

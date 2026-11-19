@@ -4,7 +4,7 @@
 # This script contains excerpts of Primordial Soup's Newspeak sources,
 # Copyright 2008, the Newspeak project authors, licensed under the Apache
 # License, Version 2.0; see the LICENSE file.
-"""Derive newspeak/platform/Eurasia/Actors.ns from psoup's ActorsForPrimordialSoup.ns.
+"""Derive newspeak/platform/Eurasia/Actors.ns from psoup's platform/PrimordialSoup/Actors.ns (same class name).
 
 The actors on Eurasia are VM actors (EURASIA_ACTORS_DESIGN_2026-11-17.md
 section 5): each has its own heap, mailbox and a clone of the platform, and
@@ -27,7 +27,7 @@ reactors; this fork replaces only what crossed actors inside one heap:
   far references.
 
 Every edit is checked: the script fails if psoup's source has changed under
-it. Usage: fork-actors.py <ActorsForPrimordialSoup.ns> <output>.
+it. Usage: fork-actors.py <psoup Actors.ns> <output>.
 """
 
 import sys
@@ -46,8 +46,7 @@ def main():
 
     # 1. The module's name (the natives table keys its rows by it).
     # Eurasia's platform namespace (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md).
-    t = replace(t, "Newspeak3\n'Root'\n", "Newspeak3\n'Eurasia'\n")
-    t = replace(t, "class ActorsForPrimordialSoup usingPlatform: p = (", "class Actors usingPlatform: p = (")
+    t = replace(t, "Newspeak3\n'PrimordialSoup'\n", "Newspeak3\n'Eurasia'\n")
 
     # 2. An Actor is a VM actor; seed: answers a far reference to a value in it.
     t = replace(t, """	public class Actor named: debugName <String> = (

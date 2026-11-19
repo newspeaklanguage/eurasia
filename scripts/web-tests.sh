@@ -49,7 +49,7 @@ echo "== the JS FFI and callbacks: JSTesting and EurasiaHostTesting on wasm"
 NEWSPEAK=${NEWSPEAK:-$EURASIA/../newspeak}
 PRIMORDIALSOUP=${PRIMORDIALSOUP:-$EURASIA/../primordialsoup}
 P=$PRIMORDIALSOUP/newspeak
-JSMODULES="$P/Kernel.ns $P/CollectionsForPrimordialSoup.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $P/Minitest.ns $P/JSTesting.ns $NEWSPEAK/EurasiaHostTesting.ns"
+JSMODULES="$P/Kernel.ns $P/platform/PrimordialSoup/Collections.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $P/Minitest.ns $P/JSTesting.ns $NEWSPEAK/EurasiaHostTesting.ns"
 mkdir -p "$OUT/js"
 # shellcheck disable=SC2086
 "$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel \
@@ -69,7 +69,7 @@ fi
 echo "== CounterApp: packaged with Hopscotch, genesis on the command line"
 # Hopscotch needs a DOM, so CounterApp runs only in a browser: open
 # index.html?snapshot=counter/base.eus from a server for target/web.
-COUNTERMODULES="$P/Kernel.ns $P/CollectionsForPrimordialSoup.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $NEWSPEAK/Ducts.ns $NEWSPEAK/GraphicsForHTML5.ns $NEWSPEAK/FontsForHTML5.ns $NEWSPEAK/TextModule.ns $NEWSPEAK/HopscotchForHTML5.ns $NEWSPEAK/VoiceController.ns $NEWSPEAK/AIAccess.ns $NEWSPEAK/platform/Eurasia/WebRuntime.ns $NEWSPEAK/CounterUI.ns"
+COUNTERMODULES="$P/Kernel.ns $P/platform/PrimordialSoup/Collections.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $NEWSPEAK/Ducts.ns $NEWSPEAK/GraphicsForHTML5.ns $NEWSPEAK/FontsForHTML5.ns $NEWSPEAK/TextModule.ns $NEWSPEAK/HopscotchForHTML5.ns $NEWSPEAK/VoiceController.ns $NEWSPEAK/AIAccess.ns $NEWSPEAK/platform/Eurasia/WebRuntime.ns $NEWSPEAK/CounterUI.ns"
 mkdir -p "$OUT/counter"
 # shellcheck disable=SC2086
 "$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel \
