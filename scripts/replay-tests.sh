@@ -91,8 +91,8 @@ echo "the kernel tests (with checkpoints) and the JS tests replay"
 echo "== a checkpoint restored into a new host"
 mkdir -p "$OUT/restore"
 "$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel \
-  "$NEWSPEAK/EurasiaKernel.ns" kernel/natives.tsv "$NEWSPEAK/EurasiaRestoreProbe.ns" \
-  "$P/Kernel.ns" "$P/CollectionsForPrimordialSoup.ns" "$NEWSPEAK/EurasiaActors.ns" "$NEWSPEAK/EurasiaRuntime.ns" \
+  "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv "$NEWSPEAK/EurasiaRestoreProbe.ns" \
+  "$P/Kernel.ns" "$P/CollectionsForPrimordialSoup.ns" "$NEWSPEAK/platform/Eurasia/Actors.ns" "$NEWSPEAK/platform/Eurasia/Runtime.ns" \
   "$OUT/restore/genesis.eus" > "$OUT/restore/package.log"
 (cd "$OUT/restore" && "$E" genesis.eus base.eus)
 EURASIA_RECORD="$OUT/restore/session.log" node web/run-node.mjs "$WASM" "$OUT/restore/base.eus" > "$OUT/restore/recorded.txt"

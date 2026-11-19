@@ -4,7 +4,7 @@
 # This script contains excerpts of Primordial Soup's Newspeak sources,
 # Copyright 2008, the Newspeak project authors, licensed under the Apache
 # License, Version 2.0; see the LICENSE file.
-"""Derive newspeak/EurasiaMirrors.ns from psoup's MirrorsForPrimordialSoup.ns.
+"""Derive newspeak/platform/Eurasia/Mirrors.ns from psoup's MirrorsForPrimordialSoup.ns.
 
 The mirrors on Eurasia (newspeak/EURASIA_M6_REFLECTION_DESIGN_2026-11-18.md
 section 4.2): psoup's mirror library, with what knows psoup's object layout
@@ -49,8 +49,10 @@ def main():
     t = open(source).read()
 
     # 1. The module's name.
+    # Eurasia's platform namespace (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md).
+    t = replace(t, "Newspeak3\n'Root'\n", "Newspeak3\n'Eurasia'\n")
     t = replace(t, "class MirrorsForPrimordialSoup usingPlatform: platform internalKernel: ik namespace: ns",
-                "class EurasiaMirrors usingPlatform: platform internalKernel: ik namespace: ns")
+                "class Mirrors usingPlatform: platform internalKernel: ik namespace: ns")
 
     # 2. Classes: Eurasia's contract fields (mixin, superclass, enclosing
     #    object, name, library). The enclosing object is field 3 on both.

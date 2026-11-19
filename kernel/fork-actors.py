@@ -4,7 +4,7 @@
 # This script contains excerpts of Primordial Soup's Newspeak sources,
 # Copyright 2008, the Newspeak project authors, licensed under the Apache
 # License, Version 2.0; see the LICENSE file.
-"""Derive newspeak/EurasiaActors.ns from psoup's ActorsForPrimordialSoup.ns.
+"""Derive newspeak/platform/Eurasia/Actors.ns from psoup's ActorsForPrimordialSoup.ns.
 
 The actors on Eurasia are VM actors (EURASIA_ACTORS_DESIGN_2026-11-17.md
 section 5): each has its own heap, mailbox and a clone of the platform, and
@@ -45,7 +45,9 @@ def main():
     t = open(source).read()
 
     # 1. The module's name (the natives table keys its rows by it).
-    t = replace(t, "class ActorsForPrimordialSoup usingPlatform: p = (", "class EurasiaActors usingPlatform: p = (")
+    # Eurasia's platform namespace (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md).
+    t = replace(t, "Newspeak3\n'Root'\n", "Newspeak3\n'Eurasia'\n")
+    t = replace(t, "class ActorsForPrimordialSoup usingPlatform: p = (", "class Actors usingPlatform: p = (")
 
     # 2. An Actor is a VM actor; seed: answers a far reference to a value in it.
     t = replace(t, """	public class Actor named: debugName <String> = (

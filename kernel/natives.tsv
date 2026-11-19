@@ -128,24 +128,24 @@ VMMirror	instance	snapshot	VmSnapshot	90
 VMMirror	instance	writeBytes:toFile:	VmWriteFile	91
 VMMirror	instance	readFile:	VmReadFile	92
 VMMirror	instance	setRole:to:	VmSetRole	93
-# The actors module (newspeak/EurasiaActors.ns, derived from psoup's by
+# The actors module (newspeak/platform/Eurasia/Actors.ns, derived from psoup's by
 # kernel/fork-actors.py): the genesis packager installs these natives on its
 # methods by class name, as psoup's primitives were.
-EurasiaActors	instance	classOf:	VmClassOf	113
-EurasiaActors	instance	currentMonotonicNanos	VmMonotonicNanos	121
-EurasiaActors	instance	newActorHandle	VmNewActor	127
-EurasiaActors	instance	farReference:to:	VmFarReferenceTo	128
-EurasiaActors	instance	post:to:	VmPost	129
-EurasiaActors	instance	isFarReference:	VmIsFarReference	130
+Actors	instance	classOf:	VmClassOf	113
+Actors	instance	currentMonotonicNanos	VmMonotonicNanos	121
+Actors	instance	newActorHandle	VmNewActor	127
+Actors	instance	farReference:to:	VmFarReferenceTo	128
+Actors	instance	post:to:	VmPost	129
+Actors	instance	isFarReference:	VmIsFarReference	130
 MessageLoop	instance	finish:	VmFinishTurn	123
 MessageLoop	instance	exit:	VmExit	21
-EurasiaActors	instance	newPromiseFor:	VmNewPromise	132
-EurasiaActors	instance	resolvePromise:with:	VmResolvePromise	133
-EurasiaActors	instance	breakPromise:with:	VmBreakPromise	134
-EurasiaActors	instance	promiseState:	VmPromiseState	135
-EurasiaActors	instance	promise:addWaiter:	VmPromiseAddWaiter	136
-EurasiaActors	instance	isVMPromise:	VmIsPromise	137
-EurasiaActors	instance	promise:send:	VmPromiseSend	138
+Actors	instance	newPromiseFor:	VmNewPromise	132
+Actors	instance	resolvePromise:with:	VmResolvePromise	133
+Actors	instance	breakPromise:with:	VmBreakPromise	134
+Actors	instance	promiseState:	VmPromiseState	135
+Actors	instance	promise:addWaiter:	VmPromiseAddWaiter	136
+Actors	instance	isVMPromise:	VmIsPromise	137
+Actors	instance	promise:send:	VmPromiseSend	138
 # Host objects (operation list, section 10): the kernel's Alien class.
 VMMirror	instance	hostGlobal	VmHostGlobal	140
 Alien	instance	at:	AlienAt	141
@@ -163,22 +163,22 @@ Method	instance	header	MethodHeader	149
 Method	instance	header:	MethodHeaderPut	150
 Method	instance	bytecode	MethodBytecode	151
 Method	instance	bytecode:	MethodBytecodePut	152
-# The mirrors module (newspeak/EurasiaMirrors.ns, derived from psoup's by
+# The mirrors module (newspeak/platform/Eurasia/Mirrors.ns, derived from psoup's by
 # kernel/fork-mirrors.py): its primitive methods.
-EurasiaMirrors	instance	allInstancesOf:	VmAllInstancesOf	153
-EurasiaMirrors	instance	allocate:	VmInstantiate	116
-EurasiaMirrors	instance	classOf:	VmClassOf	113
-EurasiaMirrors	instance	copiedOf:at:	ClosureCopiedAt	154
-EurasiaMirrors	instance	copiedOf:at:put:	ClosureCopiedAtPut	155
-EurasiaMirrors	instance	currentActivation	CurrentActivation	100
-EurasiaMirrors	instance	definingActivationOf:	DefiningActivationOf	110
-EurasiaMirrors	instance	identityHashOf:	VmIdentityHashOf	115
-EurasiaMirrors	instance	initialBCIOf:	ClosureInitialPc	156
-EurasiaMirrors	instance	is:identicalTo:	VmIsIdenticalTo	114
-EurasiaMirrors	instance	isCanonical:	VmIsCanonical	117
-EurasiaMirrors	instance	numCopiedOf:	ClosureNumCopied	157
-EurasiaMirrors	instance	slotOf:at:	VmSlotOfAt	111
-EurasiaMirrors	instance	slotOf:at:put:	VmSlotOfAtPut	112
+Mirrors	instance	allInstancesOf:	VmAllInstancesOf	153
+Mirrors	instance	allocate:	VmInstantiate	116
+Mirrors	instance	classOf:	VmClassOf	113
+Mirrors	instance	copiedOf:at:	ClosureCopiedAt	154
+Mirrors	instance	copiedOf:at:put:	ClosureCopiedAtPut	155
+Mirrors	instance	currentActivation	CurrentActivation	100
+Mirrors	instance	definingActivationOf:	DefiningActivationOf	110
+Mirrors	instance	identityHashOf:	VmIdentityHashOf	115
+Mirrors	instance	initialBCIOf:	ClosureInitialPc	156
+Mirrors	instance	is:identicalTo:	VmIsIdenticalTo	114
+Mirrors	instance	isCanonical:	VmIsCanonical	117
+Mirrors	instance	numCopiedOf:	ClosureNumCopied	157
+Mirrors	instance	slotOf:at:	VmSlotOfAt	111
+Mirrors	instance	slotOf:at:put:	VmSlotOfAtPut	112
 ClassMirror	class	allInstancesOf:	VmAllInstancesOf	153
 # Program change (M6 step 3).
 VMMirror	instance	commit:	VmCommit	158
@@ -188,8 +188,8 @@ VMMirror	instance	programVersion	VmProgramVersion	161
 VMMirror	instance	checkpointNow	VmCheckpointNow	174
 VMMirror	instance	checkpointPolicy:	VmCheckpointPolicy	175
 VMMirror	instance	logPosition	VmLogPosition	176
-EurasiaMirrors	instance	subclassesOf:	VmSubclassesOf	160
-EurasiaMirrors	instance	commit:	VmCommit	158
+Mirrors	instance	subclassesOf:	VmSubclassesOf	160
+Mirrors	instance	commit:	VmCommit	158
 # Activations and the Simulator (M6 step 4).
 Activation	instance	method:	ActivationMethodPut	163
 Activation	instance	closure:	ActivationClosurePut	164
@@ -202,9 +202,9 @@ VMMirror	instance	isSimulationRoot:	VmIsSimulationRoot	169
 VMMirror	instance	continueAt:with:	VmContinueAt	170
 VMMirror	instance	resumeActivation:	VmResumeActivation	171
 VMMirror	instance	runNative:receiver:arguments:	VmRunNative	172
-EurasiaMirrors	instance	currentMessageLoop	VmCurrentMessageLoop	131
-EurasiaMirrors	instance	isSimulationRoot:	VmIsSimulationRoot	169
-EurasiaMirrors	instance	markSimulationRoot:	VmMarkSimulationRoot	168
-EurasiaMirrors	instance	runNative:receiver:arguments:	VmRunNative	172
+Mirrors	instance	currentMessageLoop	VmCurrentMessageLoop	131
+Mirrors	instance	isSimulationRoot:	VmIsSimulationRoot	169
+Mirrors	instance	markSimulationRoot:	VmMarkSimulationRoot	168
+Mirrors	instance	runNative:receiver:arguments:	VmRunNative	172
 Thread	instance	jumpTo:	VmResumeActivation	171
 Simulator	instance	newClosureIn:initialBCI:numArgs:numCopied:	ClosureIn	173

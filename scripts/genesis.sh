@@ -16,7 +16,7 @@ OUT=$EURASIA/target/genesis
 mkdir -p "$OUT"
 # The application's modules: psoup's public kernel, collections and actors,
 # and the platform over them.
-MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $NEWSPEAK/EurasiaActors.ns $NEWSPEAK/EurasiaRuntime.ns $NEWSPEAK/EurasiaValueProbe.ns $NEWSPEAK/EurasiaSpawnProbe.ns"
+MODULES="$PRIMORDIALSOUP/newspeak/Kernel.ns $PRIMORDIALSOUP/newspeak/CollectionsForPrimordialSoup.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $NEWSPEAK/EurasiaValueProbe.ns $NEWSPEAK/EurasiaSpawnProbe.ns"
 
 echo "== building EurasiaPackager.vfuel"
 (cd "$PRIMORDIALSOUP" && ./out/ReleaseX64/primordialsoup ./out/snapshots/WebCompiler.vfuel \
@@ -28,7 +28,7 @@ echo "== building EurasiaPackager.vfuel"
 
 echo "== packaging the genesis image"
 "$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" "$OUT/EurasiaPackager.vfuel" \
-  "$NEWSPEAK/EurasiaKernel.ns" "$EURASIA/kernel/natives.tsv" \
+  "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" "$EURASIA/kernel/natives.tsv" \
   "$NEWSPEAK/EurasiaKernelSmokeTest.ns" $MODULES "$OUT/genesis.eus"
 
 cargo build -q -p eurasia-native
@@ -65,7 +65,7 @@ grep -q "failDeeper" "$OUT/unhandled.txt" || { echo "the trace lacks failDeeper"
 echo "== reproducibility: building again must give byte-identical images"
 mkdir -p "$OUT/again"
 "$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" "$OUT/EurasiaPackager.vfuel" \
-  "$NEWSPEAK/EurasiaKernel.ns" "$EURASIA/kernel/natives.tsv" \
+  "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" "$EURASIA/kernel/natives.tsv" \
   "$NEWSPEAK/EurasiaKernelSmokeTest.ns" $MODULES "$OUT/again/genesis.eus" > /dev/null
 # A different output path: a snapshot saves only what the roles reach, so
 # the arguments genesis ran with are not in the image.

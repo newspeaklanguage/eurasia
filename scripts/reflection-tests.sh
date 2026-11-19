@@ -28,9 +28,9 @@ echo "== building EurasiaPackager.vfuel"
   || { echo "building the packager failed; see $OUT/build.log"; exit 1; }
 
 echo "== the compiler probe"
-MODULES="$P/Kernel.ns $P/CollectionsForPrimordialSoup.ns $NEWSPEAK/EurasiaActors.ns $NEWSPEAK/EurasiaRuntime.ns $P/NewspeakASTs.ns $P/NewspeakPredictiveParsing.ns $P/IntermediatesForPrimordialSoup.ns $P/NewspeakCompilation.ns $P/NewspeakBytecodeCompilation.ns $NEWSPEAK/Newspeak2V5BytecodeCompilation.ns"
+MODULES="$P/Kernel.ns $P/CollectionsForPrimordialSoup.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $P/NewspeakASTs.ns $P/NewspeakPredictiveParsing.ns $P/IntermediatesForPrimordialSoup.ns $P/NewspeakCompilation.ns $P/NewspeakBytecodeCompilation.ns $NEWSPEAK/Newspeak2V5BytecodeCompilation.ns"
 # shellcheck disable=SC2086
-"$PSOUP" "$OUT/EurasiaPackager.vfuel" "$NEWSPEAK/EurasiaKernel.ns" kernel/natives.tsv \
+"$PSOUP" "$OUT/EurasiaPackager.vfuel" "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv \
   "$NEWSPEAK/EurasiaCompilerProbe.ns" $MODULES "$OUT/genesis.eus" > "$OUT/package.log"
 cargo build -q --release -p eurasia-native
 EURASIA_BIN=$EURASIA/target/release/eurasia
@@ -41,10 +41,10 @@ expected=$(printf '%s\n' 'compiled Probe' 42 56 'built at run time!' 'class side
 EURASIA_GC_STRESS=200 "$EURASIA_BIN" "$OUT/base.eus" > "$OUT/output-stress.txt"
 cmp "$OUT/output.txt" "$OUT/output-stress.txt" || { echo "GC stress changed the output"; exit 1; }
 echo "== the debugger probe: a broken thread outlives its turn"
-REFLECTIVE="$P/Kernel.ns $P/CollectionsForPrimordialSoup.ns $NEWSPEAK/EurasiaActors.ns $NEWSPEAK/EurasiaRuntime.ns $NEWSPEAK/EurasiaMirrors.ns $NEWSPEAK/EurasiaReflectiveRuntime.ns $P/NewspeakASTs.ns $P/NewspeakPredictiveParsing.ns $P/IntermediatesForPrimordialSoup.ns $P/NewspeakCompilation.ns $P/NewspeakBytecodeCompilation.ns $NEWSPEAK/Newspeak2V5BytecodeCompilation.ns $P/MetadataParsing.ns"
+REFLECTIVE="$P/Kernel.ns $P/CollectionsForPrimordialSoup.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $NEWSPEAK/platform/Eurasia/Mirrors.ns $NEWSPEAK/platform/Eurasia/RuntimeWithMirrors.ns $P/NewspeakASTs.ns $P/NewspeakPredictiveParsing.ns $P/IntermediatesForPrimordialSoup.ns $P/NewspeakCompilation.ns $P/NewspeakBytecodeCompilation.ns $NEWSPEAK/Newspeak2V5BytecodeCompilation.ns $P/MetadataParsing.ns"
 mkdir -p "$OUT/debugger"
 # shellcheck disable=SC2086
-"$PSOUP" "$OUT/EurasiaPackager.vfuel" "$NEWSPEAK/EurasiaKernel.ns" kernel/natives.tsv \
+"$PSOUP" "$OUT/EurasiaPackager.vfuel" "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv \
   "$NEWSPEAK/EurasiaDebuggerProbe.ns" $REFLECTIVE "$OUT/debugger/genesis.eus" > "$OUT/debugger/package.log"
 (cd "$OUT/debugger" && "$EURASIA_BIN" genesis.eus base.eus)
 "$EURASIA_BIN" "$OUT/debugger/base.eus" | tee "$OUT/debugger/output.txt"

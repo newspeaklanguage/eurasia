@@ -1,10 +1,10 @@
 #!/bin/sh
 # Copyright (c) 2026-2027, Gilad Bracha. All rights reserved. Use of this source
 # code is governed by a BSD-style license that can be found in the LICENSE file.
-# Regenerate the Eurasia forks of psoup's modules: newspeak/EurasiaKernel.ns
+# Regenerate the Eurasia forks of psoup's modules: newspeak/platform/Eurasia/InternalKernel.ns
 # from KernelForPrimordialSoup.ns (kernel/fork-kernel.py) and
-# newspeak/EurasiaActors.ns from ActorsForPrimordialSoup.ns
-# (kernel/fork-actors.py) and newspeak/EurasiaMirrors.ns from
+# newspeak/platform/Eurasia/Actors.ns from ActorsForPrimordialSoup.ns
+# (kernel/fork-actors.py) and newspeak/platform/Eurasia/Mirrors.ns from
 # MirrorsForPrimordialSoup.ns (kernel/fork-mirrors.py), pretty-printed and
 # parse-validated as the newspeak
 # repository requires. Each output replaces its file only if it parses.
@@ -23,8 +23,8 @@ cd "$NEWSPEAK/tool"
 ./pretty-print.sh "$TMP/raw.ns" "$TMP/printed.ns" > /dev/null
 ./parse-validate.sh "$TMP/printed.ns" | grep -q "is syntactically valid" \
   || { echo "the printed fork does not parse"; exit 1; }
-cp "$TMP/printed.ns" "$NEWSPEAK/EurasiaKernel.ns"
-echo "fork-kernel: wrote $NEWSPEAK/EurasiaKernel.ns"
+cp "$TMP/printed.ns" "$NEWSPEAK/platform/Eurasia/InternalKernel.ns"
+echo "fork-kernel: wrote $NEWSPEAK/platform/Eurasia/InternalKernel.ns"
 
 # The actors module (kernel/fork-actors.py), the same way.
 python3 "$EURASIA/kernel/fork-actors.py" "$PRIMORDIALSOUP/newspeak/ActorsForPrimordialSoup.ns" "$TMP/actors-raw.ns"
@@ -33,8 +33,8 @@ python3 "$EURASIA/kernel/fork-actors.py" "$PRIMORDIALSOUP/newspeak/ActorsForPrim
 ./pretty-print.sh "$TMP/actors-raw.ns" "$TMP/actors-printed.ns" > /dev/null
 ./parse-validate.sh "$TMP/actors-printed.ns" | grep -q "is syntactically valid" \
   || { echo "the printed actors fork does not parse"; exit 1; }
-cp "$TMP/actors-printed.ns" "$NEWSPEAK/EurasiaActors.ns"
-echo "fork-kernel: wrote $NEWSPEAK/EurasiaActors.ns"
+cp "$TMP/actors-printed.ns" "$NEWSPEAK/platform/Eurasia/Actors.ns"
+echo "fork-kernel: wrote $NEWSPEAK/platform/Eurasia/Actors.ns"
 
 # The mirrors module (kernel/fork-mirrors.py), the same way.
 python3 "$EURASIA/kernel/fork-mirrors.py" "$PRIMORDIALSOUP/newspeak/MirrorsForPrimordialSoup.ns" \
@@ -44,5 +44,5 @@ python3 "$EURASIA/kernel/fork-mirrors.py" "$PRIMORDIALSOUP/newspeak/MirrorsForPr
 ./pretty-print.sh "$TMP/mirrors-raw.ns" "$TMP/mirrors-printed.ns" > /dev/null
 ./parse-validate.sh "$TMP/mirrors-printed.ns" | grep -q "is syntactically valid" \
   || { echo "the printed mirrors fork does not parse"; exit 1; }
-cp "$TMP/mirrors-printed.ns" "$NEWSPEAK/EurasiaMirrors.ns"
-echo "fork-kernel: wrote $NEWSPEAK/EurasiaMirrors.ns"
+cp "$TMP/mirrors-printed.ns" "$NEWSPEAK/platform/Eurasia/Mirrors.ns"
+echo "fork-kernel: wrote $NEWSPEAK/platform/Eurasia/Mirrors.ns"

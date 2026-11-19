@@ -4,7 +4,7 @@
 # This script contains excerpts of Primordial Soup's Newspeak sources,
 # Copyright 2008, the Newspeak project authors, licensed under the Apache
 # License, Version 2.0; see the LICENSE file.
-"""Derive EurasiaKernel.ns from psoup's KernelForPrimordialSoup.ns.
+"""Derive platform/Eurasia/InternalKernel.ns from psoup's KernelForPrimordialSoup.ns.
 
 Usage: fork-kernel.py PSOUP_KERNEL.ns OUTPUT.ns
 
@@ -32,8 +32,10 @@ def main():
     t = open(source).read()
 
     # 1. The module's name.
-    t = replace(t, "class KernelForPrimordialSoup new = (", "class EurasiaKernel new = (")
-    t = replace(t, "outer KernelForPrimordialSoup ", "outer EurasiaKernel ", t.count("outer KernelForPrimordialSoup "))
+    # Eurasia's platform namespace (PLATFORM_NAMESPACES_DESIGN_2026-11-18.md).
+    t = replace(t, "Newspeak3\n'Root'\n", "Newspeak3\n'Eurasia'\n")
+    t = replace(t, "class KernelForPrimordialSoup new = (", "class InternalKernel new = (")
+    t = replace(t, "outer KernelForPrimordialSoup ", "outer InternalKernel ", t.count("outer KernelForPrimordialSoup "))
 
     # 2. Primitive pragmas out: natives are the packager's table, never source
     #    (the V5 compiler rejects them). Each pragma is followed by a line of
@@ -624,12 +626,12 @@ def main():
 	) (
 	) : ()
 """ + anchor)
-    t = replace(t, """			^outer EurasiaKernel _Array
+    t = replace(t, """			^outer InternalKernel _Array
 		)
-""", """			^outer EurasiaKernel _Array
+""", """			^outer InternalKernel _Array
 		)
 		Value ^<Value class> = (
-			^outer EurasiaKernel Value
+			^outer InternalKernel Value
 		)
 """)
 

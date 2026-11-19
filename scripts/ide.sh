@@ -34,7 +34,7 @@ MODULES=$(grep '\.ns$' "$OUT/modules.txt" | tr '\n' ' ')
 
 echo "== packaging and genesis"
 # shellcheck disable=SC2086
-"$PSOUP" "$OUT/EurasiaPackager.vfuel" "$NEWSPEAK/EurasiaKernel.ns" kernel/natives.tsv \
+"$PSOUP" "$OUT/EurasiaPackager.vfuel" "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv \
   "$NEWSPEAK/EurasiaIDE.ns" $MODULES "$OUT/genesis.eus" > "$OUT/package.log" 2>&1 \
   || true
 grep -q "^Wrote" "$OUT/package.log" || { head -3 "$OUT/package.log"; echo "packaging the IDE failed; see $OUT/package.log"; exit 1; }
