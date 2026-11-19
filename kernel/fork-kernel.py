@@ -143,6 +143,28 @@ def main():
 		vm setRole: 36 to: (vm clone: loop).
 		vm writeBytes: vm snapshot toFile: (args at: 1)
 	)
+	traceCallbackException: exception text: text = (
+		(* Print an exception that stopped at a callback boundary (Closure>>dispatchCallbackWith:) and the stack it was signalled on, from the frame that signalled it (the handler runs above it). Sends nothing to the exception's receiver or the frames' receivers (their printString may itself fail, or forward everything, as a proxy does): the class names come from the VM mirror. Never fails: a failure while tracing is dropped. *)
+
+		[
+			| a depth |
+			vm print: 'Exception in a callback: ' , (nil = text
+						ifTrue: [ nameOrQuestionMark: (vm slotOf: (vm classOf: exception) at: 4) ]
+						ifFalse: [ text ]).
+			(* Skip this method and the handler machinery: start below the boundary's handler. *)
+			a:: vm currentActivation.
+			[ nil = a or: [ (vm slotOf: a method at: 3) = 'dispatchCallbackWith:' ] ] whileFalse: [ a:: a sender ].
+			[ nil = a or: [ (vm slotOf: a method at: 3) = 'signal' ] ] whileFalse: [ a:: a sender ].
+			nil = a ifFalse: [ a:: a sender ].
+			depth:: 0.
+			[ nil = a or: [ depth > 60 ] ] whileFalse: [
+					vm print: '  ' , (traceLineFor: a).
+					a:: a sender.
+					depth:: depth + 1
+				]
+		] on: Exception
+			do: [:e | ]
+	)
 	unhandled: exception from: activation = (
 		(* An image with a message loop hands the exception to it, as psoup's kernel does (MessageLoop>>unhandledException:from:: the application's handler of last resort, if it set one, and the turn ends; otherwise a trace and exit). Without one (genesis), print the exception and a stack trace, then exit. Pausing the actor, the decided semantics, arrives with the debugger (M6). *)
 
@@ -573,12 +595,13 @@ def main():
     #     cannotReturn: (the VM's non-local return stops at role 28).
     t = replace(t, """		public ensure: onUnwind <[]> = (
 """, """		public dispatchCallbackWith: arguments <Array> = (
-			(* The boundary of a callback from the host (Eurasia; design doc section 4, role 28). The VM runs a callback as this method: an exception in it stops here, and a non-local return through it raises cannotReturn:. Answers {true. result} or {false. a description of the exception}, from which the host caller gets a host exception. *)
+			(* The boundary of a callback from the host (Eurasia; design doc section 4, role 28). The VM runs a callback as this method: an exception in it stops here, and a non-local return through it raises cannotReturn:. Answers {true. result} or {false. a description of the exception}, from which the host caller gets a host exception. The exception and the stack it was signalled on are printed first (traceCallbackException:text:), as an unhandled exception's are: the host's error names only the exception. *)
 
 			^[ {true. self valueWithArguments: arguments. } ] on: Exception
 				do: [:e |
 					| text |
 					text:: e messageText.
+					traceCallbackException: e text: text.
 					{false. nil = text ifTrue: [ 'an exception' ] ifFalse: [ text ]. }
 				]
 		)
