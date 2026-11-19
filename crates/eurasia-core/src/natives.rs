@@ -215,6 +215,7 @@ natives! {
     VmLogPosition = 176 / 0: "`vm logPosition`: the position in the host's input log (recording or replaying), or nil when there is none.",
     VmIncarnation = 177 / 0: "`vm incarnation`: a copy of the running incarnation's id, 16 bytes minted from host entropy at every start (contract design, section 6).",
     VmLineage = 178 / 0: "`vm lineage`: a copy of the id of the incarnation that saved the image this one started from, or nil (an image from genesis).",
+    VmSaveImage = 179 / 1: "`saveImage: name`: a checkpoint at the next safepoint with no host operation under way, handed to the host to save under `name` (a String); the restore handler (role 40) is then sent `imageSaved`, in a turn of its own. Answers the receiver.",
     ClosureIn = 173 / 4: "`newClosureIn: activation initialBCI: bci numArgs: n numCopied: c`, for the Simulator (psoup's primitive 69): a closure defined by the activation, its body at bytecode position `bci` (from 1), with `c` copied values, nil until set.",
     VmSpawn = 139 / 1: "`vm spawn: mixin`: a new actor running a clone of the platform template, with the mixin applied to Object (role 37) in its heap, enclosing object nil; answers a far reference to the new class (`actor-semantics.tex`, eq. `create-actor`).",
     VmPromiseSend = 138 / 2: "`vm promise: record send: {selector. resultRecord. arguments...}`: an eventual send to the promise (Route-Pending): queued in the record, at the end of its chain, until it settles; delivered at once if it has.",
@@ -750,6 +751,9 @@ pub enum Outcome {
     /// An activation native: the interpreter, which owns the frames, carries
     /// it out and answers or fails.
     Frame(Native),
+    /// `saveImage:`: the interpreter takes a checkpoint and hands it to
+    /// the host under this name.
+    SaveImage(String),
     /// `vm setRole:to:`: the interpreter assigns the role.
     SetRole {
         /// The role.
@@ -1901,6 +1905,10 @@ pub fn invoke(
         Native::VmCommit => Outcome::Commit(arg(0)),
         Native::VmProgramVersion => Outcome::ProgramVersion,
         Native::VmCheckpointNow => Outcome::CheckpointNow,
+        Native::VmSaveImage => match ctx.heap.string_bytes(arg(0)) {
+            Some(name) => Outcome::SaveImage(String::from_utf8_lossy(name).into_owned()),
+            None => Outcome::Fail(Reason::WrongKind(1)),
+        },
         Native::VmCheckpointPolicy => match arg(0).as_small_integer() {
             Some(n) if n >= 0 => Outcome::CheckpointPolicy(n as u64),
             Some(_) => Outcome::Fail(Reason::OutOfRange(1)),

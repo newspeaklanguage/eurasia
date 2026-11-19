@@ -17,6 +17,10 @@
 #    Alien in a lazy slot is looked up again, one in an ordinary slot is
 #    dead, and the restore handler runs, in a new incarnation whose lineage
 #    is the first.
+# 5. A saved image (EurasiaSaveImageProbe, on the command line): the program
+#    saves its image, its promise is fulfilled with #saved and a second save
+#    under way is refused; the image, run on its own, continues from the save
+#    and the same promise is fulfilled with #restored instead.
 # Needs the images of scripts/kernel-tests.sh, scripts/reflection-tests.sh and
 # scripts/web-tests.sh. Outputs go to target/replay/.
 set -eu
@@ -118,4 +122,19 @@ node web/run-node.mjs "$WASM" "$OUT/restore/checkpoint.eus" > "$OUT/restore/rest
 expected=$(printf '%s\n' 'after lazy 2 ordinary failed' 'restored lazy 2 ordinary failed' 'restored: a new incarnation, whose lineage is the first')
 [ "$(cat "$OUT/restore/restored.txt")" = "$expected" ] || { cat "$OUT/restore/restored.txt"; echo "unexpected output after the restore"; exit 1; }
 cat "$OUT/restore/restored.txt"
-echo "Replay: logs replay to the same outputs, from the start and from checkpoints, across wasm and native; checkpoints restore into a new host."
+
+echo "== a saved image"
+rm -rf "$OUT/save"
+mkdir -p "$OUT/save"
+"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel \
+  "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv "$NEWSPEAK/EurasiaSaveImageProbe.ns" \
+  "$P/Kernel.ns" "$P/platform/PrimordialSoup/Collections.ns" "$NEWSPEAK/platform/Eurasia/Actors.ns" "$NEWSPEAK/platform/Eurasia/Runtime.ns" \
+  "$OUT/save/genesis.eus" > "$OUT/save/package.log"
+(cd "$OUT/save" && "$E" genesis.eus base.eus && "$E" base.eus > saving.txt && [ -f saved.eus ] && "$E" saved.eus > restored.txt) \
+  || { echo "the saved image was not saved, or does not run"; exit 1; }
+expected=$(printf '%s\n' 'asked for the image to be saved' 'a second save: refused' "saveImage: answered 'saved'")
+[ "$(cat "$OUT/save/saving.txt")" = "$expected" ] || { cat "$OUT/save/saving.txt"; echo "unexpected output while saving"; exit 1; }
+expected=$(printf '%s\n' 'asked for the image to be saved' 'a second save: refused' 'restored: the restore action ran' "saveImage: answered 'restored'")
+[ "$(cat "$OUT/save/restored.txt")" = "$expected" ] || { cat "$OUT/save/restored.txt"; echo "unexpected output from the saved image"; exit 1; }
+cat "$OUT/save/restored.txt"
+echo "Replay: logs replay to the same outputs, from the start and from checkpoints, across wasm and native; checkpoints restore into a new host; a saved image continues from its save."

@@ -135,6 +135,7 @@ Actors	instance	classOf:	VmClassOf	113
 Actors	instance	currentMonotonicNanos	VmMonotonicNanos	121
 Actors	instance	newActorHandle	VmNewActor	127
 Actors	instance	setRole:to:	VmSetRole	93
+Actors	instance	primSaveImage:	VmSaveImage	179
 Actors	instance	farReference:to:	VmFarReferenceTo	128
 Actors	instance	post:to:	VmPost	129
 Actors	instance	isFarReference:	VmIsFarReference	130

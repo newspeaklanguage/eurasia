@@ -135,6 +135,15 @@ pub trait Host {
         let _ = bytes;
     }
 
+    /// Output (`saveImage:`): the program asked for its image to be saved
+    /// under `name`, and `bytes` is that image, a checkpoint taken at the
+    /// next safepoint. The host keeps it as it sees fit (the web host hands
+    /// it to the page); the program is told only that the image was handed
+    /// over, so that the outcome is not an input. The default keeps nothing.
+    fn save_image(&mut self, name: &str, bytes: alloc::vec::Vec<u8>) {
+        let _ = (name, bytes);
+    }
+
     /// Whether this host keeps checkpoints (a recording or replaying host).
     fn wants_checkpoints(&self) -> bool {
         false

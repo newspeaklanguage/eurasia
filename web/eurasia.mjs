@@ -110,7 +110,11 @@ function hostObjects(bytesAt, decoder, encoder, link) {
 // the log so far as bytes, for `eurasia --replay` on the command line; call
 // it while the VM is not running (from a timer or an event of the page's
 // own, not from a callback into Newspeak).
-export async function run(wasm, snapshot, { print = console.log, record, keep = 0, onStart } = {}) {
+//
+// When the program saves its image (Actors>>saveImage:), `onSaveImage` is
+// given the name and the image's bytes (a copy), to keep as the page sees
+// fit; without one the image is dropped, with a warning.
+export async function run(wasm, snapshot, { print = console.log, record, keep = 0, onStart, onSaveImage } = {}) {
   let memory = null;
   const link = { exports: null, depth: 0, afterIdleCallback: () => {} };
   const decoder = new TextDecoder();
@@ -122,6 +126,11 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
       monotonic_nanos: () => Math.floor(performance.now() * 1e6),
       utc_nanos: () => Date.now() * 1e6,
       random_bytes: (ptr, len) => crypto.getRandomValues(bytesAt(ptr, len)),
+      save_image: (namePtr, nameLen, ptr, len) => {
+        const name = decoder.decode(bytesAt(namePtr, nameLen));
+        if (onSaveImage) onSaveImage(name, bytesAt(ptr, len).slice());
+        else console.warn(`eurasia: the image ${name} was dropped (this page keeps no images)`);
+      },
       ...hostObjects(bytesAt, decoder, encoder, link),
     },
   };

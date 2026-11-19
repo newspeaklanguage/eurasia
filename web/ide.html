@@ -18,7 +18,16 @@
 <script src="vendor/lightning-fs-4.6.2.min.js"></script>
 <script src="vendor/isomorphic-git-1.38.4-http-web.umd.js"></script>
 <script src="vendor/diff_match_patch-2019-07.js"></script>
-<style>body { margin: 0; background: #fff; }</style>
+<style>
+body { margin: 0; background: #fff; }
+#eurasia-images { font: 14px system-ui, sans-serif; max-width: 40em; margin: 4em auto; padding: 0 16px; }
+#eurasia-images h1 { font-size: 20px; font-weight: 600; }
+#eurasia-images table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+#eurasia-images td { padding: 6px 8px; border-top: 1px solid #ddd; }
+#eurasia-images td.size, #eurasia-images td.when { color: #666; white-space: nowrap; }
+#eurasia-images td:last-child { white-space: nowrap; }
+#eurasia-images button { font: inherit; padding: 3px 10px; cursor: pointer; }
+</style>
 </head>
 <body>
 <!-- Runs the IDE's image (query parameter snapshot, default ide/base.eus) on
@@ -29,7 +38,13 @@
      that the log stays bounded (keep=k keeps k; keep=0 keeps everything):
      eurasiaSaveLog() in the console, or Ctrl-Shift-L, downloads its log, to
      replay with `eurasia --replay`; eurasiaUploadLog() sends it to
-     scripts/serve-web.sh's server instead. -->
+     scripts/serve-web.sh's server instead.
+
+     Saved images: the IDE's Save Image (Actors>>saveImage:) hands the
+     running image to this page, which keeps it in the browser's origin
+     private file system (directory eurasia-images). When there are saved
+     images and no snapshot parameter, the page offers them, or a fresh IDE,
+     before it starts; image=name opens one directly. -->
 <script type="module">
   import { run } from './eurasia.mjs';
   const params = new URLSearchParams(location.search);
@@ -38,10 +53,85 @@
     if (!response.ok) throw new Error(`cannot fetch ${url}: ${response.status}`);
     return new Uint8Array(await response.arrayBuffer());
   };
+  // Saved images, one file each in the origin private file system.
+  const imagesDir = async () =>
+    (await navigator.storage.getDirectory()).getDirectoryHandle('eurasia-images', { create: true });
+  // A name may hold any character (a date's slashes); its file name is
+  // URI-encoded.
+  const fileName = (name) => `${encodeURIComponent(name)}.eus`;
+  const storeImage = async (name, bytes) => {
+    const file = await (await imagesDir()).getFileHandle(fileName(name), { create: true });
+    const writable = await file.createWritable();
+    await writable.write(bytes);
+    await writable.close();
+    navigator.storage.persist?.();
+    console.log(`eurasia: saved the image ${name} (${bytes.length} bytes)`);
+  };
+  const listImages = async () => {
+    const images = [];
+    try {
+      for await (const [entry, handle] of (await imagesDir()).entries()) {
+        if (handle.kind !== 'file' || !entry.endsWith('.eus')) continue;
+        const file = await handle.getFile();
+        images.push({ name: decodeURIComponent(entry.slice(0, -4)), entry, size: file.size, when: file.lastModified });
+      }
+    } catch (e) {
+      console.warn('eurasia: no saved images:', e.message);
+    }
+    return images.sort((a, b) => b.when - a.when);
+  };
+  const readImage = async (entry) =>
+    new Uint8Array(await (await (await (await imagesDir()).getFileHandle(entry)).getFile()).arrayBuffer());
+  // Offers the saved images, or a fresh IDE; answers the snapshot's bytes,
+  // or null for the fresh IDE.
+  const chooseImage = (images) => new Promise((resolve) => {
+    const panel = document.createElement('div');
+    panel.id = 'eurasia-images';
+    const show = (list) => {
+      panel.replaceChildren();
+      const heading = document.createElement('h1');
+      heading.textContent = 'Saved images';
+      const fresh = document.createElement('button');
+      fresh.textContent = 'Start a fresh IDE';
+      fresh.onclick = () => { panel.remove(); resolve(null); };
+      const table = document.createElement('table');
+      for (const image of list) {
+        const row = table.insertRow();
+        row.insertCell().textContent = image.name;
+        const size = row.insertCell();
+        size.className = 'size';
+        size.textContent = `${(image.size / 1048576).toFixed(1)} MB`;
+        const when = row.insertCell();
+        when.className = 'when';
+        when.textContent = new Date(image.when).toLocaleString();
+        const open = document.createElement('button');
+        open.textContent = 'Open';
+        open.onclick = async () => { panel.remove(); resolve(await readImage(image.entry)); };
+        const remove = document.createElement('button');
+        remove.textContent = 'Delete';
+        remove.onclick = async () => {
+          if (!confirm(`Delete the image ${image.name}? This cannot be undone.`)) return;
+          await (await imagesDir()).removeEntry(image.entry);
+          const rest = list.filter((i) => i !== image);
+          if (rest.length === 0) { panel.remove(); resolve(null); } else show(rest);
+        };
+        row.insertCell().append(open, ' ', remove);
+      }
+      panel.append(heading, table, fresh);
+    };
+    show(images);
+    document.body.append(panel);
+  });
+  const startingImage = async () => {
+    if (params.has('snapshot')) return fetchBytes(params.get('snapshot'));
+    if (params.has('image')) return readImage(fileName(params.get('image')));
+    const images = await listImages();
+    return (images.length > 0 && await chooseImage(images)) || fetchBytes('ide/base.eus');
+  };
   try {
     const [wasm, snapshot] = await Promise.all([
       fetchBytes('eurasia_web.wasm'),
-      fetchBytes(params.get('snapshot') ?? 'ide/base.eus'),
+      startingImage(),
     ]);
     const record = params.has('record') ? Number(params.get('record') || 0) : undefined;
     const keep = params.has('keep') ? Number(params.get('keep') || 0) : 2;
@@ -79,6 +169,12 @@
       record,
       keep,
       onStart: (c) => { controls = c; },
+      onSaveImage: (name, bytes) => {
+        storeImage(name, bytes).catch((e) => {
+          console.error('eurasia: the image was not saved:', e);
+          alert(`The image ${name} was not saved: ${e.message}`);
+        });
+      },
     });
     console.log('eurasia:', result.status === 'exited' ? `exited ${result.code}` : 'idle');
   } catch (e) {

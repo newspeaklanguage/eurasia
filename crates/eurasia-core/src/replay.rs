@@ -316,6 +316,12 @@ impl Host for Recorder<'_> {
         self.log.trim();
     }
 
+    // Not an event: the program is told only that the image was handed
+    // over, and a replay saves nothing (the Replayer keeps the default).
+    fn save_image(&mut self, name: &str, bytes: Vec<u8>) {
+        self.inner.save_image(name, bytes);
+    }
+
     fn wants_checkpoints(&self) -> bool {
         true
     }

@@ -192,6 +192,9 @@ pub struct Vm {
     last_checkpoint: u64,
     /// `vm checkpointNow` asked for one at the next safepoint.
     checkpoint_pending: bool,
+    /// `saveImage:` asked for the checkpoint at the next safepoint to be
+    /// saved under this name.
+    save_pending: Option<String>,
     /// Steps until the event loop next asks the host whether to stop.
     interrupt_countdown: u32,
     /// Restored into a new host: the next [`Vm::continue_run`] begins a new
@@ -255,6 +258,7 @@ impl Vm {
             checkpoint_every: 0,
             last_checkpoint: 0,
             checkpoint_pending: false,
+            save_pending: None,
             interrupt_countdown: INTERRUPT_INTERVAL,
             incarnation_pending: false,
         }
@@ -497,14 +501,49 @@ impl Vm {
     /// at a safepoint with no host operation under way. The counters are
     /// updated whether or not the host wants it, so that recording does not
     /// change the run.
+    ///
+    /// A checkpoint that `saveImage:` asked for is also handed to the host
+    /// to save, and the restore handler is then told, in a turn of its own:
+    /// the image is taken first, so a restore of it is not told.
     fn take_checkpoint(&mut self, host: &mut dyn Host) {
         self.checkpoint_pending = false;
         self.last_checkpoint = self.heap.allocation_counter();
+        let save = self.save_pending.take();
+        let wanted = host.wants_checkpoints();
         if let Some(write) = self.snapshot_writer
-            && host.wants_checkpoints()
+            && (wanted || save.is_some())
         {
             let (heap, roles, state) = self.checkpoint_image();
-            host.checkpoint(write(&heap, &roles, Some(&state)));
+            let bytes = write(&heap, &roles, Some(&state));
+            match save {
+                Some(name) => {
+                    if wanted {
+                        host.checkpoint(bytes.clone());
+                    }
+                    host.save_image(&name, bytes);
+                    self.notify_restore_handler("imageSaved");
+                }
+                None => host.checkpoint(bytes),
+            }
+        }
+    }
+
+    /// Queues a turn that sends `selector` to the restore handler (role 40),
+    /// if the program set one.
+    fn notify_restore_handler(&mut self, selector: &'static str) {
+        let nil = self.nil();
+        let handler = self.roles.get(Role::RestoreHandler);
+        if handler != nil && !self.actors.is_empty() {
+            let selector = self.symbol(selector);
+            let array_class = self.roles.get(Role::ArrayClass);
+            let space = Space::Actor(0);
+            // A packet: receiver, selector, resolver, then the arguments.
+            let packet = self.heap.allocate(
+                array_class,
+                space,
+                Body::Array(alloc::vec![handler, selector, nil]),
+            );
+            self.actors[0].mailbox.push_back(packet);
         }
     }
 
@@ -568,19 +607,7 @@ impl Vm {
                 }
             }
         }
-        let handler = self.roles.get(Role::RestoreHandler);
-        if handler != nil && !self.actors.is_empty() {
-            let selector = self.symbol("restored");
-            let array_class = self.roles.get(Role::ArrayClass);
-            let space = Space::Actor(0);
-            // A packet: receiver, selector, resolver, then the arguments.
-            let packet = self.heap.allocate(
-                array_class,
-                space,
-                Body::Array(alloc::vec![handler, selector, nil]),
-            );
-            self.actors[0].mailbox.push_back(packet);
-        }
+        self.notify_restore_handler("restored");
     }
 
     /// Begins an incarnation (contract design, section 6): every start, a
@@ -1431,6 +1458,12 @@ impl Vm {
                 }
                 Err(reason) => self.native_failure(native, receiver, args, reason, host),
             },
+            Outcome::SaveImage(name) => {
+                self.save_pending = Some(name);
+                self.checkpoint_pending = true;
+                self.stack.push(receiver);
+                Ok(None)
+            }
             Outcome::CheckpointNow => {
                 self.checkpoint_pending = true;
                 let nil = self.nil();

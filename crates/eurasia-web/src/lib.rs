@@ -33,6 +33,11 @@
 //! bounded; `eurasia_log()` then encodes the log so far into
 //! the buffer, to be saved and replayed on the command line. A checkpoint
 //! given to `eurasia_start` is restored into this new host and continues.
+//!
+//! Saving an image: when the program asks (`saveImage:`), the VM hands the
+//! checkpoint to the import `save_image(name_ptr, name_len, ptr, len)`,
+//! which copies the bytes out during the call and keeps them as the page
+//! sees fit.
 
 // `no_mangle` exports and the host imports are the unsafe constructs here.
 #![allow(unsafe_code)]
@@ -352,6 +357,10 @@ impl Host for WebHost {
     fn description(&self) -> &str {
         "web"
     }
+
+    fn save_image(&mut self, name: &str, bytes: Vec<u8>) {
+        imports::save_image(name.as_bytes(), &bytes);
+    }
 }
 
 /// The host imports, on wasm32; elsewhere (the crate's own tests) inert
@@ -368,6 +377,8 @@ mod imports {
         fn host_utc_nanos() -> f64;
         #[link_name = "random_bytes"]
         fn host_random_bytes(ptr: *mut u8, len: usize);
+        #[link_name = "save_image"]
+        fn host_save_image(name: *const u8, name_len: usize, ptr: *const u8, len: usize);
         fn ffi_arg_undefined();
         fn ffi_arg_null();
         fn ffi_arg_bool(b: i32);
@@ -462,6 +473,11 @@ mod imports {
         // SAFETY: the host writes at most `len` bytes at `ptr` during the call.
         unsafe { host_random_bytes(buffer.as_mut_ptr(), buffer.len()) }
     }
+
+    pub fn save_image(name: &[u8], bytes: &[u8]) {
+        // SAFETY: the host reads both byte ranges during the call.
+        unsafe { host_save_image(name.as_ptr(), name.len(), bytes.as_ptr(), bytes.len()) }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -480,6 +496,10 @@ mod imports {
 
     pub fn random_bytes(buffer: &mut [u8]) {
         buffer.fill(0);
+    }
+
+    pub fn save_image(name: &[u8], bytes: &[u8]) {
+        let _ = (name, bytes);
     }
 
     pub fn stage(v: &eurasia_core::host::HostValue) {

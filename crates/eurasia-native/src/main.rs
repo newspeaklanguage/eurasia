@@ -82,6 +82,14 @@ impl Host for CommandLineHost {
         std::env::consts::OS
     }
 
+    /// `saveImage:` writes the image to the file `name`, which `eurasia`
+    /// can then continue (a checkpoint is restored into a new host).
+    fn save_image(&mut self, name: &str, bytes: Vec<u8>) {
+        if let Err(e) = std::fs::write(name, bytes) {
+            eprintln!("eurasia: cannot save the image as {name}: {e}");
+        }
+    }
+
     fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
         std::fs::write(path, bytes).map_err(|e| format!("cannot write {path}: {e}"))
     }
