@@ -147,6 +147,7 @@ fn exit_status(outcome: Result<Completion, VmError>) -> ExitCode {
         Ok(Completion::Returned(_)) => ExitCode::SUCCESS,
         Ok(Completion::Exited(code)) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
         Ok(Completion::Waiting(_)) => unreachable!("this host blocks"),
+        Ok(Completion::Compiled(_)) => unreachable!("this host installs no code"),
         Err(e) => {
             eprintln!("eurasia: {e}");
             ExitCode::from(70)

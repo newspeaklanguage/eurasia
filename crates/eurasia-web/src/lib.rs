@@ -89,6 +89,8 @@ struct State {
     record_every: Option<u64>,
     /// How many checkpoints the log keeps (0: all).
     record_keep: u32,
+    /// Activations of a method before it is compiled (0: never).
+    jit: u32,
 }
 
 thread_local! {
@@ -186,6 +188,128 @@ pub extern "C" fn eurasia_heap_stat(which: u32) -> f64 {
         .unwrap_or(-1.0)
 }
 
+/// Compiles methods at their `threshold`th activation (0: never), before
+/// [`eurasia_start`] (newspeak/EURASIA_COMPILER_DESIGN_2026-11-19.md). Not
+/// while recording: the recording host installs no code.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_jit(threshold: u32) {
+    STATE.with_borrow_mut(|s| s.jit = threshold);
+}
+
+/// Runs compiled code while the VM asks for it ([`Completion::Compiled`]).
+fn trampoline(
+    vm: &mut Vm,
+    mut outcome: Result<Completion, VmError>,
+) -> Result<Completion, VmError> {
+    while let Ok(Completion::Compiled(code)) = outcome {
+        let status = call_compiled(code, vm);
+        outcome = vm.continue_after_compiled(status, &mut WebHost);
+    }
+    outcome
+}
+
+/// Calls compiled function `code` (an index in this module's function
+/// table, where the host's `install_code` put it) with the VM's address.
+#[cfg(target_arch = "wasm32")]
+fn call_compiled(code: u32, vm: &mut Vm) -> i32 {
+    // SAFETY: on wasm32 a function pointer is an index in the function
+    // table, and `install_code` put a function of this type, `(i32) -> i32`,
+    // at `code`. The VM is reached through the pointer only while the
+    // compiled code runs; the reference is not used meanwhile.
+    let f = unsafe { core::mem::transmute::<usize, extern "C" fn(*mut Vm) -> i32>(code as usize) };
+    f(vm as *mut Vm)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn call_compiled(_code: u32, _vm: &mut Vm) -> i32 {
+    unreachable!("only wasm32 installs code")
+}
+
+/// The VM behind a compiled function's first argument.
+///
+/// SAFETY (for each `eurasia_rt_*`): compiled code passes the address
+/// [`call_compiled`] gave it, of a VM no reference to which is in use while
+/// the compiled code runs; each call borrows it only for its own duration.
+fn vm_at<'a>(vm: *mut Vm) -> &'a mut Vm {
+    unsafe { &mut *vm }
+}
+
+/// Sets the operand stack's height to `sp`: compiled code wrote the Values
+/// below it, within the room `eurasia_rt_stack_base` reserved.
+fn adopt_stack(vm: &mut Vm, sp: i32) {
+    let stack = vm.operand_stack();
+    assert!(sp as usize <= stack.capacity());
+    // SAFETY: within the capacity, and every Value bit pattern is valid.
+    unsafe { stack.set_len(sp as usize) };
+}
+
+/// For compiled code: the operand stack's address, with room for `headroom` more Values.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_stack_base(vm: *mut Vm, headroom: i32) -> i32 {
+    vm_at(vm).compiled_stack_base(headroom as usize) as usize as i32
+}
+
+/// For compiled code: the stack height or the top frame's layout ([`Vm::compiled_frame`]).
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_frame(vm: *mut Vm, which: i32) -> i32 {
+    vm_at(vm).compiled_frame(which)
+}
+
+/// For compiled code: the top frame's receiver.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_receiver(vm: *mut Vm) -> i64 {
+    vm_at(vm).compiled_receiver().to_bits() as i64
+}
+
+/// For compiled code: nil, true or false.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_value(vm: *mut Vm, which: i32) -> i64 {
+    vm_at(vm).compiled_value(which).to_bits() as i64
+}
+
+/// For compiled code: a send ([`Vm::compiled_send`]), the stack at height `sp`.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_send(
+    vm: *mut Vm,
+    rule: i32,
+    literal: i32,
+    n: i32,
+    next: i32,
+    sp: i32,
+) -> i32 {
+    let vm = vm_at(vm);
+    adopt_stack(vm, sp);
+    vm.compiled_send(
+        &mut WebHost,
+        rule,
+        literal as usize,
+        n as usize,
+        next as usize,
+    )
+}
+
+/// For compiled code: a local return, the stack at height `sp`.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_ret(vm: *mut Vm, value: i64, sp: i32) -> i32 {
+    let vm = vm_at(vm);
+    adopt_stack(vm, sp);
+    vm.compiled_return(eurasia_core::Value::from_bits(value as u64))
+}
+
+/// For compiled code: the interpreter continues at `ip`, the stack at height `sp`.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_interpret(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
+    let vm = vm_at(vm);
+    adopt_stack(vm, sp);
+    vm.compiled_interpret(ip as usize)
+}
+
+/// For compiled code: whether a safepoint is due.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_due(vm: *mut Vm) -> i32 {
+    i32::from(vm_at(vm).safepoint_due())
+}
+
 /// The monotonic time to resume at, after [`WAITING`], in nanoseconds (an
 /// f64, exact below 2^53).
 #[unsafe(no_mangle)]
@@ -237,8 +361,10 @@ pub extern "C" fn eurasia_start() -> i32 {
                 // the host it was taken in.
                 let mut vm = Vm::restore(heap, roles, state);
                 vm.set_snapshot_writer(write_image);
+                vm.set_jit_threshold(s.jit);
                 vm.restored_into_new_host();
                 let outcome = vm.continue_run(&mut WebHost);
+                let outcome = trampoline(&mut vm, outcome);
                 s.vm = Some(vm);
                 outcome
             }
@@ -259,7 +385,11 @@ pub extern "C" fn eurasia_start() -> i32 {
                         s.log = Some(log);
                         outcome
                     }
-                    None => vm.run(&mut WebHost, &[]),
+                    None => {
+                        vm.set_jit_threshold(s.jit);
+                        let outcome = vm.run(&mut WebHost, &[]);
+                        trampoline(&mut vm, outcome)
+                    }
                 };
                 s.vm = Some(vm);
                 outcome
@@ -279,7 +409,10 @@ pub extern "C" fn eurasia_resume() -> i32 {
         };
         let outcome = match log.as_mut() {
             Some(log) => record_resume(vm, &mut WebHost, log),
-            None => vm.resume(&mut WebHost),
+            None => {
+                let outcome = vm.resume(&mut WebHost);
+                trampoline(vm, outcome)
+            }
         };
         report(s, outcome)
     })
@@ -296,6 +429,7 @@ fn report(s: &mut State, outcome: Result<Completion, VmError>) -> i32 {
             s.wakeup = nanos;
             WAITING
         }
+        Ok(Completion::Compiled(_)) => unreachable!("the trampoline runs compiled code"),
         Err(e) => fail(s, &format!("{e}")),
     }
 }
@@ -324,6 +458,10 @@ impl Host for WebHost {
 
     fn random_bytes(&mut self, buffer: &mut [u8]) {
         imports::random_bytes(buffer);
+    }
+
+    fn install_code(&mut self, module: &[u8]) -> Option<u32> {
+        imports::install_code(module)
     }
 
     fn blocks(&self) -> bool {
@@ -399,6 +537,8 @@ mod imports {
         fn host_random_bytes(ptr: *mut u8, len: usize);
         #[link_name = "save_image"]
         fn host_save_image(name: *const u8, name_len: usize, ptr: *const u8, len: usize);
+        #[link_name = "install_code"]
+        fn host_install_code(ptr: *const u8, len: usize) -> i32;
         fn ffi_arg_undefined();
         fn ffi_arg_null();
         fn ffi_arg_bool(b: i32);
@@ -498,6 +638,14 @@ mod imports {
         // SAFETY: the host reads both byte ranges during the call.
         unsafe { host_save_image(name.as_ptr(), name.len(), bytes.as_ptr(), bytes.len()) }
     }
+
+    /// Compiles and instantiates a module, puts its function in this
+    /// module's function table, and answers its index.
+    pub fn install_code(module: &[u8]) -> Option<u32> {
+        // SAFETY: the host reads the bytes during the call.
+        let i = unsafe { host_install_code(module.as_ptr(), module.len()) };
+        u32::try_from(i).ok()
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -520,6 +668,11 @@ mod imports {
 
     pub fn save_image(name: &[u8], bytes: &[u8]) {
         let _ = (name, bytes);
+    }
+
+    pub fn install_code(module: &[u8]) -> Option<u32> {
+        let _ = module;
+        None
     }
 
     pub fn stage(v: &eurasia_core::host::HostValue) {

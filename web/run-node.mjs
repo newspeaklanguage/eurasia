@@ -28,10 +28,12 @@ try {
   const result = await run(readFileSync(wasmPath), readFileSync(snapshotPath), {
     record: logPath ? Number(process.env.EURASIA_RECORD_EVERY ?? 0) : undefined,
     keep: Number(process.env.EURASIA_RECORD_KEEP ?? 0),
+    // With EURASIA_JIT=n, methods are compiled at their nth activation.
+    jit: Number(process.env.EURASIA_JIT ?? 0),
     onStart: (c) => { controls = c; },
   });
 
-  if (process.env.EURASIA_WEB_STATS) console.error(`eurasia: ${result.resumes} timer waits`);
+  if (process.env.EURASIA_WEB_STATS) console.error(`eurasia: ${result.resumes} timer waits, ${result.compiled} methods compiled`);
   process.exitCode = result.status === 'exited' ? result.code : 0;
 } catch (e) {
   console.error(`eurasia: ${e.message}`);

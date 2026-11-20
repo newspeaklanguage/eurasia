@@ -332,7 +332,7 @@ pub enum HeapError {
 pub struct Heap {
     pub(crate) words: Vec<Value>,
     pub(crate) bytes: Vec<u8>,
-    pub(crate) codes: Vec<Rc<[u8]>>,
+    pub(crate) codes: Vec<CodeEntry>,
     pub(crate) count: usize,
     next_seq: u64,
     /// The nursery (EURASIA_NURSERY_DESIGN_2026-11-19.md): objects from this
@@ -351,6 +351,17 @@ pub struct Heap {
     /// Something rewrote references wholesale (a commit): the next
     /// collection must be full.
     pub(crate) full_due: bool,
+}
+
+/// An entry of the code table: a method's bytecode, and the compiler's word
+/// for it: an activation count (0 or more), [`JIT_NEVER`], or a compiled
+/// function's index `i` as `-2 - i` (newspeak/
+/// EURASIA_COMPILER_DESIGN_2026-11-19.md). Kept here, beside the bytecode,
+/// rather than in the method object, whose size the lookups feel.
+#[derive(Clone, Debug)]
+pub(crate) struct CodeEntry {
+    pub(crate) bytes: Rc<[u8]>,
+    pub(crate) jit: i64,
 }
 
 /// The header words of an object.
@@ -521,6 +532,9 @@ const M_HEADER1: usize = 0;
 const M_HEADER2: usize = 1;
 const M_LITERALS: usize = 2;
 const M_CODE: usize = 7;
+
+/// The compiler's word for a method it does not compile ([`CodeEntry`]).
+pub const JIT_NEVER: i64 = -1;
 const MIXIN_SLOT_COUNT: usize = 4;
 const C_INITIAL_IP: usize = 1;
 const C_NUM_ARGS: usize = 2;
@@ -735,7 +749,10 @@ impl Heap {
             Body::Method(m) => {
                 let (one, two) = encode_header(&m.header);
                 let code = small(self.codes.len() as i64);
-                self.codes.push(m.bytecode);
+                self.codes.push(CodeEntry {
+                    bytes: m.bytecode,
+                    jit: 0,
+                });
                 self.words.extend_from_slice(&[
                     one, two, m.literals, m.mixin, m.selector, m.source, m.library, code,
                 ]);
@@ -1322,13 +1339,31 @@ impl Heap {
         }
     }
 
+    /// A Method's compiler word ([`CodeEntry::jit`]).
+    #[inline]
+    pub fn method_jit(&self, v: Value) -> Option<i64> {
+        let c = self.contents_of(v, Code::Method)?;
+        Some(self.codes[small_of(c[M_CODE]) as usize].jit)
+    }
+
+    /// Sets a Method's compiler word.
+    pub fn set_method_jit(&mut self, v: Value, word: i64) {
+        if let Some(c) = self.contents_of(v, Code::Method) {
+            let i = small_of(c[M_CODE]) as usize;
+            self.codes[i].jit = word;
+        }
+    }
+
     /// Sets a Method's bytecode.
     pub fn set_method_bytecode(&mut self, v: Value, bytecode: Rc<[u8]>) -> bool {
         let Some(c) = self.contents_of(v, Code::Method) else {
             return false;
         };
         let i = small_of(c[M_CODE]) as usize;
-        self.codes[i] = bytecode;
+        self.codes[i] = CodeEntry {
+            bytes: bytecode,
+            jit: 0,
+        };
         true
     }
 
@@ -1666,7 +1701,7 @@ impl<'h> MethodRef<'h> {
         decode_header(c[M_HEADER1], c[M_HEADER2])
     }
     pub fn bytecode(self) -> &'h Rc<[u8]> {
-        &self.0.codes[small_of(self.c()[M_CODE]) as usize]
+        &self.0.codes[small_of(self.c()[M_CODE]) as usize].bytes
     }
     pub fn literals(self) -> Value {
         self.c()[M_LITERALS]

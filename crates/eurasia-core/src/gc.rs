@@ -542,7 +542,7 @@ struct Copier {
     to: Vec<Value>,
     /// Their bytes and codes, to follow the old ones.
     bytes: Vec<u8>,
-    codes: Vec<alloc::rc::Rc<[u8]>>,
+    codes: Vec<crate::object::CodeEntry>,
     byte_start: usize,
     code_start: usize,
     /// Each survivor's old and new word offset.

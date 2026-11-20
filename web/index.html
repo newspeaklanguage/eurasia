@@ -15,7 +15,7 @@
 <body>
 <!-- Runs a snapshot on Eurasia's wasm32 build. Query parameters: wasm (default
      eurasia_web.wasm) and snapshot (default base.eus), both relative to this
-     page. scripts/web-tests.sh copies the build and images beside it. -->
+     page, and jit=n to compile methods at their nth activation (off by default). scripts/web-tests.sh copies the build and images beside it. -->
 <div id="status">loading</div>
 <pre id="output"></pre>
 <script type="module">
@@ -36,6 +36,7 @@
     status.textContent = 'running';
     const result = await run(wasm, snapshot, {
       print: (line) => output.append(line + '\n'),
+      jit: Number(params.get('jit') ?? 0),
     });
     status.textContent = result.status === 'exited' ? `exited ${result.code}` : 'idle (callbacks from the page still run)';
   } catch (e) {

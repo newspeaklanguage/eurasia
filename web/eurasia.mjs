@@ -114,7 +114,7 @@ function hostObjects(bytesAt, decoder, encoder, link) {
 // When the program saves its image (Actors>>saveImage:), `onSaveImage` is
 // given the name and the image's bytes (a copy), to keep as the page sees
 // fit; without one the image is dropped, with a warning.
-export async function run(wasm, snapshot, { print = console.log, record, keep = 0, onStart, onSaveImage } = {}) {
+export async function run(wasm, snapshot, { print = console.log, record, keep = 0, jit = 0, onStart, onSaveImage } = {}) {
   let memory = null;
   const link = { exports: null, depth: 0, afterIdleCallback: () => {} };
   const decoder = new TextDecoder();
@@ -126,6 +126,35 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
       monotonic_nanos: () => Math.floor(performance.now() * 1e6),
       utc_nanos: () => Date.now() * 1e6,
       random_bytes: (ptr, len) => crypto.getRandomValues(bytesAt(ptr, len)),
+      // Compiled code (newspeak/EURASIA_COMPILER_DESIGN_2026-11-19.md): a
+      // module importing the VM's memory, table and runtime functions; its
+      // function goes into the VM's table, whose index the VM keeps.
+      install_code: (ptr, len) => {
+        const vm = link.exports;
+        try {
+          const module = new WebAssembly.Module(bytesAt(ptr, len).slice());
+          const instance = new WebAssembly.Instance(module, { env: {
+            memory: vm.memory,
+            table: vm.__indirect_function_table,
+            stack_base: vm.eurasia_rt_stack_base,
+            frame: vm.eurasia_rt_frame,
+            receiver: vm.eurasia_rt_receiver,
+            value: vm.eurasia_rt_value,
+            send: vm.eurasia_rt_send,
+            ret: vm.eurasia_rt_ret,
+            interpret: vm.eurasia_rt_interpret,
+            due: vm.eurasia_rt_due,
+          } });
+          const table = vm.__indirect_function_table;
+          const index = table.grow(1);
+          table.set(index, instance.exports.run);
+          link.compiled = (link.compiled ?? 0) + 1;
+          return index;
+        } catch (e) {
+          console.warn(`eurasia: compiled code refused: ${e.message}`);
+          return -1;
+        }
+      },
       save_image: (namePtr, nameLen, ptr, len) => {
         const name = decoder.decode(bytesAt(namePtr, nameLen));
         if (onSaveImage) onSaveImage(name, bytesAt(ptr, len).slice());
@@ -151,6 +180,7 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
   const buffer = vm.eurasia_buffer(snapshot.length);
   bytesAt(buffer, snapshot.length).set(snapshot);
   if (record !== undefined) vm.eurasia_record(record, keep);
+  else if (jit > 0) vm.eurasia_jit(jit);
   onStart?.({
     log: () => {
       if (link.depth > 0) throw new Error('eurasia: the log cannot be taken while the VM runs');
@@ -171,10 +201,10 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
     const settle = (status) => {
       switch (status) {
         case RETURNED:
-          resolve({ status: 'returned', resumes });
+          resolve({ status: 'returned', resumes, compiled: link.compiled ?? 0 });
           return;
         case EXITED:
-          resolve({ status: 'exited', code: vm.eurasia_exit_code(), resumes });
+          resolve({ status: 'exited', code: vm.eurasia_exit_code(), resumes, compiled: link.compiled ?? 0 });
           return;
         case WAITING: {
           const delay = (vm.eurasia_wakeup_nanos() - performance.now() * 1e6) / 1e6;

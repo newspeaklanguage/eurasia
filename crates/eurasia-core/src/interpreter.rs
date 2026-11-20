@@ -130,6 +130,11 @@ pub enum Completion {
     /// timer, and the host does not block ([`Host::blocks`]): it calls
     /// [`Vm::resume`] once that time has come.
     Waiting(u64),
+    /// The top frame is a fresh activation of a compiled method: the host
+    /// calls compiled function `0` with the VM's address, then
+    /// [`Vm::continue_after_compiled`] with its status
+    /// (newspeak/EURASIA_COMPILER_DESIGN_2026-11-19.md).
+    Compiled(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -311,6 +316,10 @@ pub struct Vm {
     /// whenever a method or mixin is written; like psoup's, it is not
     /// cleared when an element of a mixin's (unfrozen) method array is.
     lookup_cache: Vec<Option<CacheEntry>>,
+    /// Activations of a method before it is compiled; 0: never.
+    jit_threshold: i64,
+    /// What compiled code stopped the run with ([`crate::compiler::STOP`]).
+    jit_stop: Option<Result<Option<Completion>, VmError>>,
     /// For each arithmetic or comparison common selector (0 to 13), whether
     /// SmallInteger's method for it is the native the fast path computes:
     /// 0 not yet known, 1 yes, 2 no. Cleared with the lookup cache.
@@ -389,6 +398,8 @@ impl Vm {
             safepoint_at: 0,
             incarnation_pending: false,
             lookup_cache: alloc::vec![None; LOOKUP_CACHE_SIZE],
+            jit_threshold: 0,
+            jit_stop: None,
             small_integer_fast: [0; SMALL_INTEGER_FAST_PATHS],
         }
     }
@@ -1101,6 +1112,14 @@ impl Vm {
                     return Err(VmError::Interrupted);
                 }
             }
+            // A fresh activation of a compiled method: the host runs it.
+            // (Only at the top level: a callback's loop runs interpreted.)
+            if self.jit_threshold > 0
+                && self.callback_depth == 0
+                && let Some(code) = self.compiled_entry()
+            {
+                return Ok(Completion::Compiled(code));
+            }
             let next = if self.step_limit.is_none() {
                 self.run_simple(host)?
             } else {
@@ -1806,6 +1825,9 @@ impl Vm {
                     activation: None,
                     closure: None,
                 });
+                if self.jit_threshold > 0 {
+                    self.tier_up(method, host);
+                }
                 Ok(None)
             }
         }
@@ -3752,6 +3774,172 @@ impl Vm {
         Ok(None)
     }
 
+    // ----- Compiled code (newspeak/EURASIA_COMPILER_DESIGN_2026-11-19.md) -----
+
+    /// Compiles a method at its `threshold`th activation (0: never). Only a
+    /// host that installs code ([`Host::install_code`]) should set it.
+    pub fn set_jit_threshold(&mut self, threshold: u32) {
+        self.jit_threshold = i64::from(threshold);
+    }
+
+    /// Counts an activation of `method`, and compiles it at the threshold.
+    fn tier_up(&mut self, method: Value, host: &mut dyn Host) {
+        let Some(word) = self.heap.method_jit(method) else {
+            return;
+        };
+        if word < 0 {
+            return;
+        }
+        if word + 1 < self.jit_threshold {
+            self.heap.set_method_jit(method, word + 1);
+            return;
+        }
+        let (code, argc) = {
+            let m = self.heap.method(method).expect("a method");
+            (m.bytecode().clone(), m.header().arg_count)
+        };
+        let ok: Vec<bool> = (0..SMALL_INTEGER_FAST_PATHS)
+            .map(|k| self.small_integer_native_is(k))
+            .collect();
+        let installed = crate::compiler::compile(&code, argc, &|k| ok.get(k) == Some(&true))
+            .and_then(|module| host.install_code(&module));
+        self.heap.set_method_jit(
+            method,
+            match installed {
+                Some(i) => -2 - i64::from(i),
+                None => crate::object::JIT_NEVER,
+            },
+        );
+    }
+
+    /// The compiled function of the top frame, if it is a fresh activation
+    /// of a compiled method.
+    fn compiled_entry(&self) -> Option<u32> {
+        let f = self.frames.last()?;
+        if f.ip != 0 || f.closure.is_some() {
+            return None;
+        }
+        let w = self.heap.method_jit(f.method)?;
+        (w <= -2).then(|| (-2 - w) as u32)
+    }
+
+    /// Continues the run after compiled code answered `status`.
+    pub fn continue_after_compiled(
+        &mut self,
+        status: i32,
+        host: &mut dyn Host,
+    ) -> Result<Completion, VmError> {
+        if status == crate::compiler::STOP {
+            match self.jit_stop.take() {
+                Some(Err(e)) => return Err(e),
+                Some(Ok(Some(c))) => return Ok(c),
+                _ => {}
+            }
+        }
+        self.event_loop(host)
+    }
+
+    /// For compiled code: the operand stack's address, with room for
+    /// `headroom` more Values.
+    pub fn compiled_stack_base(&mut self, headroom: usize) -> *mut Value {
+        self.stack.reserve(headroom);
+        self.stack.as_mut_ptr()
+    }
+
+    /// For the host: the operand stack, to set the height compiled code left
+    /// (it writes Values past the height, within the room it reserved).
+    pub fn operand_stack(&mut self) -> &mut Vec<Value> {
+        &mut self.stack
+    }
+
+    /// For compiled code: the stack height (0), the top frame's receiver
+    /// index (1), first local (2) or argument count (3).
+    pub fn compiled_frame(&self, which: i32) -> i32 {
+        let f = self.frames.last().expect("a frame");
+        (match which {
+            0 => self.stack.len(),
+            1 => f.bp,
+            2 => f.lp,
+            _ => f.arg_count,
+        }) as i32
+    }
+
+    /// For compiled code: the top frame's receiver.
+    pub fn compiled_receiver(&self) -> Value {
+        self.frames.last().expect("a frame").receiver
+    }
+
+    /// For compiled code: nil (0), true (1) or false (2).
+    pub fn compiled_value(&self, which: i32) -> Value {
+        self.roles.get(match which {
+            0 => Role::Nil,
+            1 => Role::True,
+            _ => Role::False,
+        })
+    }
+
+    /// For compiled code: a send from the top frame, whose instruction
+    /// continues at `next_ip`; see [`crate::compiler`] for the answer.
+    pub fn compiled_send(
+        &mut self,
+        host: &mut dyn Host,
+        rule: i32,
+        literal: usize,
+        n: usize,
+        next_ip: usize,
+    ) -> i32 {
+        use crate::compiler::{CALLEE, DONE, INTERPRET, RULE_ORDINARY, RULE_SELF, STOP};
+        let depth = self.frames.len();
+        let serial = self.frames.last().expect("a frame").serial;
+        self.frames.last_mut().expect("a frame").ip = next_ip;
+        let kind = match rule {
+            RULE_ORDINARY => SendKind::Ordinary,
+            RULE_SELF => SendKind::SelfSend,
+            _ => SendKind::ImplicitReceiver,
+        };
+        match self.send_by_literal(kind, literal, n, host) {
+            Err(e) => {
+                self.jit_stop = Some(Err(e));
+                STOP
+            }
+            Ok(Some(c)) => {
+                self.jit_stop = Some(Ok(Some(c)));
+                STOP
+            }
+            Ok(None) => {
+                let len = self.frames.len();
+                if len == depth && self.frames[len - 1].serial == serial {
+                    DONE
+                } else if len == depth + 1
+                    && self.frames[depth - 1].serial == serial
+                    && !self.safepoint_due()
+                    && let Some(code) = self.compiled_entry()
+                {
+                    CALLEE + code as i32
+                } else {
+                    INTERPRET
+                }
+            }
+        }
+    }
+
+    /// For compiled code: the local return of `value` from the top frame.
+    pub fn compiled_return(&mut self, value: Value) -> i32 {
+        self.local_return(value);
+        crate::compiler::DONE
+    }
+
+    /// For compiled code: the interpreter continues the top frame at `ip`.
+    pub fn compiled_interpret(&mut self, ip: usize) -> i32 {
+        self.frames.last_mut().expect("a frame").ip = ip;
+        crate::compiler::INTERPRET
+    }
+
+    /// For compiled code: whether the event loop has a safepoint due.
+    pub fn safepoint_due(&self) -> bool {
+        self.heap.allocation_counter() >= self.safepoint_at
+    }
+
     /// Runs instructions of the current frame, from its instruction, with
     /// the instruction pointer and the code in locals: the simple ones
     /// (pushes, stores, branches, SmallInteger arithmetic) here, and the
@@ -4122,6 +4310,9 @@ impl Vm {
             if self.frames.is_empty()
                 || self.heap.allocation_counter() >= self.safepoint_at
                 || self.interrupt_countdown == 1
+                || (self.jit_threshold > 0
+                    && self.callback_depth == 0
+                    && self.compiled_entry().is_some())
             {
                 return Ok(Step::Continue);
             }

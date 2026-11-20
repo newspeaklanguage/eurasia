@@ -161,6 +161,15 @@ pub trait Host {
         false
     }
 
+    /// Installs a module the baseline compiler made
+    /// ([`crate::compiler`]) and answers the index of its function in the
+    /// VM's function table; `None` (the default) when this host does not
+    /// run compiled code.
+    fn install_code(&mut self, module: &[u8]) -> Option<u32> {
+        let _ = module;
+        None
+    }
+
     /// Input (`vm hostDescription`): a short description of the host.
     fn description(&self) -> &str;
 

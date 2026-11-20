@@ -44,6 +44,10 @@ impl Ending {
             Ok(Completion::Returned(_)) => Ending::Returned,
             Ok(Completion::Exited(c)) => Ending::Exited(*c),
             Ok(Completion::Waiting(t)) => Ending::Waiting(*t),
+            // Recording hosts install no code, so never see this.
+            Ok(Completion::Compiled(_)) => {
+                Ending::Failed(String::from("compiled code while recording"))
+            }
             Err(e) => Ending::Failed(format!("{e}")),
         }
     }
