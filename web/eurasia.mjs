@@ -114,7 +114,7 @@ function hostObjects(bytesAt, decoder, encoder, link) {
 // When the program saves its image (Actors>>saveImage:), `onSaveImage` is
 // given the name and the image's bytes (a copy), to keep as the page sees
 // fit; without one the image is dropped, with a warning.
-export async function run(wasm, snapshot, { print = console.log, record, keep = 0, jit = 0, onStart, onSaveImage } = {}) {
+export async function run(wasm, snapshot, { print = console.log, record, keep = 0, jit = 0, gcStress = 0, onStart, onSaveImage } = {}) {
   let memory = null;
   const link = { exports: null, depth: 0, afterIdleCallback: () => {} };
   const decoder = new TextDecoder();
@@ -136,14 +136,11 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
           const instance = new WebAssembly.Instance(module, { env: {
             memory: vm.memory,
             table: vm.__indirect_function_table,
-            stack_base: vm.eurasia_rt_stack_base,
-            frame: vm.eurasia_rt_frame,
-            receiver: vm.eurasia_rt_receiver,
-            value: vm.eurasia_rt_value,
             send: vm.eurasia_rt_send,
             ret: vm.eurasia_rt_ret,
             interpret: vm.eurasia_rt_interpret,
-            due: vm.eurasia_rt_due,
+            step: vm.eurasia_rt_step,
+            tick: vm.eurasia_rt_tick,
           } });
           const table = vm.__indirect_function_table;
           const index = table.grow(1);
@@ -181,6 +178,7 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
   bytesAt(buffer, snapshot.length).set(snapshot);
   if (record !== undefined) vm.eurasia_record(record, keep);
   else if (jit > 0) vm.eurasia_jit(jit);
+  if (gcStress > 0) vm.eurasia_gc_stress(gcStress);
   onStart?.({
     log: () => {
       if (link.depth > 0) throw new Error('eurasia: the log cannot be taken while the VM runs');

@@ -91,6 +91,9 @@ struct State {
     record_keep: u32,
     /// Activations of a method before it is compiled (0: never).
     jit: u32,
+    /// Collect at the first safepoint after every this many allocations
+    /// (the native host's `EURASIA_GC_STRESS`; 0: as usual).
+    gc_stress: u32,
 }
 
 thread_local! {
@@ -196,32 +199,46 @@ pub extern "C" fn eurasia_jit(threshold: u32) {
     STATE.with_borrow_mut(|s| s.jit = threshold);
 }
 
+/// Collects at the first safepoint after every `interval` allocations (0:
+/// as usual), before [`eurasia_start`]: the stress test, with compiled code
+/// too.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_gc_stress(interval: u32) {
+    STATE.with_borrow_mut(|s| s.gc_stress = interval);
+}
+
+use eurasia_core::compiler::Regs;
+
 /// Runs compiled code while the VM asks for it ([`Completion::Compiled`]).
 fn trampoline(
     vm: &mut Vm,
     mut outcome: Result<Completion, VmError>,
 ) -> Result<Completion, VmError> {
-    while let Ok(Completion::Compiled(code)) = outcome {
-        let status = call_compiled(code, vm);
+    while let Ok(Completion::Compiled(code, block)) = outcome {
+        let regs = vm.jit_regs();
+        let status = call_compiled(code, regs, block, vm);
         outcome = vm.continue_after_compiled(status, &mut WebHost);
     }
     outcome
 }
 
 /// Calls compiled function `code` (an index in this module's function
-/// table, where the host's `install_code` put it) with the VM's address.
+/// table, where the host's `install_code` put it) with the VM's address, its
+/// registers' and the entry block `block`.
 #[cfg(target_arch = "wasm32")]
-fn call_compiled(code: u32, vm: &mut Vm) -> i32 {
+fn call_compiled(code: u32, regs: *mut Regs, block: u32, vm: &mut Vm) -> i32 {
     // SAFETY: on wasm32 a function pointer is an index in the function
-    // table, and `install_code` put a function of this type, `(i32) -> i32`,
-    // at `code`. The VM is reached through the pointer only while the
-    // compiled code runs; the reference is not used meanwhile.
-    let f = unsafe { core::mem::transmute::<usize, extern "C" fn(*mut Vm) -> i32>(code as usize) };
-    f(vm as *mut Vm)
+    // table, and `install_code` put a function of this type, `(i32, i32,
+    // i32) -> i32`, at `code`. The VM is reached through the pointer only
+    // while the compiled code runs; the reference is not used meanwhile.
+    let f = unsafe {
+        core::mem::transmute::<usize, extern "C" fn(*mut Vm, *mut Regs, u32) -> i32>(code as usize)
+    };
+    f(vm as *mut Vm, regs, block)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn call_compiled(_code: u32, _vm: &mut Vm) -> i32 {
+fn call_compiled(_code: u32, _regs: *mut Regs, _block: u32, _vm: &mut Vm) -> i32 {
     unreachable!("only wasm32 installs code")
 }
 
@@ -241,30 +258,6 @@ fn adopt_stack(vm: &mut Vm, sp: i32) {
     assert!(sp as usize <= stack.capacity());
     // SAFETY: within the capacity, and every Value bit pattern is valid.
     unsafe { stack.set_len(sp as usize) };
-}
-
-/// For compiled code: the operand stack's address, with room for `headroom` more Values.
-#[unsafe(no_mangle)]
-pub extern "C" fn eurasia_rt_stack_base(vm: *mut Vm, headroom: i32) -> i32 {
-    vm_at(vm).compiled_stack_base(headroom as usize) as usize as i32
-}
-
-/// For compiled code: the stack height or the top frame's layout ([`Vm::compiled_frame`]).
-#[unsafe(no_mangle)]
-pub extern "C" fn eurasia_rt_frame(vm: *mut Vm, which: i32) -> i32 {
-    vm_at(vm).compiled_frame(which)
-}
-
-/// For compiled code: the top frame's receiver.
-#[unsafe(no_mangle)]
-pub extern "C" fn eurasia_rt_receiver(vm: *mut Vm) -> i64 {
-    vm_at(vm).compiled_receiver().to_bits() as i64
-}
-
-/// For compiled code: nil, true or false.
-#[unsafe(no_mangle)]
-pub extern "C" fn eurasia_rt_value(vm: *mut Vm, which: i32) -> i64 {
-    vm_at(vm).compiled_value(which).to_bits() as i64
 }
 
 /// For compiled code: a send ([`Vm::compiled_send`]), the stack at height `sp`.
@@ -304,10 +297,20 @@ pub extern "C" fn eurasia_rt_interpret(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
     vm.compiled_interpret(ip as usize)
 }
 
-/// For compiled code: whether a safepoint is due.
+/// For compiled code: the instruction at `ip` by the interpreter ([`Vm::compiled_step`]), the stack at height `sp`.
 #[unsafe(no_mangle)]
-pub extern "C" fn eurasia_rt_due(vm: *mut Vm) -> i32 {
-    i32::from(vm_at(vm).safepoint_due())
+pub extern "C" fn eurasia_rt_step(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
+    let vm = vm_at(vm);
+    adopt_stack(vm, sp);
+    vm.compiled_step(&mut WebHost, ip as usize)
+}
+
+/// For compiled code: backward jumps against the interrupt poll ([`Vm::compiled_tick`]), the stack at height `sp`.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_tick(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
+    let vm = vm_at(vm);
+    adopt_stack(vm, sp);
+    vm.compiled_tick(ip as usize)
 }
 
 /// The monotonic time to resume at, after [`WAITING`], in nanoseconds (an
@@ -362,6 +365,7 @@ pub extern "C" fn eurasia_start() -> i32 {
                 let mut vm = Vm::restore(heap, roles, state);
                 vm.set_snapshot_writer(write_image);
                 vm.set_jit_threshold(s.jit);
+                vm.set_gc_stress((s.gc_stress > 0).then_some(u64::from(s.gc_stress)));
                 vm.restored_into_new_host();
                 let outcome = vm.continue_run(&mut WebHost);
                 let outcome = trampoline(&mut vm, outcome);
@@ -371,6 +375,7 @@ pub extern "C" fn eurasia_start() -> i32 {
             None => {
                 let mut vm = Vm::new(heap, roles);
                 vm.set_snapshot_writer(write_image);
+                vm.set_gc_stress((s.gc_stress > 0).then_some(u64::from(s.gc_stress)));
                 let outcome = match s.record_every {
                     Some(every) => {
                         vm.set_checkpoint_policy(every);
@@ -429,7 +434,7 @@ fn report(s: &mut State, outcome: Result<Completion, VmError>) -> i32 {
             s.wakeup = nanos;
             WAITING
         }
-        Ok(Completion::Compiled(_)) => unreachable!("the trampoline runs compiled code"),
+        Ok(Completion::Compiled(..)) => unreachable!("the trampoline runs compiled code"),
         Err(e) => fail(s, &format!("{e}")),
     }
 }

@@ -1,92 +1,206 @@
 // Copyright (c) 2026-2027, Gilad Bracha. All rights reserved. Use of this source
 // code is governed by a BSD-style license that can be found in the LICENSE file.
 
-//! The baseline compiler, stage 1 (a spike): V5 bytecode to a WebAssembly
-//! module, for a subset of the instructions (newspeak/
-//! EURASIA_COMPILER_DESIGN_2026-11-19.md section 7).
+//! The baseline compiler: V5 bytecode to a WebAssembly module, one per method
+//! (newspeak/EURASIA_COMPILER_DESIGN_2026-11-19.md).
 //!
 //! Compiled code keeps the interpreter's frames: it runs on the VM's operand
 //! stack in linear memory, and every call into the VM's runtime, and every
 //! exit, leaves the frame as the interpreter would have it (its instruction
 //! index, its stack height), so the interpreter can continue it at any of
-//! those points.
+//! those points, and compiled code can take it back at any of its *entries*:
+//! the starts of its basic blocks. A block starts at the method's start, at
+//! each closure body's start (a closure's body is inline in its method's
+//! bytecode, so one function runs the method and its closures), at each jump
+//! target and after each call into the runtime.
+//!
+//! Every instruction compiles: the common ones inline, the others as a call
+//! to the runtime's `step`, which runs that one instruction as the
+//! interpreter does; compiled code goes on after it when the frame is still
+//! on top and was not taken over.
 //!
 //! The module imports the VM's memory and function table and these runtime
 //! functions (exported by the web host as `eurasia_rt_*`), each taking the
 //! VM's address first:
-//! - `stack_base(vm, headroom) -> i32`: the operand stack's address, with room
-//!   for `headroom` more Values;
-//! - `frame(vm, which) -> i32`: the stack height (0), the frame's receiver
-//!   index (1), its first local (2) or its argument count (3);
-//! - `receiver(vm) -> i64`, `value(vm, which) -> i64` (nil, true, false);
 //! - `send(vm, rule, literal, args, next_ip, sp) -> i32`: makes a send as the
-//!   interpreter does; answers [`DONE`] when it completed (its result on the
-//!   stack), [`INTERPRET`], [`STOP`], or [`CALLEE`] plus the function index of
-//!   a compiled method whose fresh frame it pushed;
+//!   interpreter does (for [`RULE_COMMON`], `literal` is the common
+//!   selector's number); answers [`DONE`] when it completed (its result on
+//!   the stack), [`INTERPRET`], [`STOP`], or [`CALLEE`] plus the function
+//!   index of a compiled callee whose frame it pushed;
+//! - `step(vm, ip, sp) -> i32`: runs the instruction at `ip`; answers as
+//!   `send` does, or [`RETURNED`] when the frame returned;
 //! - `ret(vm, value, sp) -> i32`: the interpreter's local return;
 //! - `interpret(vm, ip, sp) -> i32`: leaves the frame at instruction `ip` for
 //!   the interpreter;
-//! - `due(vm) -> i32`: whether a safepoint is due.
+//! - `tick(vm, ip, sp) -> i32`: counts [`TICK`] backward jumps down against
+//!   the interrupt poll; [`DONE`], or [`INTERPRET`] with the frame at `ip`.
 //!
-//! The function it exports, `run(vm) -> i32`, runs a fresh activation of the
-//! method and answers [`DONE`] (the frame returned), [`INTERPRET`] or
-//! [`STOP`].
+//! Everything else compiled code reads from the VM's *registers*
+//! ([`Regs`]), which the VM sets before it enters compiled code and after
+//! every call that answers [`DONE`], [`RETURNED`] or [`CALLEE`]: the operand
+//! stack's address and height, the top frame's layout, receiver and literals,
+//! nil, true and false, whether a safepoint is due, and a callee's entry.
+//!
+//! The function it exports, `run(vm, regs, entry) -> i32`, runs the top frame
+//! from its block `entry` and answers [`DONE`] (the frame returned),
+//! [`INTERPRET`] or [`STOP`].
 
 use alloc::vec::Vec;
 
 use crate::bytecode::{instruction_length, op};
 
-/// The frame returned; its result is on the caller's stack.
+/// The frame returned; its result is on the caller's stack. (From `send`
+/// and `step`: the instruction completed.)
 pub const DONE: i32 = 0;
 /// The interpreter continues the top frame.
 pub const INTERPRET: i32 = 1;
 /// The run stops: the VM holds the completion or the error.
 pub const STOP: i32 = 2;
-/// Added to a function index: a compiled callee's fresh frame was pushed.
+/// Added to a function index: a compiled callee's frame was pushed.
 pub const CALLEE: i32 = 3;
+/// From `step`: the frame returned (a `^` in a method).
+pub const RETURNED: i32 = -1;
+/// From `step` or a callee: a non-local return unwound to the frame of
+/// depth `Regs::depth`, which goes on as after a completed send if it is
+/// the caller's; others pass it on.
+pub const UNWOUND: i32 = -2;
+/// Backward jumps between two calls of `tick`.
+pub const TICK: i32 = 64;
+/// The operand-stack room the VM keeps for compiled code (in Values); a
+/// method that could need more is not compiled.
+pub const HEADROOM: usize = 2048;
+
+/// The VM's registers for compiled code, at an address that does not change
+/// while it runs. Addresses are wasm32's.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Regs {
+    /// The operand stack's address, with [`HEADROOM`] Values of room.
+    pub base: u32,
+    /// The stack's height.
+    pub sp: u32,
+    /// The top frame's receiver index, first local and argument count.
+    pub bp: u32,
+    /// See `bp`.
+    pub lp: u32,
+    /// See `bp`.
+    pub argc: u32,
+    /// The entry block of a [`CALLEE`].
+    pub block: u32,
+    /// Whether a safepoint is due (0 or 1).
+    pub due: u32,
+    /// The address of the top frame's first literal, and how many there are.
+    pub literals: u32,
+    /// See `literals`.
+    pub literal_count: u32,
+    /// The heap arena's address: object `v` starts at `arena + (v >> 1) * 8`.
+    pub arena: u32,
+    /// The nursery's start, in words: older objects need the write barrier.
+    pub boundary: u32,
+    /// The lookup cache's epoch, changed at every flush (collections
+    /// included): an inline cache filled in another epoch is empty.
+    pub epoch: u32,
+    /// After a send that hit an accessor an inline cache can hold: 1, and
+    /// its slot and class.
+    pub ic_kind: u32,
+    /// See `ic_kind`.
+    pub ic_slot: u32,
+    /// The number of frames (the top frame's depth).
+    pub depth: u32,
+    /// The top frame's receiver.
+    pub receiver: u64,
+    /// nil, true and false.
+    pub nil: u64,
+    /// See `nil`.
+    pub true_: u64,
+    /// See `nil`.
+    pub false_: u64,
+    /// See `ic_kind`.
+    pub ic_class: u64,
+}
+
+// The registers' offsets.
+const R_BASE: u32 = 0;
+const R_SP: u32 = 4;
+const R_BP: u32 = 8;
+const R_LP: u32 = 12;
+const R_ARGC: u32 = 16;
+const R_BLOCK: u32 = 20;
+const R_DUE: u32 = 24;
+const R_LITERALS: u32 = 28;
+const R_LITERAL_COUNT: u32 = 32;
+const R_ARENA: u32 = 36;
+const R_BOUNDARY: u32 = 40;
+const R_EPOCH: u32 = 44;
+const R_IC_KIND: u32 = 48;
+const R_IC_SLOT: u32 = 52;
+const R_DEPTH: u32 = 56;
+const R_RECEIVER: u32 = 64;
+const R_NIL: u32 = 72;
+const R_TRUE: u32 = 80;
+const R_FALSE: u32 = 88;
+const R_IC_CLASS: u32 = 96;
+
+// The object header (newspeak/EURASIA_ARENA_DESIGN): class, sequence number,
+// meta (format 5 bits, flags 5, space 21, remembered 1, size 32); then the
+// slots.
+const META: u32 = 16;
+const SLOTS: u32 = 24;
+const META_FLAGS_FROZEN_OR_VALUE: i64 = (1 | 2) << 5;
+const META_REMEMBERED: i64 = 1 << 31;
 
 /// The send rules `send` takes.
 pub const RULE_ORDINARY: i32 = 0;
 /// A self send.
 pub const RULE_SELF: i32 = 1;
+/// A super send.
+pub const RULE_SUPER: i32 = 2;
 /// An implicit-receiver send.
 pub const RULE_IMPLICIT: i32 = 3;
+/// A common-selector send.
+pub const RULE_COMMON: i32 = 4;
 
 // Imported functions, in import order.
-const F_STACK_BASE: u32 = 0;
-const F_FRAME: u32 = 1;
-const F_RECEIVER: u32 = 2;
-const F_VALUE: u32 = 3;
-const F_SEND: u32 = 4;
-const F_RET: u32 = 5;
-const F_INTERPRET: u32 = 6;
-const F_DUE: u32 = 7;
-const IMPORTED: u32 = 8;
+const F_SEND: u32 = 0;
+const F_RET: u32 = 1;
+const F_INTERPRET: u32 = 2;
+const F_STEP: u32 = 3;
+const F_TICK: u32 = 4;
+const IMPORTED: u32 = 5;
 
 // Types.
-const T_RUN: u32 = 0; // (i32) -> i32
-const T_I32_I32: u32 = 1; // (i32, i32) -> i32
-const T_I32_I64: u32 = 2; // (i32) -> i64
-const T_I32I32_I64: u32 = 3; // (i32, i32) -> i64
-const T_SEND: u32 = 4; // (i32 x 6) -> i32
-const T_RET: u32 = 5; // (i32, i64, i32) -> i32
-const T_INTERPRET: u32 = 6; // (i32, i32, i32) -> i32
+const T_RUN: u32 = 0; // (i32, i32, i32) -> i32: run, interpret, step, tick
+const T_SEND: u32 = 1; // (i32 x 6) -> i32
+const T_RET: u32 = 2; // (i32, i64, i32) -> i32
 
-// Locals of `run`.
+// Locals of `run`: the parameters, then i32s, then i64s.
 const L_VM: u32 = 0;
-const L_BASE: u32 = 1;
-const L_SP: u32 = 2;
-const L_BP: u32 = 3;
-const L_LP: u32 = 4;
-const L_ARGC: u32 = 5;
-const L_PC: u32 = 6;
-const L_R: u32 = 7;
-const L_A: u32 = 8;
-const L_B: u32 = 9;
-const L_SELF: u32 = 10;
-const L_NIL: u32 = 11;
-const L_TRUE: u32 = 12;
-const L_FALSE: u32 = 13;
+const L_REGS: u32 = 1;
+const L_ENTRY: u32 = 2;
+const L_BASE: u32 = 3;
+const L_SP: u32 = 4;
+const L_BP: u32 = 5;
+const L_LP: u32 = 6;
+const L_ARGC: u32 = 7;
+const L_PC: u32 = 8;
+const L_R: u32 = 9;
+const L_COUNT: u32 = 10;
+/// An object's index (in words) and address.
+const L_INDEX: u32 = 11;
+const L_ADDR: u32 = 12;
+/// The frame's depth, to recognize an [`UNWOUND`] to it.
+const L_DEPTH: u32 = 13;
+const I32_LOCALS: u8 = 11;
+const L_A: u32 = 14;
+const L_B: u32 = 15;
+const L_SELF: u32 = 16;
+const L_NIL: u32 = 17;
+const L_TRUE: u32 = 18;
+const L_FALSE: u32 = 19;
+/// The scratch i64 for arithmetic results.
+const L_R64: u32 = 20;
+const L_META: u32 = 21;
+const I64_LOCALS: u8 = 8;
 
 /// One decoded instruction.
 #[derive(Clone, Copy, Debug)]
@@ -100,6 +214,7 @@ enum Ins {
     PushFalse,
     PushSelf,
     PushSmall(i64),
+    PushLiteral(u32),
     Pop,
     Dup,
     /// To the instruction at this index.
@@ -114,6 +229,16 @@ enum Ins {
         args: u32,
     },
     Return(Ret),
+    /// Push, pop into or store into element `index` of the indirection
+    /// vector in local `local`.
+    Indirect {
+        op: u8,
+        index: u32,
+        local: u32,
+    },
+    /// Any other instruction, by the runtime's `step`; compiled code goes on
+    /// at the given index (after a closure push, past the closure's body).
+    Step(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -130,10 +255,12 @@ fn inline_arith(k: u8) -> bool {
     matches!(k, 0 | 1 | 7..=13)
 }
 
-/// Decodes `code` into (index, length, instruction), or `None` if it uses an
-/// instruction outside the spike's subset.
-fn decode(code: &[u8]) -> Option<Vec<(usize, usize, Ins)>> {
+/// Decodes `code` into (index, length, instruction), and the closure bodies'
+/// starts; `None` if it is malformed.
+#[allow(clippy::type_complexity)]
+fn decode(code: &[u8]) -> Option<(Vec<(usize, usize, Ins)>, Vec<usize>)> {
     let mut out = Vec::new();
+    let mut closures = Vec::new();
     let mut ip = 0;
     while ip < code.len() {
         let o = code[ip];
@@ -143,6 +270,7 @@ fn decode(code: &[u8]) -> Option<Vec<(usize, usize, Ins)>> {
         }
         let b1 = if len > 1 { code[ip + 1] } else { 0 };
         let b2 = if len > 2 { code[ip + 2] } else { 0 };
+        let b3 = if len > 3 { code[ip + 3] } else { 0 };
         let wide = u16::from_le_bytes([b1, b2]) as usize;
         let next = ip + len;
         let ext_sel = u32::from(b1) | (u32::from(b2 & 0x0f) << 8);
@@ -165,6 +293,7 @@ fn decode(code: &[u8]) -> Option<Vec<(usize, usize, Ins)>> {
             120..=127 => Ins::PushLocal(u32::from(o & 7)),
             128..=135 => Ins::PopIntoLocal(u32::from(o & 7)),
             136..=143 => Ins::StoreIntoLocal(u32::from(o & 7)),
+            144..=151 => Ins::PushLiteral(u32::from(o & 7)),
             op::PUSH_NIL => Ins::PushNil,
             op::PUSH_FALSE => Ins::PushFalse,
             op::PUSH_TRUE => Ins::PushTrue,
@@ -178,6 +307,11 @@ fn decode(code: &[u8]) -> Option<Vec<(usize, usize, Ins)>> {
             op::RETURN_SELF => Ins::Return(Ret::Self_),
             op::RETURN_TOP => Ins::Return(Ret::Top),
             176..=207 if inline_arith(o - 176) => Ins::Arith(o - 176),
+            176..=207 => Ins::Send {
+                rule: RULE_COMMON,
+                literal: u32::from(o - 176),
+                args: 0,
+            },
             op::PUSH_PARAMETER => Ins::PushParam(u32::from(b1)),
             op::PUSH_LOCAL => Ins::PushLocal(u32::from(b1)),
             op::POP_INTO_LOCAL => Ins::PopIntoLocal(u32::from(b1)),
@@ -186,6 +320,7 @@ fn decode(code: &[u8]) -> Option<Vec<(usize, usize, Ins)>> {
             op::BRANCH => Ins::Jump(next + wide),
             op::BRANCH_IF_TRUE => Ins::Branch(true, next + wide),
             op::BRANCH_IF_FALSE => Ins::Branch(false, next + wide),
+            op::PUSH_LITERAL => Ins::PushLiteral(wide as u32),
             op::PUSH_INTEGER => Ins::PushSmall(i64::from(i16::from_le_bytes([b1, b2]))),
             op::ORDINARY_SEND => Ins::Send {
                 rule: RULE_ORDINARY,
@@ -202,64 +337,126 @@ fn decode(code: &[u8]) -> Option<Vec<(usize, usize, Ins)>> {
                 literal: ext_sel,
                 args: ext_args,
             },
-            _ => return None,
+            op::SUPER_SEND => Ins::Send {
+                rule: RULE_SUPER,
+                literal: ext_sel,
+                args: ext_args,
+            },
+            op::PUSH_INDIRECT_LOCAL
+            | op::POP_INTO_INDIRECT_LOCAL
+            | op::STORE_INTO_INDIRECT_LOCAL => Ins::Indirect {
+                op: o,
+                index: u32::from(b1),
+                local: u32::from(b2),
+            },
+            op::PUSH_CLOSURE => {
+                // The body follows, `length` bytes; the method goes on after
+                // it.
+                let length = u16::from_le_bytes([b2, b3]) as usize;
+                if next + length > code.len() {
+                    return None;
+                }
+                closures.push(next);
+                Ins::Step(next + length)
+            }
+            // Everything else, the interpreter's errors included.
+            _ => Ins::Step(next),
         };
         out.push((ip, len, ins));
         ip = next;
     }
-    Some(out)
+    Some((out, closures))
+}
+
+/// A compiled method: its module, and the instruction indices at which its
+/// function can be entered (sorted; entry `k` is block `k`).
+pub struct Compiled {
+    /// The WebAssembly module.
+    pub module: Vec<u8>,
+    /// The entries.
+    pub entries: Vec<u32>,
 }
 
 /// Compiles `code` (a method's bytecode) to a module, or answers `None` if
-/// it uses an instruction outside the subset. `arith_ok(k)` says whether the
-/// inline SmallInteger meaning of common selector `k` is SmallInteger's
-/// method (as the interpreter's fast path checks).
-pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) -> Option<Vec<u8>> {
-    let ins = decode(code)?;
-    for &(_, _, i) in &ins {
-        match i {
-            Ins::Arith(k) if !arith_ok(usize::from(k)) => return None,
-            // Parameters are numbered from 1 (the interpreter refuses others).
-            Ins::PushParam(p) if p == 0 || p > arg_count => return None,
+/// it is malformed. `arith_ok(k)` says whether the inline SmallInteger
+/// meaning of common selector `k` is SmallInteger's method (as the
+/// interpreter's fast path checks); where it is not, the instruction is a
+/// send, by `step`.
+pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled> {
+    let (mut ins, closures) = decode(code)?;
+    for entry in &mut ins {
+        match entry.2 {
+            Ins::Arith(k) if !arith_ok(usize::from(k)) => {
+                entry.2 = Ins::Send {
+                    rule: RULE_COMMON,
+                    literal: u32::from(k),
+                    args: 0,
+                }
+            }
+            // Parameters are numbered from 1; others are the interpreter's
+            // error. (A closure's parameters are numbered as its method's
+            // are, within the closure's own count, which the interpreter
+            // checks.)
+            Ins::PushParam(0) => entry.2 = Ins::Step(entry.0 + entry.1),
             _ => {}
         }
     }
     // Basic blocks: their first instructions' indices.
     let mut leaders: Vec<usize> = alloc::vec![0];
+    leaders.extend_from_slice(&closures);
     for &(ip, len, i) in &ins {
+        let next = ip + len;
         match i {
             Ins::Jump(t) | Ins::Branch(_, t) => {
                 leaders.push(t);
-                leaders.push(ip + len);
+                leaders.push(next);
             }
-            Ins::Return(_) => leaders.push(ip + len),
+            Ins::Return(_) => leaders.push(next),
+            Ins::Send { .. } | Ins::Arith(_) | Ins::Indirect { .. } => leaders.push(next),
+            Ins::Step(after) => {
+                leaders.push(after);
+                leaders.push(next);
+            }
             _ => {}
         }
     }
     leaders.retain(|&l| l < code.len());
     leaders.sort_unstable();
     leaders.dedup();
-    // Every jump target must be an instruction's start.
+    // Every block must start at an instruction.
     for &l in &leaders {
-        if !ins.iter().any(|&(ip, _, _)| ip == l) {
+        if ins.binary_search_by_key(&l, |&(ip, _, _)| ip).is_err() {
             return None;
         }
     }
     let block_of = |ip: usize| leaders.binary_search(&ip).ok();
     // Room on the operand stack: no more than every pushing instruction.
-    let headroom = ins.len() as i32 + 8;
+    if ins.len() + 8 > HEADROOM {
+        return None;
+    }
 
     let mut f = Func::default();
-    // Entry: the frame's layout and the constants.
-    f.get(L_VM).i32c(headroom).call(F_STACK_BASE).set(L_BASE);
-    for (local, which) in [(L_SP, 0), (L_BP, 1), (L_LP, 2), (L_ARGC, 3)] {
-        f.get(L_VM).i32c(which).call(F_FRAME).set(local);
+    // Entry: the frame's layout and the constants, from the registers.
+    for (local, offset) in [
+        (L_BASE, R_BASE),
+        (L_SP, R_SP),
+        (L_BP, R_BP),
+        (L_LP, R_LP),
+        (L_ARGC, R_ARGC),
+        (L_DEPTH, R_DEPTH),
+    ] {
+        f.reg32(offset).set(local);
     }
-    f.get(L_VM).call(F_RECEIVER).set(L_SELF);
-    for (local, which) in [(L_NIL, 0), (L_TRUE, 1), (L_FALSE, 2)] {
-        f.get(L_VM).i32c(which).call(F_VALUE).set(local);
+    for (local, offset) in [
+        (L_SELF, R_RECEIVER),
+        (L_NIL, R_NIL),
+        (L_TRUE, R_TRUE),
+        (L_FALSE, R_FALSE),
+    ] {
+        f.reg64(offset).set(local);
     }
-    f.i32c(0).set(L_PC);
+    f.get(L_ENTRY).set(L_PC);
+    f.i32c(TICK).set(L_COUNT);
     // loop $dispatch; block x n; br_table; then each block's code after
     // its `end`.
     let n = leaders.len() as u32;
@@ -280,7 +477,7 @@ pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) ->
         let next = ip + len;
         // The branch depth to the dispatch loop from block k's code: the
         // blocks k+1 .. n-1 still enclose it.
-        let to_loop = (n - 1 - k as u32) as u32;
+        let to_loop = n - 1 - k as u32;
         // `extra`: the `if`s around the jump.
         let jump = |f: &mut Func, target: usize, extra: u32| {
             f.i32c(block_of(target).expect("a leader") as i32).set(L_PC);
@@ -288,7 +485,12 @@ pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) ->
         };
         match i {
             Ins::PushParam(p) => {
-                // stack[bp + 1 + (argc - p)]
+                // stack[bp + 1 + (argc - p)]; beyond the count, the
+                // interpreter's error.
+                f.get(L_ARGC).i32c(p as i32).op(0x48); // argc < p
+                f.op(0x04).op(0x40);
+                f.interpret(ip);
+                f.op(0x0b);
                 f.push_addr();
                 f.slot_addr(|f| {
                     f.get(L_BP)
@@ -340,6 +542,19 @@ pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) ->
             Ins::PushSmall(v) => {
                 f.push_addr().i64c(v << 1).store().inc_sp();
             }
+            Ins::PushLiteral(i) => {
+                // From the literals' address in the registers (the array
+                // can move at allocations, which are calls); beyond the
+                // count, the interpreter's error.
+                f.reg32(R_LITERAL_COUNT).i32c(i as i32).op(0x4d); // count <= i
+                f.op(0x04).op(0x40);
+                f.step(ip);
+                f.leave_after_step();
+                f.op(0x0b);
+                f.push_addr();
+                f.reg32(R_LITERALS).i32c(8 * i as i32).add().load();
+                f.store().inc_sp();
+            }
             Ins::Pop => {
                 f.dec_sp();
             }
@@ -350,10 +565,24 @@ pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) ->
                 });
                 f.load().store().inc_sp();
             }
-            Ins::Jump(t) => jump(&mut f, t, 0),
+            Ins::Jump(t) => {
+                if t <= ip {
+                    // A backward jump: the interrupt poll, every TICK.
+                    f.get(L_COUNT).i32c(1).sub().set(L_COUNT);
+                    f.get(L_COUNT).op(0x45); // i32.eqz
+                    f.op(0x04).op(0x40);
+                    f.i32c(TICK).set(L_COUNT);
+                    f.get(L_VM).i32c(t as i32).get(L_SP).call(F_TICK).set(L_R);
+                    f.get(L_R).op(0x04).op(0x40);
+                    f.get(L_R).op(0x0f);
+                    f.op(0x0b);
+                    f.op(0x0b);
+                }
+                jump(&mut f, t, 0);
+            }
             Ins::Branch(condition, t) => {
-                // a = top; not a Boolean: the interpreter (which sends
-                // #nonBooleanReceiver:).
+                // a = top; not a Boolean: the interpreter's branch (which
+                // sends #mustBeBoolean or the like), then the interpreter.
                 f.slot_addr(|f| {
                     f.get(L_SP).i32c(1).sub();
                 });
@@ -367,7 +596,8 @@ pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) ->
                     .op(0x72); // eq | eq
                 f.op(0x45); // i32.eqz
                 f.op(0x04).op(0x40); // if
-                f.interpret(ip);
+                f.step(ip);
+                f.leave_after_step();
                 f.op(0x0b);
                 f.dec_sp();
                 f.get(L_A)
@@ -383,7 +613,7 @@ pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) ->
             }
             Ins::Arith(k) => {
                 // a = stack[sp-2], b = stack[sp-1]; both SmallIntegers
-                // (low bit 0), else the interpreter.
+                // (low bit 0), else the send, by `step`.
                 f.slot_addr(|f| {
                     f.get(L_SP).i32c(2).sub();
                 });
@@ -400,7 +630,7 @@ pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) ->
                     .op(0x50)
                     .op(0x45); // ((a|b)&1) != 0
                 f.op(0x04).op(0x40);
-                f.interpret(ip);
+                f.common_and_go_on(k, next, code.len(), 1, &jump);
                 f.op(0x0b);
                 // The result, into r64, then into stack[sp-2]; sp -= 1.
                 match k {
@@ -430,7 +660,7 @@ pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) ->
                         }
                         f.i64c(0).op(0x53); // i64.lt_s
                         f.op(0x04).op(0x40);
-                        f.interpret(ip);
+                        f.common_and_go_on(k, next, code.len(), 1, &jump);
                         f.op(0x0b);
                     }
                     7 => {
@@ -467,6 +697,13 @@ pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) ->
                 literal,
                 args,
             } => {
+                let cacheable =
+                    args <= 1 && matches!(rule, RULE_ORDINARY | RULE_SELF | RULE_IMPLICIT);
+                let site = if cacheable { Some(f.new_site()) } else { None };
+                if let Some(g) = site {
+                    f.inline_accessor(g, rule == RULE_ORDINARY, args == 1);
+                    f.op(0x05); // else: the send
+                }
                 f.get(L_VM)
                     .i32c(rule)
                     .i32c(literal as i32)
@@ -475,24 +712,90 @@ pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) ->
                     .get(L_SP)
                     .call(F_SEND)
                     .set(L_R);
-                // A compiled callee: run it here.
-                f.get(L_R).i32c(CALLEE).op(0x4e); // i32.ge_s
-                f.op(0x04).op(0x40);
-                f.get(L_VM).get(L_R).i32c(CALLEE).sub();
-                f.op(0x11).uleb(T_RUN).uleb(0); // call_indirect
-                f.set(L_R);
+                f.after_call();
+                if let Some(g) = site {
+                    // Fill the cache from what the send found.
+                    f.reg32(R_IC_KIND).op(0x04).op(0x40);
+                    f.reg64(R_IC_CLASS).gset(g);
+                    f.reg32(R_IC_SLOT).gset(g + 2);
+                    f.reg32(R_EPOCH).gset(g + 1);
+                    f.op(0x0b);
+                    f.op(0x0b); // end if/else
+                }
+            }
+            Ins::Indirect {
+                op: o,
+                index,
+                local,
+            } => {
+                // The vector: an Array with the element; for a store, not
+                // frozen, and young or remembered. Else by `step`.
+                f.slot_addr(|f| {
+                    f.get(L_LP).i32c(local as i32).add();
+                });
+                f.load().set(L_A);
+                f.object_at_a();
+                f.get(L_A).i64c(1).op(0x83).op(0x50).op(0x45); // a reference
+                f.op(0x04).op(0x7f);
+                f.get(L_ADDR).i32c(META as i32).add().load().set(L_META);
+                f.get(L_META).i64c(31).op(0x83).i64c(3).op(0x51); // an Array
+                f.get(L_META)
+                    .i64c(32)
+                    .op(0x88)
+                    .i64c(i64::from(index))
+                    .op(0x56)
+                    .op(0x71); // size > index
+                if o != op::PUSH_INDIRECT_LOCAL {
+                    f.get(L_META).i64c(1 << 5).op(0x83).op(0x50).op(0x71); // not frozen
+                    f.get(L_INDEX).reg32(R_BOUNDARY).op(0x4f);
+                    f.get(L_META)
+                        .i64c(META_REMEMBERED)
+                        .op(0x83)
+                        .op(0x50)
+                        .op(0x45);
+                    f.op(0x72).op(0x71);
+                }
+                f.op(0x05).i32c(0).op(0x0b);
+                f.op(0x45).op(0x04).op(0x40); // if not: by step
+                f.step(ip);
+                f.after_call();
+                if next < code.len() {
+                    jump(&mut f, next, 1);
+                } else {
+                    f.interpret(next);
+                }
                 f.op(0x0b);
-                // Anything but a completed send: leave it to the caller.
-                f.get(L_R).op(0x04).op(0x40);
-                f.get(L_R).op(0x0f); // return r
-                f.op(0x0b);
-                // A safepoint due: the interpreter's loop takes it.
-                f.get(L_VM).call(F_DUE).op(0x04).op(0x40);
-                f.i32c(INTERPRET).op(0x0f);
-                f.op(0x0b);
-                // Reload the stack's address and height.
-                f.get(L_VM).i32c(headroom).call(F_STACK_BASE).set(L_BASE);
-                f.get(L_VM).i32c(0).call(F_FRAME).set(L_SP);
+                let element = |f: &mut Func| {
+                    f.get(L_ADDR).i32c((SLOTS + 8 * index) as i32).add();
+                };
+                match o {
+                    op::PUSH_INDIRECT_LOCAL => {
+                        f.push_addr();
+                        element(&mut f);
+                        f.load().store().inc_sp();
+                    }
+                    _ => {
+                        element(&mut f);
+                        f.slot_addr(|f| {
+                            f.get(L_SP).i32c(1).sub();
+                        });
+                        f.load().store();
+                        if o == op::POP_INTO_INDIRECT_LOCAL {
+                            f.dec_sp();
+                        }
+                    }
+                }
+            }
+            Ins::Step(after) => {
+                f.step(ip);
+                f.after_call();
+                if after != next {
+                    if after < code.len() {
+                        jump(&mut f, after, 0);
+                    } else {
+                        f.interpret(after);
+                    }
+                }
             }
             Ins::Return(r) => {
                 f.get(L_VM);
@@ -524,19 +827,21 @@ pub fn compile(code: &[u8], arg_count: u32, arith_ok: &dyn Fn(usize) -> bool) ->
         }
     }
     // Falling off the end: the interpreter decides.
-    f.i32c(INTERPRET).op(0x0f);
+    f.interpret(code.len());
     f.op(0x0b); // end loop
     f.i32c(INTERPRET);
-    Some(module(&f.body))
+    Some(Compiled {
+        module: module(&f.body, f.sites),
+        entries: leaders.iter().map(|&l| l as u32).collect(),
+    })
 }
-
-/// The scratch i64 for arithmetic results.
-const L_R64: u32 = 14;
 
 /// A function body under construction.
 #[derive(Default)]
 struct Func {
     body: Vec<u8>,
+    /// Inline-cache sites, each three globals: class (i64), epoch, slot.
+    sites: u32,
 }
 
 impl Func {
@@ -618,6 +923,212 @@ impl Func {
     fn dec_sp(&mut self) -> &mut Func {
         self.get(L_SP).i32c(1).sub().set(L_SP)
     }
+    /// Runs the instruction at `ip` by the runtime's `step`, into `r`.
+    fn step(&mut self, ip: usize) -> &mut Func {
+        self.get(L_VM)
+            .i32c(ip as i32)
+            .get(L_SP)
+            .call(F_STEP)
+            .set(L_R)
+    }
+    /// After a `step` whose continuation compiled code does not know: back
+    /// to the caller, with the frame as the step left it.
+    fn leave_after_step(&mut self) -> &mut Func {
+        self.get(L_R).i32c(RETURNED).op(0x46).op(0x04).op(0x40);
+        self.i32c(DONE).op(0x0f);
+        self.op(0x0b);
+        self.get(L_R).i32c(STOP).op(0x46).op(0x04).op(0x40);
+        self.i32c(STOP).op(0x0f);
+        self.op(0x0b);
+        self.i32c(INTERPRET).op(0x0f)
+    }
+    /// After a `send` or `step` (its answer in `r`) whose instruction goes on
+    /// at `next`: runs a compiled callee; returns unless the instruction
+    /// completed; takes a due safepoint in the interpreter's loop; reloads
+    /// the stack.
+    fn after_call(&mut self) -> &mut Func {
+        // A compiled callee: run it here, from its entry.
+        self.get(L_R).i32c(CALLEE).op(0x4e); // i32.ge_s
+        self.op(0x04).op(0x40);
+        self.get(L_VM).get(L_REGS).reg32(R_BLOCK);
+        self.get(L_R).i32c(CALLEE).sub();
+        self.op(0x11).uleb(T_RUN).uleb(0); // call_indirect
+        self.set(L_R);
+        self.op(0x0b);
+        // The frame returned (a `^` by `step`).
+        self.get(L_R).i32c(RETURNED).op(0x46).op(0x04).op(0x40);
+        self.i32c(DONE).op(0x0f);
+        self.op(0x0b);
+        // A non-local return to this frame: as a completed send.
+        self.get(L_R).i32c(UNWOUND).op(0x46);
+        self.reg32(R_DEPTH).get(L_DEPTH).op(0x46).op(0x71);
+        self.op(0x04).op(0x40);
+        self.i32c(DONE).set(L_R);
+        self.op(0x0b);
+        // Anything but a completed instruction: leave it to the caller.
+        self.get(L_R).op(0x04).op(0x40);
+        self.get(L_R).op(0x0f);
+        self.op(0x0b);
+        // A safepoint due: the interpreter's loop takes it (and gives the
+        // frame back at `next`, an entry).
+        self.reg32(R_DUE).op(0x04).op(0x40);
+        self.i32c(INTERPRET).op(0x0f);
+        self.op(0x0b);
+        // Reload the stack's address and height.
+        self.reg32(R_SP).set(L_SP);
+        self.reg32(R_BASE).set(L_BASE)
+    }
+    fn gget(&mut self, g: u32) -> &mut Func {
+        self.op(0x23).uleb(g)
+    }
+    fn gset(&mut self, g: u32) -> &mut Func {
+        self.op(0x24).uleb(g)
+    }
+    /// A new inline-cache site: its first global.
+    fn new_site(&mut self) -> u32 {
+        self.sites += 1;
+        3 * (self.sites - 1)
+    }
+    /// The inline accessor of site `g`, opening an `if` the caller closes
+    /// (with an `else` for the send): the receiver (on the stack for an
+    /// ordinary send, below the argument of a setter; else the frame's) an
+    /// object of the cached class, in the cache's epoch, of the regular
+    /// format with the slot; for a setter, neither frozen nor a value, and
+    /// young or remembered (else the write barrier must remember it).
+    fn inline_accessor(&mut self, g: u32, ordinary: bool, setter: bool) -> &mut Func {
+        if ordinary {
+            let below = if setter { 2 } else { 1 };
+            self.slot_addr(|f| {
+                f.get(L_SP).i32c(below).sub();
+            });
+            self.load().set(L_A);
+        } else {
+            self.get(L_SELF).set(L_A);
+        }
+        self.object_at_a();
+        // a reference, the class, the epoch
+        self.get(L_A).i64c(1).op(0x83).op(0x50).op(0x45); // (a & 1) != 0
+        self.op(0x04).op(0x7f); // if (result i32)
+        self.get(L_ADDR).load().gget(g).op(0x51); // class == cached
+        self.reg32(R_EPOCH).gget(g + 1).op(0x46).op(0x71); // & epoch == cached
+        self.op(0x05).i32c(0).op(0x0b);
+        self.op(0x04).op(0x7f); // if (result i32)
+        // the meta word: regular (code 0) and the slot within the size
+        self.get(L_ADDR).i32c(META as i32).add().load().set(L_META);
+        self.get(L_META).i64c(31).op(0x83).op(0x50); // code == 0
+        self.get(L_META)
+            .i64c(32)
+            .op(0x88)
+            .gget(g + 2)
+            .op(0xad)
+            .op(0x56)
+            .op(0x71); // size > slot
+        if setter {
+            self.get(L_META)
+                .i64c(META_FLAGS_FROZEN_OR_VALUE)
+                .op(0x83)
+                .op(0x50)
+                .op(0x71);
+            // young, or remembered
+            self.get(L_INDEX).reg32(R_BOUNDARY).op(0x4f); // index >= boundary
+            self.get(L_META)
+                .i64c(META_REMEMBERED)
+                .op(0x83)
+                .op(0x50)
+                .op(0x45);
+            self.op(0x72).op(0x71);
+        }
+        self.op(0x05).i32c(0).op(0x0b);
+        self.op(0x04).op(0x40); // if: the hit
+        // the slot's address: addr + SLOTS + slot * 8
+        let slot_addr = |f: &mut Func| {
+            f.get(L_ADDR)
+                .i32c(SLOTS as i32)
+                .add()
+                .gget(g + 2)
+                .i32c(3)
+                .op(0x74)
+                .add();
+        };
+        match (ordinary, setter) {
+            (_, false) => {
+                // The value replaces the receiver (ordinary) or is pushed.
+                if ordinary {
+                    self.slot_addr(|f| {
+                        f.get(L_SP).i32c(1).sub();
+                    });
+                } else {
+                    self.push_addr();
+                }
+                slot_addr(self);
+                self.load().store();
+                if !ordinary {
+                    self.inc_sp();
+                }
+            }
+            (_, true) => {
+                // slot := top; the answer is the receiver.
+                slot_addr(self);
+                self.slot_addr(|f| {
+                    f.get(L_SP).i32c(1).sub();
+                });
+                self.load().store();
+                if ordinary {
+                    self.dec_sp();
+                } else {
+                    self.slot_addr(|f| {
+                        f.get(L_SP).i32c(1).sub();
+                    });
+                    self.get(L_A).store();
+                }
+            }
+        }
+        self
+    }
+    /// The i32 register at `offset`.
+    fn reg32(&mut self, offset: u32) -> &mut Func {
+        self.get(L_REGS).op(0x28).uleb(2).uleb(offset) // i32.load align 4
+    }
+    /// The i64 register at `offset`.
+    fn reg64(&mut self, offset: u32) -> &mut Func {
+        self.get(L_REGS).op(0x29).uleb(3).uleb(offset) // i64.load align 8
+    }
+    /// index = a >> 1; addr = arena + index * 8 (for `a` a reference).
+    fn object_at_a(&mut self) -> &mut Func {
+        self.get(L_A).i64c(1).op(0x88).op(0xa7).set(L_INDEX); // i64.shr_u, i32.wrap
+        self.reg32(R_ARENA)
+            .get(L_INDEX)
+            .i32c(3)
+            .op(0x74)
+            .add()
+            .set(L_ADDR)
+    }
+    /// The slow path of inline common selector `k`: the send, then on to
+    /// `next` (from inside `extra` `if`s).
+    fn common_and_go_on(
+        &mut self,
+        k: u8,
+        next: usize,
+        len: usize,
+        extra: u32,
+        jump: &dyn Fn(&mut Func, usize, u32),
+    ) -> &mut Func {
+        self.get(L_VM)
+            .i32c(RULE_COMMON)
+            .i32c(i32::from(k))
+            .i32c(0)
+            .i32c(next as i32)
+            .get(L_SP)
+            .call(F_SEND)
+            .set(L_R);
+        self.after_call();
+        if next < len {
+            jump(self, next, extra);
+        } else {
+            self.interpret(next);
+        }
+        self
+    }
     /// Leaves the frame at instruction `ip` for the interpreter, and returns.
     fn interpret(&mut self, ip: usize) -> &mut Func {
         self.get(L_VM)
@@ -652,19 +1163,15 @@ fn section(out: &mut Vec<u8>, id: u8, content: &[u8]) {
 }
 
 /// The module around the function body `body` (its locals not included).
-fn module(body: &[u8]) -> Vec<u8> {
+fn module(body: &[u8], sites: u32) -> Vec<u8> {
     const I32: u8 = 0x7f;
     const I64: u8 = 0x7e;
     let mut m = alloc::vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
-    // Types.
-    let types: [(&[u8], &[u8]); 7] = [
-        (&[I32], &[I32]),
-        (&[I32, I32], &[I32]),
-        (&[I32], &[I64]),
-        (&[I32, I32], &[I64]),
+    // Types, in the order of the T_ constants.
+    let types: [(&[u8], &[u8]); 3] = [
+        (&[I32, I32, I32], &[I32]),
         (&[I32, I32, I32, I32, I32, I32], &[I32]),
         (&[I32, I64, I32], &[I32]),
-        (&[I32, I32, I32], &[I32]),
     ];
     let mut t = Vec::new();
     uleb(&mut t, types.len() as u32);
@@ -676,16 +1183,14 @@ fn module(body: &[u8]) -> Vec<u8> {
         t.extend_from_slice(results);
     }
     section(&mut m, 1, &t);
-    // Imports: the functions, the memory, the table.
+    // Imports: the functions (in the order of the F_ constants), the
+    // memory, the table.
     let functions: [(&str, u32); IMPORTED as usize] = [
-        ("stack_base", T_I32_I32),
-        ("frame", T_I32_I32),
-        ("receiver", T_I32_I64),
-        ("value", T_I32I32_I64),
         ("send", T_SEND),
         ("ret", T_RET),
-        ("interpret", T_INTERPRET),
-        ("due", T_RUN),
+        ("interpret", T_RUN),
+        ("step", T_RUN),
+        ("tick", T_RUN),
     ];
     let mut im = Vec::new();
     uleb(&mut im, functions.len() as u32 + 2);
@@ -704,16 +1209,26 @@ fn module(body: &[u8]) -> Vec<u8> {
     section(&mut m, 2, &im);
     // The one function, `run`.
     section(&mut m, 3, &[0x01, T_RUN as u8]);
+    // Globals: each site's class (i64), epoch and slot (i32), mutable, 0.
+    if sites > 0 {
+        let mut g = Vec::new();
+        uleb(&mut g, 3 * sites);
+        for _ in 0..sites {
+            g.extend_from_slice(&[I64, 0x01, 0x42, 0x00, 0x0b]);
+            g.extend_from_slice(&[I32, 0x01, 0x41, 0x00, 0x0b]);
+            g.extend_from_slice(&[I32, 0x01, 0x41, 0x00, 0x0b]);
+        }
+        section(&mut m, 6, &g);
+    }
     let mut ex = Vec::new();
     uleb(&mut ex, 1);
     name(&mut ex, "run");
     ex.push(0x00);
     uleb(&mut ex, IMPORTED);
     section(&mut m, 7, &ex);
-    // Code: locals 1..=7 i32, 8..=14 i64 (base sp bp lp argc pc r; a b self
-    // nil true false r64).
+    // Code: the locals after the parameters, i32s then i64s.
     let mut code = Vec::new();
-    code.extend_from_slice(&[0x02, 0x07, I32, 0x07, I64]);
+    code.extend_from_slice(&[0x02, I32_LOCALS, I32, I64_LOCALS, I64]);
     code.extend_from_slice(body);
     code.push(0x0b); // end of function
     let mut c = Vec::new();
@@ -729,18 +1244,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_method_outside_the_subset_is_not_compiled() {
-        // push closure: not in the spike's subset.
-        assert!(compile(&[op::PUSH_CLOSURE, 0, 0, 0], 0, &|_| true).is_none());
-        // push parameter 0 does not exist.
-        assert!(compile(&[112, op::RETURN_TOP], 1, &|_| true).is_none());
+    fn a_malformed_method_is_not_compiled() {
+        // A closure whose body runs past the method's end.
+        assert!(compile(&[op::PUSH_CLOSURE, 0, 9, 0], &|_| true).is_none());
+        // A jump into the middle of an instruction.
+        assert!(compile(&[17, op::PUSH_INTEGER, 1, 0, op::RETURN_TOP], &|_| true).is_none());
     }
 
     #[test]
-    fn a_straight_method_compiles_to_a_module() {
-        // ^self + 1, as a self send of #foo: then return.
+    fn a_method_compiles_to_a_module_with_its_entries() {
+        // ^self + 1
         let code = [op::PUSH_SELF, 162, 176, op::RETURN_TOP];
-        let m = compile(&code, 0, &|_| true).expect("compiles");
-        assert_eq!(&m[..4], b"\0asm");
+        let c = compile(&code, &|_| true).expect("compiles");
+        assert_eq!(&c.module[..4], b"\0asm");
+        // The start, and after the arithmetic (its slow path is a call).
+        assert_eq!(c.entries, [0, 3]);
+    }
+
+    #[test]
+    fn a_closure_body_is_an_entry() {
+        // [^nil] value: push closure (0 copied, 0 args, 1 byte), then send.
+        let code = [
+            op::PUSH_CLOSURE,
+            0,
+            1,
+            0,
+            op::RETURN_NIL,
+            64,
+            op::RETURN_TOP,
+        ];
+        let c = compile(&code, &|_| true).expect("compiles");
+        assert_eq!(c.entries, [0, 4, 5, 6]);
     }
 }

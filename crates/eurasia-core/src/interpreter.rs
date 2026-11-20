@@ -130,11 +130,11 @@ pub enum Completion {
     /// timer, and the host does not block ([`Host::blocks`]): it calls
     /// [`Vm::resume`] once that time has come.
     Waiting(u64),
-    /// The top frame is a fresh activation of a compiled method: the host
-    /// calls compiled function `0` with the VM's address, then
-    /// [`Vm::continue_after_compiled`] with its status
+    /// The top frame is at an entry of a compiled method: the host calls
+    /// compiled function `.0` with the VM's address and the entry's block
+    /// `.1`, then [`Vm::continue_after_compiled`] with its status
     /// (newspeak/EURASIA_COMPILER_DESIGN_2026-11-19.md).
-    Compiled(u32),
+    Compiled(u32, u32),
 }
 
 #[derive(Clone, Debug)]
@@ -320,6 +320,12 @@ pub struct Vm {
     jit_threshold: i64,
     /// What compiled code stopped the run with ([`crate::compiler::STOP`]).
     jit_stop: Option<Result<Option<Completion>, VmError>>,
+    /// The frame count when the host last entered compiled code: compiled
+    /// callees nest in the host's own stack, so their depth is bounded.
+    jit_base: usize,
+    /// The registers compiled code reads ([`crate::compiler::Regs`]), boxed
+    /// so that their address holds while it runs.
+    jit_regs: alloc::boxed::Box<crate::compiler::Regs>,
     /// For each arithmetic or comparison common selector (0 to 13), whether
     /// SmallInteger's method for it is the native the fast path computes:
     /// 0 not yet known, 1 yes, 2 no. Cleared with the lookup cache.
@@ -400,6 +406,11 @@ impl Vm {
             lookup_cache: alloc::vec![None; LOOKUP_CACHE_SIZE],
             jit_threshold: 0,
             jit_stop: None,
+            jit_base: 0,
+            jit_regs: alloc::boxed::Box::new(crate::compiler::Regs {
+                epoch: 1,
+                ..crate::compiler::Regs::default()
+            }),
             small_integer_fast: [0; SMALL_INTEGER_FAST_PATHS],
         }
     }
@@ -409,6 +420,8 @@ impl Vm {
     /// method (its literals and mixin), which such a change may also move.
     fn flush_lookup_cache(&mut self) {
         self.lookup_cache.fill(None);
+        // Compiled code's inline caches go with it.
+        self.jit_regs.epoch = self.jit_regs.epoch.wrapping_add(1).max(1);
         self.small_integer_fast = [0; SMALL_INTEGER_FAST_PATHS];
         let nil = self.nil();
         for f in &mut self.frames {
@@ -1112,13 +1125,16 @@ impl Vm {
                     return Err(VmError::Interrupted);
                 }
             }
-            // A fresh activation of a compiled method: the host runs it.
-            // (Only at the top level: a callback's loop runs interpreted.)
+            // The top frame at an entry of a compiled method: the host runs
+            // it. (Only at the top level: a callback's loop runs
+            // interpreted.)
             if self.jit_threshold > 0
                 && self.callback_depth == 0
-                && let Some(code) = self.compiled_entry()
+                && let Some((code, block)) = self.compiled_entry()
             {
-                return Ok(Completion::Compiled(code));
+                self.jit_base = self.frames.len();
+                self.fill_jit_regs();
+                return Ok(Completion::Compiled(code, block));
             }
             let next = if self.step_limit.is_none() {
                 self.run_simple(host)?
@@ -1868,6 +1884,7 @@ impl Vm {
         // place on the stack.
         if let Outcome::ActivateReceiver = outcome {
             self.activate_closure(receiver, n)?;
+            self.tier_up_closure(host);
             return Ok(None);
         }
         let args: Vec<Value> = self.stack[base + 1..base + 1 + n].to_vec();
@@ -2302,6 +2319,7 @@ impl Vm {
                 let n = args.len();
                 self.stack.extend(args);
                 self.activate_closure(closure, n)?;
+                self.tier_up_closure(host);
                 Ok(None)
             }
         }
@@ -3794,33 +3812,39 @@ impl Vm {
             self.heap.set_method_jit(method, word + 1);
             return;
         }
-        let (code, argc) = {
-            let m = self.heap.method(method).expect("a method");
-            (m.bytecode().clone(), m.header().arg_count)
-        };
+        let code = self
+            .heap
+            .method(method)
+            .expect("a method")
+            .bytecode()
+            .clone();
         let ok: Vec<bool> = (0..SMALL_INTEGER_FAST_PATHS)
             .map(|k| self.small_integer_native_is(k))
             .collect();
-        let installed = crate::compiler::compile(&code, argc, &|k| ok.get(k) == Some(&true))
-            .and_then(|module| host.install_code(&module));
-        self.heap.set_method_jit(
-            method,
-            match installed {
-                Some(i) => -2 - i64::from(i),
-                None => crate::object::JIT_NEVER,
-            },
-        );
+        let compiled = crate::compiler::compile(&code, &|k| ok.get(k) == Some(&true));
+        match compiled.and_then(|c| host.install_code(&c.module).map(|i| (i, c.entries))) {
+            Some((i, entries)) => self.heap.set_method_compiled(method, i, entries.into()),
+            None => self.heap.set_method_jit(method, crate::object::JIT_NEVER),
+        }
     }
 
-    /// The compiled function of the top frame, if it is a fresh activation
-    /// of a compiled method.
-    fn compiled_entry(&self) -> Option<u32> {
-        let f = self.frames.last()?;
-        if f.ip != 0 || f.closure.is_some() {
+    /// Counts a closure activation (the top frame) against its method.
+    fn tier_up_closure(&mut self, host: &mut dyn Host) {
+        if self.jit_threshold > 0 {
+            let method = self.frames.last().expect("a frame").method;
+            self.tier_up(method, host);
+        }
+    }
+
+    /// The compiled function of the top frame and its block, if the frame
+    /// is at an entry of its compiled method (and no step limit counts
+    /// instructions).
+    fn compiled_entry(&self) -> Option<(u32, u32)> {
+        if self.step_limit.is_some() {
             return None;
         }
-        let w = self.heap.method_jit(f.method)?;
-        (w <= -2).then(|| (-2 - w) as u32)
+        let f = self.frames.last()?;
+        self.heap.compiled_entry(f.method, &f.code, f.ip)
     }
 
     /// Continues the run after compiled code answered `status`.
@@ -3839,11 +3863,9 @@ impl Vm {
         self.event_loop(host)
     }
 
-    /// For compiled code: the operand stack's address, with room for
-    /// `headroom` more Values.
-    pub fn compiled_stack_base(&mut self, headroom: usize) -> *mut Value {
-        self.stack.reserve(headroom);
-        self.stack.as_mut_ptr()
+    /// For the host: the registers' address, to pass to compiled code.
+    pub fn jit_regs(&mut self) -> *mut crate::compiler::Regs {
+        &mut *self.jit_regs
     }
 
     /// For the host: the operand stack, to set the height compiled code left
@@ -3852,30 +3874,55 @@ impl Vm {
         &mut self.stack
     }
 
-    /// For compiled code: the stack height (0), the top frame's receiver
-    /// index (1), first local (2) or argument count (3).
-    pub fn compiled_frame(&self, which: i32) -> i32 {
+    /// Sets the registers for the top frame.
+    fn fill_jit_regs(&mut self) {
+        self.stack.reserve(crate::compiler::HEADROOM);
         let f = self.frames.last().expect("a frame");
-        (match which {
-            0 => self.stack.len(),
-            1 => f.bp,
-            2 => f.lp,
-            _ => f.arg_count,
-        }) as i32
+        let (literals, literal_count) = self
+            .heap
+            .array_elements(f.literals)
+            .map_or((0, 0), |e| (e.as_ptr() as usize as u32, e.len() as u32));
+        let (bp, lp, argc, receiver) = (f.bp, f.lp, f.arg_count, f.receiver);
+        let (nil, t, fa) = (
+            self.nil(),
+            self.roles.get(Role::True),
+            self.roles.get(Role::False),
+        );
+        let due = self.safepoint_due();
+        let r = &mut *self.jit_regs;
+        r.base = self.stack.as_ptr() as usize as u32;
+        r.sp = self.stack.len() as u32;
+        r.bp = bp as u32;
+        r.lp = lp as u32;
+        r.argc = argc as u32;
+        r.due = u32::from(due);
+        r.literals = literals;
+        r.literal_count = literal_count;
+        r.arena = self.heap.words.as_ptr() as usize as u32;
+        r.boundary = self.heap.boundary as u32;
+        r.receiver = receiver.to_bits();
+        r.nil = nil.to_bits();
+        r.true_ = t.to_bits();
+        r.false_ = fa.to_bits();
+        r.depth = self.frames.len() as u32;
     }
 
-    /// For compiled code: the top frame's receiver.
-    pub fn compiled_receiver(&self) -> Value {
-        self.frames.last().expect("a frame").receiver
-    }
-
-    /// For compiled code: nil (0), true (1) or false (2).
-    pub fn compiled_value(&self, which: i32) -> Value {
-        self.roles.get(match which {
-            0 => Role::Nil,
-            1 => Role::True,
-            _ => Role::False,
-        })
+    /// Updates the registers after a call that left the top frame as it
+    /// was: the stack, the arena (which an allocation may have moved, and
+    /// the literals with it), the safepoint.
+    fn refresh_jit_regs(&mut self) {
+        self.stack.reserve(crate::compiler::HEADROOM);
+        let arena = self.heap.words.as_ptr() as usize as u32;
+        let due = self.safepoint_due();
+        let r = &mut *self.jit_regs;
+        r.base = self.stack.as_ptr() as usize as u32;
+        r.sp = self.stack.len() as u32;
+        r.due = u32::from(due);
+        if r.literal_count > 0 {
+            r.literals = r.literals.wrapping_sub(r.arena).wrapping_add(arena);
+        }
+        r.arena = arena;
+        r.boundary = self.heap.boundary as u32;
     }
 
     /// For compiled code: a send from the top frame, whose instruction
@@ -3888,44 +3935,255 @@ impl Vm {
         n: usize,
         next_ip: usize,
     ) -> i32 {
-        use crate::compiler::{CALLEE, DONE, INTERPRET, RULE_ORDINARY, RULE_SELF, STOP};
-        let depth = self.frames.len();
-        let serial = self.frames.last().expect("a frame").serial;
+        use crate::compiler::{RULE_COMMON, RULE_ORDINARY, RULE_SELF, RULE_SUPER};
+        let before = self.before_compiled_call();
+        self.jit_regs.ic_kind = 0;
         self.frames.last_mut().expect("a frame").ip = next_ip;
-        let kind = match rule {
-            RULE_ORDINARY => SendKind::Ordinary,
-            RULE_SELF => SendKind::SelfSend,
-            _ => SendKind::ImplicitReceiver,
+        let cached = match rule {
+            RULE_COMMON => None,
+            RULE_ORDINARY => self.cached_send(Rule::Ordinary, literal, n, host),
+            RULE_SELF => self.cached_send(Rule::SelfSend, literal, n, host),
+            RULE_SUPER => None,
+            _ => self.cached_send(Rule::ImplicitReceiver, literal, n, host),
         };
-        match self.send_by_literal(kind, literal, n, host) {
+        let result = match cached {
+            Some(r) => r,
+            None if rule == RULE_COMMON => self.common_send(literal, host),
+            None => {
+                let kind = match rule {
+                    RULE_ORDINARY => SendKind::Ordinary,
+                    RULE_SELF => SendKind::SelfSend,
+                    RULE_SUPER => SendKind::Super,
+                    _ => SendKind::ImplicitReceiver,
+                };
+                self.send_by_literal(kind, literal, n, host)
+            }
+        };
+        self.after_compiled_call(before, result, next_ip, false)
+    }
+
+    /// A send of literal `index` by `rule` with `n` arguments from the top
+    /// frame through the lookup cache, as `run_simple` makes it: an accessor
+    /// read or written here, any other cached method activated. `None` on a
+    /// miss, or where the full send must decide.
+    fn cached_send(
+        &mut self,
+        rule: Rule,
+        index: usize,
+        n: usize,
+        host: &mut dyn Host,
+    ) -> Option<Result<Option<Completion>, VmError>> {
+        let selector = self.literal(index)?;
+        let (receiver, mixin, lp) = {
+            let f = self.frames.last()?;
+            (f.receiver, f.mixin, f.lp)
+        };
+        let nil = self.nil();
+        let len = self.stack.len();
+        let ordinary = rule == Rule::Ordinary;
+        if len < lp + n + usize::from(ordinary) {
+            return None;
+        }
+        let (key, key_mixin) = if ordinary {
+            (self.stack[len - 1 - n], nil)
+        } else {
+            (receiver, mixin)
+        };
+        let class = self.class_of(key);
+        let e = self.lookup_cache[cache_index(class, selector, key_mixin, rule)]?;
+        if e.class != class || e.selector != selector || e.mixin != key_mixin || e.rule != rule {
+            return None;
+        }
+        let object = match e.target.receiver {
+            TargetReceiver::Present => key,
+            TargetReceiver::Frame => receiver,
+            TargetReceiver::Fixed(r) => r,
+        };
+        // An accessor of the receiver itself: compiled code's inline cache
+        // can hold it (keyed by its class; the mixin is the site's).
+        let own = matches!(
+            (e.target.receiver, ordinary),
+            (TargetReceiver::Present, true) | (TargetReceiver::Frame, false)
+        );
+        match (e.target.header.kind, n, e.target.slot) {
+            (MethodKind::Getter, 0, Some(slot)) => {
+                let v = *self.heap.regular_slots(object)?.get(slot)?;
+                if ordinary {
+                    self.stack[len - 1] = v;
+                } else {
+                    self.stack.push(v);
+                }
+                if own {
+                    self.jit_cache(object, slot);
+                }
+                Some(Ok(None))
+            }
+            (MethodKind::Setter, 1, Some(slot)) => {
+                if self.heap.flags(object) & (FROZEN | VALUE) != 0 {
+                    return None;
+                }
+                let value = self.stack[len - 1];
+                *self.heap.regular_slots_mut(object)?.get_mut(slot)? = value;
+                if ordinary {
+                    self.stack.pop();
+                } else {
+                    self.stack[len - 1] = object;
+                }
+                if own {
+                    self.jit_cache(object, slot);
+                }
+                Some(Ok(None))
+            }
+            _ => {
+                let t = e.target;
+                match t.receiver {
+                    TargetReceiver::Present => {}
+                    TargetReceiver::Frame => self.insert_receiver(receiver, n),
+                    TargetReceiver::Fixed(r) => self.insert_receiver(r, n),
+                }
+                Some(self.activate_with(t.method, t.header, n, host, t.slot))
+            }
+        }
+    }
+
+    /// For compiled code: the top frame's instruction at `ip`, as the
+    /// interpreter runs it; see [`crate::compiler`] for the answer.
+    pub fn compiled_step(&mut self, host: &mut dyn Host, ip: usize) -> i32 {
+        let before = self.before_compiled_call();
+        let (expected, returns) = {
+            let f = self.frames.last_mut().expect("a frame");
+            f.ip = ip;
+            let o = f.code.get(ip).copied().unwrap_or(0);
+            let len = instruction_length(o);
+            let expected = if o == op::PUSH_CLOSURE && ip + 4 <= f.code.len() {
+                ip + len + u16::from_le_bytes([f.code[ip + 2], f.code[ip + 3]]) as usize
+            } else {
+                ip + len
+            };
+            (expected, (171..=175).contains(&o))
+        };
+        let result = self.step(host).map(|s| match s {
+            Step::Continue => None,
+            Step::Done(c) => Some(c),
+        });
+        self.after_compiled_call(before, result, expected, returns)
+    }
+
+    /// What [`Vm::after_compiled_call`] compares with: the frame count, the
+    /// top frame's serial and the collection count.
+    fn before_compiled_call(&self) -> (usize, u64, u64) {
+        let serial = self.frames.last().expect("a frame").serial;
+        (self.frames.len(), serial, self.collections())
+    }
+
+    /// The answer to compiled code for a call into the runtime that ended
+    /// with `result`, the frames as `before` was: the instruction completed
+    /// ([`DONE`](crate::compiler::DONE)), the frame returned
+    /// ([`RETURNED`](crate::compiler::RETURNED)), a compiled callee's frame
+    /// is on top, at an entry ([`CALLEE`](crate::compiler::CALLEE) plus its
+    /// function; its block in `jit_block`), or the interpreter continues
+    /// ([`INTERPRET`](crate::compiler::INTERPRET)) or the run stops
+    /// ([`STOP`](crate::compiler::STOP)). Compiled code holds Values in its
+    /// own locals, so after a collection it does not go on: the interpreter
+    /// gives the frame back at its next entry. Compiled code goes on only
+    /// where it expects: after the instruction, at `expected` (an activation
+    /// native can move a frame, or cut frames back), and with a return or
+    /// non-local return only after a return instruction (`returns`).
+    fn after_compiled_call(
+        &mut self,
+        (depth, serial, collections): (usize, u64, u64),
+        result: Result<Option<Completion>, VmError>,
+        expected: usize,
+        returns: bool,
+    ) -> i32 {
+        use crate::compiler::{CALLEE, DONE, INTERPRET, RETURNED, STOP, UNWOUND};
+        /// Compiled callees nested in the host's stack, at most.
+        const MAX_NESTED: usize = 512;
+        match result {
             Err(e) => {
                 self.jit_stop = Some(Err(e));
-                STOP
+                return STOP;
             }
             Ok(Some(c)) => {
                 self.jit_stop = Some(Ok(Some(c)));
-                STOP
+                return STOP;
             }
-            Ok(None) => {
-                let len = self.frames.len();
-                if len == depth && self.frames[len - 1].serial == serial {
-                    DONE
-                } else if len == depth + 1
-                    && self.frames[depth - 1].serial == serial
-                    && !self.safepoint_due()
-                    && let Some(code) = self.compiled_entry()
-                {
-                    CALLEE + code as i32
-                } else {
-                    INTERPRET
-                }
+            Ok(None) => {}
+        }
+        if self.collections() != collections {
+            return INTERPRET;
+        }
+        let len = self.frames.len();
+        if len == depth && self.frames[len - 1].serial == serial {
+            if self.frames[len - 1].ip != expected {
+                return INTERPRET;
             }
+            self.refresh_jit_regs();
+            DONE
+        } else if !returns && len < depth {
+            INTERPRET
+        } else if len + 1 == depth {
+            self.jit_regs.ic_kind = 0;
+            if len > 0 {
+                self.fill_jit_regs();
+            }
+            RETURNED
+        } else if len == depth + 1
+            && self.frames[depth - 1].serial == serial
+            && self.frames[depth - 1].ip == expected
+            && len.saturating_sub(self.jit_base) < MAX_NESTED
+            && !self.safepoint_due()
+            && let Some((code, block)) = self.compiled_entry()
+        {
+            self.jit_regs.block = block;
+            self.fill_jit_regs();
+            CALLEE + code as i32
+        } else if returns && len + 1 < depth && len >= self.jit_base && len > 0 {
+            // A non-local return to a frame that compiled code holds (every
+            // frame from the one the host entered up is a compiled call).
+            self.jit_regs.ic_kind = 0;
+            self.fill_jit_regs();
+            UNWOUND
+        } else {
+            INTERPRET
+        }
+    }
+
+    /// Offers compiled code's inline cache the accessor of `object`'s class
+    /// at `slot`.
+    fn jit_cache(&mut self, object: Value, slot: usize) {
+        let class = self.class_of(object);
+        let r = &mut *self.jit_regs;
+        r.ic_kind = 1;
+        r.ic_slot = slot as u32;
+        r.ic_class = class.to_bits();
+    }
+
+    /// For compiled code: [`crate::compiler::TICK`] backward jumps of the top
+    /// frame, the next at `ip`, counted against the interrupt poll. When
+    /// the poll is due, the interpreter's loop takes it.
+    pub fn compiled_tick(&mut self, ip: usize) -> i32 {
+        let tick = crate::compiler::TICK as u32;
+        if self.interrupt_countdown > tick + 1 {
+            self.interrupt_countdown -= tick;
+            self.refresh_jit_regs();
+            crate::compiler::DONE
+        } else {
+            self.interrupt_countdown = 1;
+            self.frames.last_mut().expect("a frame").ip = ip;
+            crate::compiler::INTERPRET
         }
     }
 
     /// For compiled code: the local return of `value` from the top frame.
     pub fn compiled_return(&mut self, value: Value) -> i32 {
         self.local_return(value);
+        // The caller's send did not hit an accessor (its callee's last send
+        // may have).
+        self.jit_regs.ic_kind = 0;
+        if !self.frames.is_empty() {
+            self.fill_jit_regs();
+        }
         crate::compiler::DONE
     }
 
@@ -4461,26 +4719,7 @@ impl Vm {
                 self.stack.push(v);
                 None
             }
-            176..=207 => {
-                let k = (opcode - 176) as usize;
-                let table = self.roles.get(Role::CommonSelectors);
-                let entries = self
-                    .heap
-                    .array_elements(table)
-                    .ok_or_else(|| VmError::Malformed("common selectors must be an Array"))?;
-                let (Some(&selector), Some(&arity)) = (entries.get(2 * k), entries.get(2 * k + 1))
-                else {
-                    return Err(VmError::Malformed("common-selector table too short"));
-                };
-                let n = arity
-                    .as_small_integer()
-                    .and_then(|a| usize::try_from(a).ok())
-                    .ok_or_else(|| VmError::Malformed("common-selector arity"))?;
-                if self.stack.len() - self.frames.last().expect("a frame").lp < n + 1 {
-                    return Err(self.invalid());
-                }
-                self.ordinary_send(selector, n, host)?
-            }
+            176..=207 => self.common_send((opcode - 176) as usize, host)?,
             op::PUSH_NEW_ARRAY => {
                 let nil = self.nil();
                 let class = self.roles.get(Role::ArrayClass);
@@ -4660,6 +4899,36 @@ impl Vm {
             Some(done) => Step::Done(done),
             None => Step::Continue,
         })
+    }
+
+    /// A send of common selector `k` (SmallInteger fast paths first).
+    fn common_send(
+        &mut self,
+        k: usize,
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
+        if let Some(v) = self.small_integer_fast_path(k) {
+            let len = self.stack.len();
+            self.stack.truncate(len - 2);
+            self.stack.push(v);
+            return Ok(None);
+        }
+        let table = self.roles.get(Role::CommonSelectors);
+        let entries = self
+            .heap
+            .array_elements(table)
+            .ok_or_else(|| VmError::Malformed("common selectors must be an Array"))?;
+        let (Some(&selector), Some(&arity)) = (entries.get(2 * k), entries.get(2 * k + 1)) else {
+            return Err(VmError::Malformed("common-selector table too short"));
+        };
+        let n = arity
+            .as_small_integer()
+            .and_then(|a| usize::try_from(a).ok())
+            .ok_or_else(|| VmError::Malformed("common-selector arity"))?;
+        if self.stack.len() - self.frames.last().expect("a frame").lp < n + 1 {
+            return Err(self.invalid());
+        }
+        self.ordinary_send(selector, n, host)
     }
 
     fn push_parameter(&mut self, p: usize) -> Result<(), VmError> {

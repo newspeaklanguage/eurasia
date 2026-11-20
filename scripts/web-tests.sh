@@ -5,7 +5,11 @@
 # browser's loader (web/eurasia.mjs), the images genesis.sh and kernel-tests.sh
 # built. The base image must print exactly what the native VM printed, and
 # every kernel test must have the same outcome; the kernel tests, which use
-# timers, must also have waited for one (the non-blocking path).
+# timers, must also have waited for one (the non-blocking path). Compiled:
+# the kernel tests with every method compiled must have the same outcomes,
+# and compiled code must not go on after a collection
+# (EurasiaCompiledGCProbe); STRESS=1 adds the kernel tests compiled under GC
+# stress.
 # Run genesis.sh and kernel-tests.sh first. Also copies the build and the base
 # image into target/web/ beside the page, for a browser (web/index.html).
 set -eu
@@ -38,17 +42,52 @@ cmp "$OUT/kernel-native-outcomes.txt" "$OUT/kernel-wasm-outcomes.txt" \
   || { echo "the kernel tests have different outcomes on wasm"; exit 1; }
 tail -1 "$OUT/kernel-wasm.txt" | grep -qx done || { echo "the kernel tests did not finish on wasm"; exit 1; }
 cat "$OUT/kernel-wasm-stats.txt"
+
+echo "== the kernel tests on wasm, every method compiled"
+# The baseline compiler (newspeak/EURASIA_COMPILER_DESIGN_2026-11-19.md):
+# compiled at its first activation, every method the tests run must give the
+# interpreter's outcomes; with STRESS=1, also with a collection after every
+# 64 allocations.
+EURASIA_JIT=1 EURASIA_WEB_STATS=1 node web/run-node.mjs "$WASM" target/kerneltests/base.eus \
+  > "$OUT/kernel-jit.txt" 2> "$OUT/kernel-jit-stats.txt" || true
+grep '>>' "$OUT/kernel-jit.txt" | sort > "$OUT/kernel-jit-outcomes.txt"
+cmp "$OUT/kernel-native-outcomes.txt" "$OUT/kernel-jit-outcomes.txt" \
+  || { echo "the kernel tests have different outcomes compiled"; exit 1; }
+tail -1 "$OUT/kernel-jit.txt" | grep -qx done || { echo "the kernel tests did not finish compiled"; exit 1; }
+grep -q "eurasia: .* [1-9][0-9]* methods compiled" "$OUT/kernel-jit-stats.txt" \
+  || { echo "no method was compiled"; cat "$OUT/kernel-jit-stats.txt"; exit 1; }
+cat "$OUT/kernel-jit-stats.txt"
+if [ "${STRESS:-}" = 1 ]; then
+  EURASIA_JIT=1 EURASIA_GC_STRESS=64 node web/run-node.mjs "$WASM" target/kerneltests/base.eus \
+    > "$OUT/kernel-jit-stress.txt" 2>&1 || true
+  grep '>>' "$OUT/kernel-jit-stress.txt" | sort > "$OUT/kernel-jit-stress-outcomes.txt"
+  cmp "$OUT/kernel-native-outcomes.txt" "$OUT/kernel-jit-stress-outcomes.txt" \
+    || { echo "the kernel tests have different outcomes compiled, under GC stress"; exit 1; }
+  echo "the same outcomes compiled under GC stress"
+fi
 grep -q "eurasia: [1-9][0-9]* timer waits" "$OUT/kernel-wasm-stats.txt" \
   || { echo "the kernel tests never waited for a timer"; exit 1; }
+
+echo "== compiled code across collections (EurasiaCompiledGCProbe)"
+NEWSPEAK=${NEWSPEAK:-$EURASIA/../newspeak}
+PRIMORDIALSOUP=${PRIMORDIALSOUP:-$EURASIA/../primordialsoup}
+P=$PRIMORDIALSOUP/newspeak
+mkdir -p "$OUT/gcprobe"
+"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel \
+  "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv "$NEWSPEAK/EurasiaCompiledGCProbe.ns" \
+  "$P/Kernel.ns" "$P/platform/PrimordialSoup/Collections.ns" "$NEWSPEAK/platform/Eurasia/Actors.ns" "$NEWSPEAK/platform/Eurasia/Runtime.ns" \
+  "$OUT/gcprobe/genesis.eus" > "$OUT/gcprobe/package.log"
+(cd "$OUT/gcprobe" && "$EURASIA/target/release/eurasia" genesis.eus base.eus > /dev/null)
+EURASIA_JIT=1 node web/run-node.mjs "$WASM" "$OUT/gcprobe/base.eus" > "$OUT/gcprobe/output.txt"
+cat "$OUT/gcprobe/output.txt"
+grep -qx "compiled code across collections: 0 of 20 rounds failed" "$OUT/gcprobe/output.txt" \
+  || { echo "compiled code went on after a collection"; exit 1; }
 
 echo "== the JS FFI and callbacks: JSTesting and EurasiaHostTesting on wasm"
 # psoup's native VM cannot run these (a failing JS primitive halts it), so
 # they are not in the differential kernel tests: the kernel test runner is
 # packaged with JSTesting and EurasiaHostTesting (callbacks), and every JS test must succeed on wasm except
 # those docs/EXPECTED_DIFFERENCES.md lists under "JS tests on wasm".
-NEWSPEAK=${NEWSPEAK:-$EURASIA/../newspeak}
-PRIMORDIALSOUP=${PRIMORDIALSOUP:-$EURASIA/../primordialsoup}
-P=$PRIMORDIALSOUP/newspeak
 JSMODULES="$P/Kernel.ns $P/platform/PrimordialSoup/Collections.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $P/Minitest.ns $P/JSTesting.ns $NEWSPEAK/EurasiaHostTesting.ns"
 mkdir -p "$OUT/js"
 # shellcheck disable=SC2086

@@ -362,6 +362,9 @@ pub struct Heap {
 pub(crate) struct CodeEntry {
     pub(crate) bytes: Rc<[u8]>,
     pub(crate) jit: i64,
+    /// For a compiled method, the instruction indices at which its compiled
+    /// function can be entered, sorted: entry `k` is its block `k`.
+    pub(crate) entries: Option<Rc<[u32]>>,
 }
 
 /// The header words of an object.
@@ -752,6 +755,7 @@ impl Heap {
                 self.codes.push(CodeEntry {
                     bytes: m.bytecode,
                     jit: 0,
+                    entries: None,
                 });
                 self.words.extend_from_slice(&[
                     one, two, m.literals, m.mixin, m.selector, m.source, m.library, code,
@@ -1354,6 +1358,31 @@ impl Heap {
         }
     }
 
+    /// Records a Method's compiled function `function`, enterable at the
+    /// instruction indices `entries` (sorted).
+    pub fn set_method_compiled(&mut self, v: Value, function: u32, entries: Rc<[u32]>) {
+        if let Some(c) = self.contents_of(v, Code::Method) {
+            let i = small_of(c[M_CODE]) as usize;
+            self.codes[i].jit = -2 - i64::from(function);
+            self.codes[i].entries = Some(entries);
+        }
+    }
+
+    /// The compiled function of `method` and its block for instruction `ip`,
+    /// if the method is compiled from `code` (a frame keeps the code it began
+    /// with) and `ip` is one of its entries.
+    #[inline]
+    pub fn compiled_entry(&self, method: Value, code: &Rc<[u8]>, ip: usize) -> Option<(u32, u32)> {
+        let c = self.contents_of(method, Code::Method)?;
+        let e = &self.codes[small_of(c[M_CODE]) as usize];
+        if e.jit > -2 || !Rc::ptr_eq(&e.bytes, code) {
+            return None;
+        }
+        let entries = e.entries.as_ref()?;
+        let k = entries.binary_search(&(ip as u32)).ok()?;
+        Some(((-2 - e.jit) as u32, k as u32))
+    }
+
     /// Sets a Method's bytecode.
     pub fn set_method_bytecode(&mut self, v: Value, bytecode: Rc<[u8]>) -> bool {
         let Some(c) = self.contents_of(v, Code::Method) else {
@@ -1363,6 +1392,7 @@ impl Heap {
         self.codes[i] = CodeEntry {
             bytes: bytecode,
             jit: 0,
+            entries: None,
         };
         true
     }

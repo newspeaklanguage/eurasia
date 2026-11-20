@@ -30,6 +30,8 @@ try {
     keep: Number(process.env.EURASIA_RECORD_KEEP ?? 0),
     // With EURASIA_JIT=n, methods are compiled at their nth activation.
     jit: Number(process.env.EURASIA_JIT ?? 0),
+    // With EURASIA_GC_STRESS=n, a collection after every n allocations.
+    gcStress: Number(process.env.EURASIA_GC_STRESS ?? 0),
     onStart: (c) => { controls = c; },
   });
 
