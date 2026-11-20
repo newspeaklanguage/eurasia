@@ -335,6 +335,22 @@ pub struct Heap {
     pub(crate) codes: Vec<Rc<[u8]>>,
     pub(crate) count: usize,
     next_seq: u64,
+    /// The nursery (EURASIA_NURSERY_DESIGN_2026-11-19.md): objects from this
+    /// word offset on are young; below it, old. Likewise for the byte
+    /// space and the code table.
+    pub(crate) boundary: usize,
+    pub(crate) byte_boundary: usize,
+    pub(crate) code_boundary: usize,
+    /// The old objects (word offsets) that may refer to young ones, each
+    /// once (its header's [`REMEMBERED`] bit says it is here).
+    pub(crate) remembered: Vec<usize>,
+    /// The objects below `boundary`, and the old words after the last full
+    /// collection (to decide when the next one is due).
+    pub(crate) old_count: usize,
+    pub(crate) old_words_at_full: usize,
+    /// Something rewrote references wholesale (a commit): the next
+    /// collection must be full.
+    pub(crate) full_due: bool,
 }
 
 /// The header words of an object.
@@ -429,9 +445,14 @@ impl Code {
 }
 
 /// The Program space's code in the header.
-const PROGRAM_SPACE: u64 = (1 << 22) - 1;
+const PROGRAM_SPACE: u64 = (1 << 21) - 1;
 
-/// The third header word: format (5 bits), flags (5), space (22), size (32).
+/// The header bit of an object in the remembered set (the top bit of the
+/// space field, which is therefore 21 bits).
+pub(crate) const REMEMBERED: u64 = 1 << 31;
+
+/// The third header word: format (5 bits), flags (5), space (21), remembered
+/// (1), size (32).
 pub(crate) fn meta(code: Code, flags: u8, space: Space, size: usize) -> Value {
     let space = match space {
         Space::Program => PROGRAM_SPACE,
@@ -444,6 +465,12 @@ pub(crate) fn meta(code: Code, flags: u8, space: Space, size: usize) -> Value {
     Value::from_bits(
         code as u64 | (u64::from(flags & FLAGS) << 5) | (space << 10) | (u64::from(size) << 32),
     )
+}
+
+/// The code in a header's third word (the collector's).
+#[inline]
+pub(crate) fn meta_code_pub(m: Value) -> Code {
+    meta_code(m)
 }
 
 #[inline]
@@ -902,6 +929,7 @@ impl Heap {
         let o = self.start(v)?;
         let m = self.words[o + 2];
         if meta_code(m) == code {
+            self.remember(o);
             let n = if code == Code::Float { 1 } else { meta_size(m) };
             self.words.get_mut(o + HEADER..o + HEADER + n)
         } else {
@@ -1040,6 +1068,7 @@ impl Heap {
     /// Sets the class of object `v` (bootstrap and commit only).
     pub fn set_class(&mut self, v: Value, class: Value) {
         if let Some(o) = self.start(v) {
+            self.remember(o);
             self.words[o] = class;
         }
     }
@@ -1054,8 +1083,49 @@ impl Heap {
     pub fn set_flags(&mut self, v: Value, flags: u8) {
         if let Some(o) = self.start(v) {
             let m = self.words[o + 2];
-            self.words[o + 2] = meta(meta_code(m), flags, meta_space(m), meta_size(m));
+            let kept = m.to_bits() & REMEMBERED;
+            self.words[o + 2] = Value::from_bits(
+                meta(meta_code(m), flags, meta_space(m), meta_size(m)).to_bits() | kept,
+            );
         }
+    }
+
+    /// The write barrier: an old object about to be written may come to
+    /// refer to a young one, so it goes into the remembered set (once).
+    #[inline]
+    pub(crate) fn remember(&mut self, o: usize) {
+        if o < self.boundary {
+            let m = self.words[o + 2].to_bits();
+            if m & REMEMBERED == 0 {
+                self.words[o + 2] = Value::from_bits(m | REMEMBERED);
+                self.remembered.push(o);
+            }
+        }
+    }
+
+    /// Empties the remembered set (at a collection).
+    pub(crate) fn forget_remembered(&mut self) {
+        for o in core::mem::take(&mut self.remembered) {
+            let m = self.words[o + 2].to_bits();
+            self.words[o + 2] = Value::from_bits(m & !REMEMBERED);
+        }
+    }
+
+    /// Makes everything old (a loaded image, a finished build): the next
+    /// minor collection looks only at what is allocated after this.
+    pub fn seal(&mut self) {
+        self.forget_remembered();
+        self.boundary = self.words.len();
+        self.byte_boundary = self.bytes.len();
+        self.code_boundary = self.codes.len();
+        self.old_count = self.count;
+        self.old_words_at_full = self.words.len();
+    }
+
+    /// A commit rewrote references across the heap: the next collection is
+    /// full.
+    pub fn require_full_collection(&mut self) {
+        self.full_due = true;
     }
 
     /// Adds `flags` to those of object `v`.
@@ -1092,6 +1162,7 @@ impl Heap {
             self.code_at(o),
             Code::Regular | Code::Array | Code::WeakArray
         ) {
+            self.remember(o);
             Some(self.contents_mut(o))
         } else {
             None
@@ -1304,6 +1375,7 @@ impl Heap {
         if !matches!(self.code_at(o), Code::Class | Code::Metaclass) || i >= 6 {
             return false;
         }
+        self.remember(o);
         self.contents_mut(o)[i] = x;
         true
     }
@@ -1509,6 +1581,7 @@ impl Heap {
         let m = self.words[o + 2];
         if meta_size(m) == slots.len() {
             self.words[o] = class;
+            self.remember(o);
             self.contents_mut(o).copy_from_slice(&slots);
             return v;
         }

@@ -317,6 +317,17 @@ pub struct Vm {
     small_integer_fast: [u8; SMALL_INTEGER_FAST_PATHS],
 }
 
+/// Which collection [`Vm::collect`] runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Collection {
+    /// The nursery only.
+    Minor,
+    /// Everything, clearing weak references to garbage.
+    Full,
+    /// Everything not reachable at all, weakly or strongly (a checkpoint's).
+    KeepingWeak,
+}
+
 /// A VM actor: its message loop (in its platform), its mailbox of packets
 /// (Arrays in its heap), and its next timer. Its heap is the objects of
 /// space `Actor(n)`. Turns run to completion, so an actor that is not
@@ -541,9 +552,30 @@ impl Vm {
     /// comes after as many allocations as there are live objects (at least
     /// [`MIN_GC_BUDGET`]), so the heap stays within about twice its live size.
     pub fn collect_garbage(&mut self) -> gc::Statistics {
+        self.collect(Collection::Full)
+    }
+
+    /// A collection the allocation budget schedules: minor, unless a full
+    /// one is due (EURASIA_NURSERY_DESIGN_2026-11-19.md section 2). Under
+    /// stress, every fourth is full, so that both kinds run.
+    fn scheduled_collection(&mut self) -> gc::Statistics {
+        let full = self.heap.full_collection_due()
+            || (self.gc_stress.is_some() && self.collections % 4 == 3);
+        self.collect(if full {
+            Collection::Full
+        } else {
+            Collection::Minor
+        })
+    }
+
+    fn collect(&mut self, kind: Collection) -> gc::Statistics {
         let roots = self.roots();
         let nil = self.roles.get(Role::Nil);
-        let (fwd, statistics) = self.heap.collect(&roots, nil);
+        let (fwd, statistics) = match kind {
+            Collection::Full => self.heap.collect(&roots, nil),
+            Collection::Minor => self.heap.collect_minor(&roots, nil),
+            Collection::KeepingWeak => self.heap.collect_keeping_weak(&roots, nil),
+        };
         for e in &mut self.expats {
             e.0 = fwd.forward(e.0);
         }
@@ -786,6 +818,10 @@ impl Vm {
     /// to save, and the restore handler is then told, in a turn of its own:
     /// the image is taken first, so a restore of it is not told.
     fn take_checkpoint(&mut self, host: &mut dyn Host) {
+        // The running heap becomes what a restore of this checkpoint has: the
+        // checkpoint's collection, everything old after it. Whether or not
+        // anyone records, so that recording does not change the run.
+        self.collect(Collection::KeepingWeak);
         self.checkpoint_pending = false;
         self.last_checkpoint = self.heap.allocation_counter();
         self.safepoint_at = 0;
@@ -1051,7 +1087,7 @@ impl Vm {
             // host operation is under way.
             if self.heap.allocation_counter() >= self.safepoint_at {
                 if self.gc_due() {
-                    self.collect_garbage();
+                    self.scheduled_collection();
                 }
                 if self.checkpoint_due() {
                     self.take_checkpoint(host);
@@ -2162,6 +2198,9 @@ impl Vm {
                             })
                     })
                     .collect();
+                // In allocation order, which the arena's order need not be.
+                let mut found = found;
+                found.sort_by_key(|&v| self.heap.seq(v));
                 let array_class = self.roles.get(Role::ArrayClass);
                 let answer = self.heap.allocate(
                     array_class,
@@ -2182,6 +2221,9 @@ impl Vm {
                     .objects()
                     .filter(|&v| self.heap.class(v) == Some(class))
                     .collect();
+                // In allocation order, which the arena's order need not be.
+                let mut instances = instances;
+                instances.sort_by_key(|&v| self.heap.seq(v));
                 let array_class = self.roles.get(Role::ArrayClass);
                 let answer = self.heap.allocate(
                     array_class,
@@ -3175,6 +3217,9 @@ impl Vm {
                 None => v,
             };
             self.heap.forward_identities(&forward);
+            // References were rewritten across the heap, old objects
+            // included, without the barrier.
+            self.heap.require_full_collection();
             for v in &mut self.stack {
                 *v = forward(*v);
             }
@@ -3363,7 +3408,7 @@ impl Vm {
         }
         while self.frames.len() > base {
             if self.gc_due() {
-                self.collect_garbage();
+                self.scheduled_collection();
             }
             if let Step::Done(_) = self.step(host)? {
                 return Err(VmError::Malformed("a callback exited"));

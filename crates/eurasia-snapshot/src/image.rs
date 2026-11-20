@@ -719,6 +719,9 @@ pub fn read_checkpoint(bytes: &[u8]) -> Result<(Heap, Roles, Option<MachineState
             _ => {}
         }
     }
+    // A loaded image is old: the first minor collection looks only at what
+    // runs after it.
+    heap.seal();
     Ok((heap, roles, machine))
 }
 

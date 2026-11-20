@@ -166,6 +166,26 @@ pub extern "C" fn eurasia_exit_code() -> i32 {
     STATE.with_borrow(|s| s.exit_code)
 }
 
+/// Heap statistics, for measuring (not for programs): `which` 0 is the
+/// number of objects, 1 the arena's words, 2 the collections so far; -1
+/// when there is no VM or it is running.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_heap_stat(which: u32) -> f64 {
+    STATE
+        .try_with(|s| {
+            let Ok(s) = s.try_borrow() else {
+                return -1.0;
+            };
+            match (&s.vm, which) {
+                (Some(vm), 0) => vm.heap.len() as f64,
+                (Some(vm), 1) => vm.heap.words() as f64,
+                (Some(vm), 2) => vm.collections() as f64,
+                _ => -1.0,
+            }
+        })
+        .unwrap_or(-1.0)
+}
+
 /// The monotonic time to resume at, after [`WAITING`], in nanoseconds (an
 /// f64, exact below 2^53).
 #[unsafe(no_mangle)]
