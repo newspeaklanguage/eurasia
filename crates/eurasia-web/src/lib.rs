@@ -336,10 +336,10 @@ pub extern "C" fn eurasia_rt_closure(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
 
 /// For compiled code: a send its inline cache holds the target of ([`Vm::compiled_call`]), the stack at height `sp`.
 #[unsafe(no_mangle)]
-pub extern "C" fn eurasia_rt_call(vm: *mut Vm, target: i32, ip: i32, next: i32, sp: i32) -> i32 {
+pub extern "C" fn eurasia_rt_call(vm: *mut Vm, target: i32, next: i32, sp: i32) -> i32 {
     let vm = vm_at(vm);
     adopt_stack(vm, sp);
-    vm.compiled_call(target as usize, ip as usize, next as usize)
+    vm.compiled_call(target as u32 as usize, next as usize)
 }
 
 /// The monotonic time to resume at, after [`WAITING`], in nanoseconds (an

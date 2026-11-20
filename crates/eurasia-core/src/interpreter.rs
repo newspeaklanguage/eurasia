@@ -3946,6 +3946,7 @@ impl Vm {
         r.true_ = t.to_bits();
         r.false_ = fa.to_bits();
         r.depth = self.frames.len() as u32;
+        r.small_integer = self.roles.get(Role::SmallIntegerClass).to_bits();
     }
 
     /// Updates the registers after a call that left the top frame as it
@@ -4096,7 +4097,18 @@ impl Vm {
         }
         let t = e.target;
         if t.header.kind == MethodKind::Native {
-            return self.direct_closure(t.header.native, n, next_ip);
+            // A closure's `value`: the closure is the message receiver.
+            if e.rule != Rule::Ordinary {
+                return None;
+            }
+            let native = t.header.native;
+            let status = self.direct_closure(native, n, next_ip)?;
+            let class = self.class_of(key);
+            let r = &mut *self.jit_regs;
+            r.ic_kind = crate::compiler::IC_METHOD;
+            r.ic_slot = crate::compiler::CLOSURE_TARGET | native;
+            r.ic_class = class.to_bits();
+            return Some(status);
         }
         if t.header.kind != MethodKind::Ordinary {
             return None;
@@ -4315,13 +4327,25 @@ impl Vm {
     }
 
     /// For compiled code: a send whose inline cache holds `target`
-    /// ([`Vm::direct_call`]) from the top frame's instruction at `ip`, which
-    /// continues at `next`. Where the callee cannot be entered now, the
-    /// interpreter runs the send.
-    pub fn compiled_call(&mut self, target: usize, ip: usize, next: usize) -> i32 {
+    /// ([`Vm::direct_call`]; with [`CLOSURE_TARGET`](crate::compiler::CLOSURE_TARGET),
+    /// a closure's `value` native) from the top frame's instruction, which
+    /// continues at `next`. Where the callee cannot be entered now,
+    /// [`MISS`](crate::compiler::MISS): the site makes the general send.
+    pub fn compiled_call(&mut self, target: usize, next: usize) -> i32 {
+        let closure = crate::compiler::CLOSURE_TARGET as usize;
+        if target & closure != 0 {
+            // A closure's `value` native: its frame pushed, if it can be.
+            let native = (target & !closure) as u32;
+            let n = Native::from_id(native).map_or(0, |v| v.arity());
+            if self.may_enter_callee()
+                && let Some(status) = self.direct_closure(native, n, next)
+            {
+                return status;
+            }
+            return crate::compiler::MISS;
+        }
         if target >= self.jit_targets.len() || !self.may_enter_callee() {
-            self.frames.last_mut().expect("a frame").ip = ip;
-            return crate::compiler::INTERPRET;
+            return crate::compiler::MISS;
         }
         self.frames.last_mut().expect("a frame").ip = next;
         let t = &self.jit_targets[target];
@@ -4362,6 +4386,15 @@ impl Vm {
                 }
                 if own {
                     self.jit_cache(object, slot);
+                } else if e.rule == Rule::ImplicitReceiver
+                    && let TargetReceiver::Fixed(_) = e.target.receiver
+                {
+                    // An enclosing object's slot: keyed by the frame
+                    // receiver's class, as the lookup cache is.
+                    self.jit_cache(receiver, slot);
+                    let r = &mut *self.jit_regs;
+                    r.ic_kind = crate::compiler::IC_OUTER_GETTER;
+                    r.ic_object = object.to_bits();
                 }
                 Some(Ok(None))
             }
@@ -4381,17 +4414,37 @@ impl Vm {
                 }
                 Some(Ok(None))
             }
+            (MethodKind::ReturnSelf, _, _) if own => {
+                let t = e.target;
+                if let TargetReceiver::Frame = t.receiver {
+                    self.insert_receiver(receiver, n);
+                }
+                let result = self.activate_with(t.method, t.header, n, host, t.slot);
+                let class = self.class_of(object);
+                let r = &mut *self.jit_regs;
+                r.ic_kind = crate::compiler::IC_RETURN_SELF;
+                r.ic_class = class.to_bits();
+                Some(result)
+            }
             (MethodKind::Native, _, _) if own => {
-                use crate::compiler::{IC_AT, IC_AT_PUT, IC_BYTES_AT, IC_SIZE};
+                use crate::compiler::{
+                    IC_AT, IC_AT_PUT, IC_BIT_AND, IC_BIT_OR, IC_BIT_XOR, IC_BYTES_AT, IC_IDENTICAL,
+                    IC_SIZE,
+                };
                 use crate::object::Format;
                 let format = self.heap.format(object);
                 let bytes = matches!(format, Some(Format::Bytes | Format::String));
                 let array = format == Some(Format::Array);
+                let small = object.is_small_integer();
                 let kind = match (Native::from_id(e.target.header.native), n) {
                     (Some(Native::IndexedSize), 0) if array || bytes => IC_SIZE,
                     (Some(Native::IndexedAt), 1) if array => IC_AT,
                     (Some(Native::IndexedAt), 1) if bytes => IC_BYTES_AT,
                     (Some(Native::IndexedAtPut), 2) if array => IC_AT_PUT,
+                    (Some(Native::ObjectIdentical), 1) => IC_IDENTICAL,
+                    (Some(Native::IntegerBitAnd), 1) if small => IC_BIT_AND,
+                    (Some(Native::IntegerBitOr), 1) if small => IC_BIT_OR,
+                    (Some(Native::IntegerBitXor), 1) if small => IC_BIT_XOR,
                     _ => 0,
                 };
                 let t = e.target;

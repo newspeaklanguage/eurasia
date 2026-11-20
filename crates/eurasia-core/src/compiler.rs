@@ -64,6 +64,9 @@ pub const RETURNED: i32 = -1;
 /// depth `Regs::depth`, which goes on as after a completed send if it is
 /// the caller's; others pass it on.
 pub const UNWOUND: i32 = -2;
+/// From `call`: the cached callee cannot be entered now; the site makes the
+/// general send.
+pub const MISS: i32 = -3;
 /// Backward jumps between two calls of `tick`.
 pub const TICK: i32 = 64;
 /// The operand-stack room the VM keeps for compiled code (in Values); a
@@ -120,6 +123,12 @@ pub struct Regs {
     /// The byte store's address: a byte object's bytes start at its first
     /// slot (a SmallInteger offset), its size in its meta word.
     pub bytes: u32,
+    /// The SmallInteger class, which inline caches hold for SmallInteger
+    /// receivers.
+    pub small_integer: u64,
+    /// See `ic_kind`: for [`IC_OUTER_GETTER`], the object whose slot the
+    /// send reads.
+    pub ic_object: u64,
 }
 
 // The registers' offsets.
@@ -144,6 +153,8 @@ const R_TRUE: u32 = 80;
 const R_FALSE: u32 = 88;
 const R_IC_CLASS: u32 = 96;
 const R_BYTES: u32 = 104;
+const R_SMALL_INTEGER: u32 = 112;
+const R_IC_OBJECT: u32 = 120;
 
 // The object header (newspeak/EURASIA_ARENA_DESIGN): class, sequence number,
 // meta (format 5 bits, flags 5, space 21, remembered 1, size 32); then the
@@ -153,10 +164,13 @@ const SLOTS: u32 = 24;
 const META_FLAGS_FROZEN_OR_VALUE: i64 = (1 | 2) << 5;
 const META_REMEMBERED: i64 = 1 << 31;
 
-/// The globals of an inline-cache site: the receiver's class (i64), the
+/// The globals of an inline-cache entry: the receiver's class (i64), the
 /// epoch, the slot (an accessor's) or target (a method's, the VM's index),
-/// the kind ([`IC_ACCESSOR`] or [`IC_METHOD`]; 0 empty).
-const SITE_GLOBALS: u32 = 4;
+/// the kind ([`IC_ACCESSOR`] or [`IC_METHOD`] and the others; 0 empty), and
+/// an object (i64; [`IC_OUTER_GETTER`]'s).
+const ENTRY_GLOBALS: u32 = 5;
+/// The globals of an inline-cache site: two entries, for two classes.
+const SITE_GLOBALS: u32 = 2 * ENTRY_GLOBALS;
 /// An inline cache of an accessor, read or written in compiled code.
 pub const IC_ACCESSOR: u32 = 1;
 /// An inline cache of a compiled method, entered through `call`.
@@ -172,6 +186,24 @@ pub const IC_AT: u32 = 4;
 pub const IC_AT_PUT: u32 = 5;
 /// See [`IC_SIZE`].
 pub const IC_BYTES_AT: u32 = 6;
+/// An inline cache of `==` (`Object>>==`), compared in compiled code.
+pub const IC_IDENTICAL: u32 = 7;
+/// Inline caches of SmallInteger's `bitAnd:`, `bitOr:` and `bitXor:` (with
+/// a SmallInteger argument), computed in compiled code.
+pub const IC_BIT_AND: u32 = 8;
+/// See [`IC_BIT_AND`].
+pub const IC_BIT_OR: u32 = 9;
+/// See [`IC_BIT_AND`].
+pub const IC_BIT_XOR: u32 = 10;
+/// An inline cache of an implicit-receiver send that reads a slot of an
+/// enclosing object (the site's object), read in compiled code.
+pub const IC_OUTER_GETTER: u32 = 11;
+/// An inline cache of a method that answers its receiver, answered in
+/// compiled code.
+pub const IC_RETURN_SELF: u32 = 12;
+/// The bit of an [`IC_METHOD`] target that makes it a closure's `value`
+/// native (of the id in the low bits) rather than a method.
+pub const CLOSURE_TARGET: u32 = 1 << 31;
 /// The format code of an Array.
 const CODE_ARRAY: i64 = 3;
 
@@ -185,9 +217,6 @@ pub const RULE_SUPER: i32 = 2;
 pub const RULE_IMPLICIT: i32 = 3;
 /// A common-selector send.
 pub const RULE_COMMON: i32 = 4;
-/// The common selectors with SmallInteger fast paths (0 to 13): the
-/// arithmetic and comparisons, which the runtime tries before a send.
-pub const COMMON_FAST_PATHS: usize = 14;
 
 // Imported functions, in import order.
 const F_SEND: u32 = 0;
@@ -203,7 +232,7 @@ const IMPORTED: u32 = 7;
 const T_RUN: u32 = 0; // (i32, i32, i32) -> i32: run, interpret, step, tick
 const T_SEND: u32 = 1; // (i32 x 6) -> i32
 const T_RET: u32 = 2; // (i32, i64, i32) -> i32
-const T_CALL: u32 = 3; // (i32 x 5) -> i32
+const T_CALL: u32 = 3; // (i32 x 4) -> i32
 
 // Locals of `run`: the parameters, then i32s, then i64s.
 const L_VM: u32 = 0;
@@ -238,7 +267,12 @@ const I64_LOCALS: u8 = 8;
 /// which compiled code leaves its frame), and their count. More i32s.
 const L_LITERALS: u32 = 22;
 const L_LITERAL_COUNT: u32 = 23;
-const MORE_I32_LOCALS: u8 = 2;
+/// The inline-cache entry a send hit: its kind (0 on a miss) and slot, more
+/// i32s; its object, an i64 of its own.
+const L_KIND: u32 = 24;
+const L_SLOT: u32 = 25;
+const MORE_I32_LOCALS: u8 = 4;
+const L_OBJECT: u32 = 26;
 
 /// One decoded instruction.
 #[derive(Clone, Copy, Debug)]
@@ -694,7 +728,8 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                     .op(0x50)
                     .op(0x45); // ((a|b)&1) != 0
                 f.op(0x04).op(0x40);
-                f.common_and_go_on(k, next, code.len(), 1, &jump);
+                // Not SmallIntegers: a send, through an inline cache.
+                f.common_and_go_on(k, next, true, code.len(), 1, &jump);
                 f.op(0x0b);
                 // The result, into r64, then into stack[sp-2]; sp -= 1.
                 match k {
@@ -724,7 +759,7 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                         }
                         f.i64c(0).op(0x53); // i64.lt_s
                         f.op(0x04).op(0x40);
-                        f.common_and_go_on(k, next, code.len(), 1, &jump);
+                        f.common_and_go_on(k, next, false, code.len(), 1, &jump);
                         f.op(0x0b);
                     }
                     7 => {
@@ -761,92 +796,7 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                 literal,
                 args,
             } => {
-                // A common send is an ordinary send of its selector; those
-                // of SmallInteger's fast paths are not cached.
-                let cacheable = match rule {
-                    RULE_ORDINARY | RULE_SELF | RULE_SUPER | RULE_IMPLICIT => true,
-                    RULE_COMMON => literal as usize >= COMMON_FAST_PATHS,
-                    _ => false,
-                };
-                let site = if cacheable { Some(f.new_site()) } else { None };
-                if let Some(g) = site {
-                    let ordinary = matches!(rule, RULE_ORDINARY | RULE_COMMON);
-                    f.op(0x02).op(0x40); // block: the send's end
-                    f.op(0x02).op(0x40); // block: after the call
-                    f.site_hit(g, ordinary, args).set(L_R);
-                    if args <= 1 {
-                        // An accessor, read or written here.
-                        f.get(L_R)
-                            .gget(g + 3)
-                            .i32c(IC_ACCESSOR as i32)
-                            .op(0x46)
-                            .op(0x71);
-                        f.op(0x04).op(0x7f);
-                        f.accessor_ok(g, args == 1);
-                        f.op(0x05).i32c(0).op(0x0b);
-                        f.op(0x04).op(0x40);
-                        f.accessor(g, ordinary, args == 1);
-                        f.op(0x0c).uleb(2); // br: the send's end
-                        f.op(0x0b);
-                    }
-                    if args <= 2 {
-                        // An indexed native, run here.
-                        let kinds: &[u32] = match args {
-                            0 => &[IC_SIZE],
-                            1 => &[IC_AT, IC_BYTES_AT],
-                            _ => &[IC_AT_PUT],
-                        };
-                        for &kind in kinds {
-                            f.get(L_R).gget(g + 3).i32c(kind as i32).op(0x46).op(0x71);
-                            f.op(0x04).op(0x7f);
-                            f.indexed_ok(kind);
-                            f.op(0x05).i32c(0).op(0x0b);
-                            f.op(0x04).op(0x40);
-                            f.indexed(kind, ordinary);
-                            f.op(0x0c).uleb(2); // br: the send's end
-                            f.op(0x0b);
-                        }
-                    }
-                    // A compiled method: entered through `call`.
-                    f.get(L_R)
-                        .gget(g + 3)
-                        .i32c(IC_METHOD as i32)
-                        .op(0x46)
-                        .op(0x71);
-                    f.op(0x04).op(0x40);
-                    f.get(L_VM)
-                        .gget(g + 2)
-                        .i32c(ip as i32)
-                        .i32c(next as i32)
-                        .get(L_SP)
-                        .call(F_CALL)
-                        .set(L_R);
-                    f.op(0x0c).uleb(1); // br: after the call
-                    f.op(0x0b);
-                }
-                f.get(L_VM)
-                    .i32c(rule)
-                    .i32c(literal as i32)
-                    .i32c(args as i32)
-                    .i32c(next as i32)
-                    .get(L_SP)
-                    .call(F_SEND)
-                    .set(L_R);
-                if let Some(g) = site {
-                    // Fill the cache from what the send found, before a
-                    // callee runs (its sends change the registers).
-                    f.reg32(R_IC_KIND).op(0x04).op(0x40);
-                    f.reg64(R_IC_CLASS).gset(g);
-                    f.reg32(R_IC_SLOT).gset(g + 2);
-                    f.reg32(R_EPOCH).gset(g + 1);
-                    f.reg32(R_IC_KIND).gset(g + 3);
-                    f.op(0x0b);
-                    f.op(0x0b); // end block: after the call
-                }
-                f.after_call();
-                if site.is_some() {
-                    f.op(0x0b); // end block: the send's end
-                }
+                f.send(rule, literal, args, next);
             }
             Ins::Indirect {
                 op: o,
@@ -1129,10 +1079,12 @@ impl Func {
         self.sites += 1;
         SITE_GLOBALS * (self.sites - 1)
     }
-    /// Whether site `g` holds the send's key (an i32): the message receiver
-    /// below `args` arguments for an ordinary send, else the frame's, an
-    /// object of the cached class, in the cache's epoch. Leaves the key in
-    /// `a`, its index and address in `index` and `addr`.
+    /// Looks the send's key up in site `g`: the message receiver below
+    /// `args` arguments for an ordinary send, else the frame's. An entry
+    /// hits for an object of its class (a SmallInteger, if the class is
+    /// SmallInteger) in its epoch; its kind, slot and object are left in
+    /// `kind` (0 if neither hits), `slot` and `object`. Leaves the key in
+    /// `a`, and for a reference its index and address in `index` and `addr`.
     fn site_hit(&mut self, g: u32, ordinary: bool, args: u32) -> &mut Func {
         if ordinary {
             self.slot_addr(|f| {
@@ -1143,25 +1095,47 @@ impl Func {
             self.get(L_SELF).set(L_A);
         }
         self.object_at_a();
-        // a reference, the class, the epoch
+        // the key's class, in `meta`
         self.get(L_A).i64c(1).op(0x83).op(0x50).op(0x45); // (a & 1) != 0
-        self.op(0x04).op(0x7f); // if (result i32)
-        self.get(L_ADDR).load().gget(g).op(0x51); // class == cached
-        self.reg32(R_EPOCH).gget(g + 1).op(0x46).op(0x71); // & epoch == cached
-        self.op(0x05).i32c(0).op(0x0b)
+        self.op(0x04).op(0x7e); // if (result i64)
+        self.get(L_ADDR).load();
+        self.op(0x05);
+        self.reg64(R_SMALL_INTEGER);
+        self.op(0x0b).set(L_META);
+        self.i32c(0).set(L_KIND);
+        for e in [g, g + ENTRY_GLOBALS] {
+            self.get(L_META).gget(e).op(0x51); // class == cached
+            self.reg32(R_EPOCH).gget(e + 1).op(0x46).op(0x71); // & epoch == cached
+            self.op(0x04).op(0x40);
+            self.gget(e + 3).set(L_KIND);
+            self.gget(e + 2).set(L_SLOT);
+            self.gget(e + 4).set(L_OBJECT);
+            if e == g {
+                self.op(0x05);
+            }
+        }
+        self.op(0x0b).op(0x0b)
     }
-    /// Whether the object at `addr`, of site `g`'s class, holds the
+    /// Fills the inline-cache entry at global `e` from the registers.
+    fn fill_entry(&mut self, e: u32) -> &mut Func {
+        self.reg64(R_IC_CLASS).gset(e);
+        self.reg32(R_IC_SLOT).gset(e + 2);
+        self.reg32(R_EPOCH).gset(e + 1);
+        self.reg32(R_IC_KIND).gset(e + 3);
+        self.reg64(R_IC_OBJECT).gset(e + 4)
+    }
+    /// Whether the object at `addr`, of the hit entry's class, holds the
     /// accessor's slot: of the regular format with the slot; for a setter,
     /// neither frozen nor a value, and young or remembered (else the write
     /// barrier must remember it).
-    fn accessor_ok(&mut self, g: u32, setter: bool) -> &mut Func {
+    fn accessor_ok(&mut self, setter: bool) -> &mut Func {
         // the meta word: regular (code 0) and the slot within the size
         self.get(L_ADDR).i32c(META as i32).add().load().set(L_META);
         self.get(L_META).i64c(31).op(0x83).op(0x50); // code == 0
         self.get(L_META)
             .i64c(32)
             .op(0x88)
-            .gget(g + 2)
+            .get(L_SLOT)
             .op(0xad)
             .op(0x56)
             .op(0x71); // size > slot
@@ -1331,14 +1305,52 @@ impl Func {
         }
         self
     }
-    /// Site `g`'s accessor, read or written (after [`Func::accessor_ok`]).
-    fn accessor(&mut self, g: u32, ordinary: bool, setter: bool) -> &mut Func {
+    /// The binary operation of inline-cache kind `kind` ([`IC_IDENTICAL`] or
+    /// a bit operation) on the key in `a` and the argument on top, when it
+    /// applies (a bit operation's argument a SmallInteger), its answer
+    /// replacing the receiver and the argument (of an ordinary send) or the
+    /// argument (else); `br`s out of the enclosing `if` when it does not.
+    fn binary(&mut self, kind: u32, ordinary: bool) -> &mut Func {
+        self.slot_addr(|f| {
+            f.get(L_SP).i32c(1).sub();
+        });
+        self.load().set(L_B);
+        if kind == IC_IDENTICAL {
+            self.get(L_A).get(L_B).op(0x51); // i64.eq
+            self.op(0x04)
+                .op(0x7e)
+                .get(L_TRUE)
+                .op(0x05)
+                .get(L_FALSE)
+                .op(0x0b);
+        } else {
+            // A SmallInteger argument; the tag (0) survives the operation.
+            self.get(L_B).i64c(1).op(0x83).op(0x50).op(0x45); // not a SmallInteger
+            self.op(0x04).op(0x40).op(0x0c).uleb(1).op(0x0b); // br: out of the if
+            self.get(L_A).get(L_B);
+            self.op(match kind {
+                IC_BIT_AND => 0x83,
+                IC_BIT_OR => 0x84,
+                _ => 0x85,
+            });
+        }
+        self.set(L_R64);
+        if ordinary {
+            self.dec_sp();
+        }
+        self.slot_addr(|f| {
+            f.get(L_SP).i32c(1).sub();
+        });
+        self.get(L_R64).store()
+    }
+    /// The hit entry's accessor, read or written (after [`Func::accessor_ok`]).
+    fn accessor(&mut self, ordinary: bool, setter: bool) -> &mut Func {
         // the slot's address: addr + SLOTS + slot * 8
         let slot_addr = |f: &mut Func| {
             f.get(L_ADDR)
                 .i32c(SLOTS as i32)
                 .add()
-                .gget(g + 2)
+                .get(L_SLOT)
                 .i32c(3)
                 .op(0x74)
                 .add();
@@ -1396,25 +1408,159 @@ impl Func {
             .add()
             .set(L_ADDR)
     }
-    /// The slow path of inline common selector `k`: the send, then on to
-    /// `next` (from inside `extra` `if`s).
-    fn common_and_go_on(
-        &mut self,
-        k: u8,
-        next: usize,
-        len: usize,
-        extra: u32,
-        jump: &dyn Fn(&mut Func, usize, u32),
-    ) -> &mut Func {
+    /// A send of literal `literal` by `rule` with `args` arguments, the
+    /// instruction continuing at `next`: through its inline cache
+    /// where it has one, else the runtime's `send`; then `after_call`.
+    fn send(&mut self, rule: i32, literal: u32, args: u32, next: usize) -> &mut Func {
+        // A common send is an ordinary send of its selector (the
+        // runtime tries SmallInteger's fast paths first).
+        let cacheable = matches!(
+            rule,
+            RULE_ORDINARY | RULE_SELF | RULE_SUPER | RULE_IMPLICIT | RULE_COMMON
+        );
+        let site = if cacheable {
+            Some(self.new_site())
+        } else {
+            None
+        };
+        if let Some(g) = site {
+            let ordinary = matches!(rule, RULE_ORDINARY | RULE_COMMON);
+            self.op(0x02).op(0x40); // block: the send's end
+            self.op(0x02).op(0x40); // block: after the call
+            self.site_hit(g, ordinary, args);
+            if args <= 1 {
+                // An accessor, read or written here.
+                self.get(L_KIND).i32c(IC_ACCESSOR as i32).op(0x46);
+                self.op(0x04).op(0x7f);
+                self.accessor_ok(args == 1);
+                self.op(0x05).i32c(0).op(0x0b);
+                self.op(0x04).op(0x40);
+                self.accessor(ordinary, args == 1);
+                self.op(0x0c).uleb(2); // br: the send's end
+                self.op(0x0b);
+            }
+            if args == 0 && rule == RULE_IMPLICIT {
+                // An enclosing object's slot, read here.
+                self.get(L_KIND).i32c(IC_OUTER_GETTER as i32).op(0x46);
+                self.op(0x04).op(0x7f);
+                self.get(L_OBJECT).set(L_A);
+                self.object_at_a();
+                self.accessor_ok(false);
+                self.op(0x05).i32c(0).op(0x0b);
+                self.op(0x04).op(0x40);
+                self.accessor(false, false);
+                self.op(0x0c).uleb(2); // br: the send's end
+                self.op(0x0b);
+            }
+            if args == 1 {
+                // `==` and SmallInteger's bit operations, here.
+                for kind in [IC_IDENTICAL, IC_BIT_AND, IC_BIT_OR, IC_BIT_XOR] {
+                    self.get(L_KIND).i32c(kind as i32).op(0x46);
+                    self.op(0x04).op(0x40);
+                    self.binary(kind, ordinary);
+                    self.op(0x0c).uleb(2); // br: the send's end
+                    self.op(0x0b);
+                }
+            }
+            // A method answering its receiver, answered here.
+            self.get(L_KIND).i32c(IC_RETURN_SELF as i32).op(0x46);
+            self.op(0x04).op(0x40);
+            if args > 0 {
+                self.get(L_SP).i32c(args as i32).sub().set(L_SP);
+            }
+            if !ordinary {
+                self.push_addr().get(L_A).store();
+                self.inc_sp();
+            }
+            self.op(0x0c).uleb(2); // br: the send's end
+            self.op(0x0b);
+            if args <= 2 {
+                // An indexed native, run here.
+                let kinds: &[u32] = match args {
+                    0 => &[IC_SIZE],
+                    1 => &[IC_AT, IC_BYTES_AT],
+                    _ => &[IC_AT_PUT],
+                };
+                for &kind in kinds {
+                    self.get(L_KIND).i32c(kind as i32).op(0x46);
+                    self.op(0x04).op(0x7f);
+                    self.indexed_ok(kind);
+                    self.op(0x05).i32c(0).op(0x0b);
+                    self.op(0x04).op(0x40);
+                    self.indexed(kind, ordinary);
+                    self.op(0x0c).uleb(2); // br: the send's end
+                    self.op(0x0b);
+                }
+            }
+            // A compiled method: entered through `call`.
+            self.get(L_KIND).i32c(IC_METHOD as i32).op(0x46);
+            self.op(0x04).op(0x40);
+            self.get(L_VM)
+                .get(L_SLOT)
+                .i32c(next as i32)
+                .get(L_SP)
+                .call(F_CALL)
+                .set(L_R);
+            // br_if: after the call, unless a miss (then the general send)
+            self.get(L_R).i32c(MISS).op(0x47).op(0x0d).uleb(1);
+            self.op(0x0b);
+        }
         self.get(L_VM)
-            .i32c(RULE_COMMON)
-            .i32c(i32::from(k))
-            .i32c(0)
+            .i32c(rule)
+            .i32c(literal as i32)
+            .i32c(args as i32)
             .i32c(next as i32)
             .get(L_SP)
             .call(F_SEND)
             .set(L_R);
+        if let Some(g) = site {
+            // Fill the cache from what the send found, before a
+            // callee runs (its sends change the registers).
+            // The first entry if it is empty, stale or of this
+            // class, else the second.
+            self.reg32(R_IC_KIND).op(0x04).op(0x40);
+            self.gget(g + 3).op(0x45); // kind == 0
+            self.gget(g + 1).reg32(R_EPOCH).op(0x47).op(0x72); // | epoch != cached
+            self.gget(g).reg64(R_IC_CLASS).op(0x51).op(0x72); // | class == cached
+            self.op(0x04).op(0x40);
+            self.fill_entry(g);
+            self.op(0x05);
+            self.fill_entry(g + ENTRY_GLOBALS);
+            self.op(0x0b);
+            self.op(0x0b);
+            self.op(0x0b); // end block: after the call
+        }
         self.after_call();
+        if site.is_some() {
+            self.op(0x0b); // end block: the send's end
+        }
+        self
+    }
+    /// The slow path of inline common selector `k`: the send
+    /// (through an inline cache, if `site`), then on to `next` (from inside
+    /// `extra` `if`s).
+    fn common_and_go_on(
+        &mut self,
+        k: u8,
+        next: usize,
+        site: bool,
+        len: usize,
+        extra: u32,
+        jump: &dyn Fn(&mut Func, usize, u32),
+    ) -> &mut Func {
+        if site {
+            self.send(RULE_COMMON, u32::from(k), 1, next);
+        } else {
+            self.get(L_VM)
+                .i32c(RULE_COMMON)
+                .i32c(i32::from(k))
+                .i32c(0)
+                .i32c(next as i32)
+                .get(L_SP)
+                .call(F_SEND)
+                .set(L_R);
+            self.after_call();
+        }
         if next < len {
             jump(self, next, extra);
         } else {
@@ -1465,7 +1611,7 @@ fn module(body: &[u8], sites: u32) -> Vec<u8> {
         (&[I32, I32, I32], &[I32]),
         (&[I32, I32, I32, I32, I32, I32], &[I32]),
         (&[I32, I64, I32], &[I32]),
-        (&[I32, I32, I32, I32, I32], &[I32]),
+        (&[I32, I32, I32, I32], &[I32]),
     ];
     let mut t = Vec::new();
     uleb(&mut t, types.len() as u32);
@@ -1505,16 +1651,17 @@ fn module(body: &[u8], sites: u32) -> Vec<u8> {
     section(&mut m, 2, &im);
     // The one function, `run`.
     section(&mut m, 3, &[0x01, T_RUN as u8]);
-    // Globals: each site's class (i64), epoch, slot and kind (i32),
-    // mutable, 0.
+    // Globals: each site's two entries, each a class (i64), epoch, slot
+    // and kind (i32), and object (i64), mutable, 0.
     if sites > 0 {
         let mut g = Vec::new();
         uleb(&mut g, SITE_GLOBALS * sites);
-        for _ in 0..sites {
+        for _ in 0..2 * sites {
             g.extend_from_slice(&[I64, 0x01, 0x42, 0x00, 0x0b]);
-            for _ in 1..SITE_GLOBALS {
+            for _ in 1..ENTRY_GLOBALS - 1 {
                 g.extend_from_slice(&[I32, 0x01, 0x41, 0x00, 0x0b]);
             }
+            g.extend_from_slice(&[I64, 0x01, 0x42, 0x00, 0x0b]);
         }
         section(&mut m, 6, &g);
     }
@@ -1526,7 +1673,17 @@ fn module(body: &[u8], sites: u32) -> Vec<u8> {
     section(&mut m, 7, &ex);
     // Code: the locals after the parameters, i32s then i64s.
     let mut code = Vec::new();
-    code.extend_from_slice(&[0x03, I32_LOCALS, I32, I64_LOCALS, I64, MORE_I32_LOCALS, I32]);
+    code.extend_from_slice(&[
+        0x04,
+        I32_LOCALS,
+        I32,
+        I64_LOCALS,
+        I64,
+        MORE_I32_LOCALS,
+        I32,
+        0x01,
+        I64,
+    ]);
     code.extend_from_slice(body);
     code.push(0x0b); // end of function
     let mut c = Vec::new();
