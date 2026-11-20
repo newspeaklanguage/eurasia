@@ -35,7 +35,7 @@ use crate::host::{HostCallbacks, HostError, HostValue};
 use crate::machine::{ActorState, FrameState, MachineState};
 use crate::natives::{self, Native, NativeContext, Outcome, Reason};
 use crate::object::{
-    Access, Body, FROZEN, Heap, MethodHeader, MethodKind, PromiseRecord, Space, VALUE,
+    Access, Body, FROZEN, Format, Heap, MethodHeader, MethodKind, PromiseRecord, Space, VALUE,
 };
 use crate::roles::{Role, Roles};
 use crate::value::Value;
@@ -383,7 +383,7 @@ impl Vm {
             (f.literals, f.mixin) = self
                 .heap
                 .method(f.method)
-                .map_or((nil, nil), |m| (m.literals, m.mixin));
+                .map_or((nil, nil), |m| (m.literals(), m.mixin()));
         }
     }
 
@@ -501,8 +501,8 @@ impl Vm {
             return false;
         };
         self.heap.method(m).is_some_and(|m| {
-            m.header.kind == MethodKind::Native
-                && Native::from_id(m.header.native) == Some(expected)
+            m.header().kind == MethodKind::Native
+                && Native::from_id(m.header().native) == Some(expected)
         })
     }
 
@@ -677,9 +677,9 @@ impl Vm {
                 code: vm
                     .heap
                     .method(fr.method)
-                    .map_or_else(|| Rc::from([]), |m| m.bytecode.clone()),
-                literals: vm.heap.method(fr.method).map_or(nil, |m| m.literals),
-                mixin: vm.heap.method(fr.method).map_or(nil, |m| m.mixin),
+                    .map_or_else(|| Rc::from([]), |m| m.bytecode().clone()),
+                literals: vm.heap.method(fr.method).map_or(nil, |m| m.literals()),
+                mixin: vm.heap.method(fr.method).map_or(nil, |m| m.mixin()),
                 receiver: fr.receiver,
                 bp: fr.bp as usize,
                 arg_count: fr.arg_count as usize,
@@ -830,26 +830,23 @@ impl Vm {
         let nil = self.nil();
         let dead = Value::small_integer(-1).expect("small");
         let mut dead_aliens = alloc::collections::BTreeSet::new();
-        for i in 0..self.heap.len() {
-            let v = Value::reference(i as u64).expect("in range");
-            if let Some(o) = self.heap.get_mut(v)
-                && o.header.class == alien_class
-                && let Body::Regular(slots) = &mut o.body
+        for v in self.heap.objects() {
+            if self.heap.class(v) == Some(alien_class)
+                && let Some(slots) = self.heap.regular_slots_mut(v)
                 && slots.len() == 1
                 && slots[0]
                     .as_small_integer()
                     .is_some_and(|r| r > crate::host::HOST_GLOBAL as i64)
             {
                 slots[0] = dead;
-                dead_aliens.insert(i as u64);
+                dead_aliens.insert(v.as_reference().expect("an object"));
             }
         }
         // Each class's lazy cache slots (psoup names them x`cache`slot).
         let mut lazy: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
-        for i in 0..self.heap.len() {
-            let v = Value::reference(i as u64).expect("in range");
-            let class = match self.heap.get(v) {
-                Some(o) if matches!(o.body, Body::Regular(_)) => o.header.class,
+        for v in self.heap.objects() {
+            let class = match self.heap.format(v) {
+                Some(Format::Regular) => self.heap.class(v).expect("an object"),
                 _ => continue,
             };
             let key = class.as_reference().unwrap_or(u64::MAX);
@@ -864,9 +861,7 @@ impl Vm {
             if slots.is_empty() {
                 continue;
             }
-            if let Some(o) = self.heap.get_mut(v)
-                && let Body::Regular(values) = &mut o.body
-            {
+            if let Some(values) = self.heap.regular_slots_mut(v) {
                 for &j in &slots {
                     if j < values.len()
                         && values[j]
@@ -903,8 +898,8 @@ impl Vm {
         let mut chain = Vec::new();
         let mut c = class;
         while let Some(b) = self.heap.behavior(c) {
-            chain.push(b.mixin);
-            c = b.superclass;
+            chain.push(b.mixin());
+            c = b.superclass();
         }
         let mut indices = Vec::new();
         let mut index = 0;
@@ -912,7 +907,7 @@ impl Vm {
             let Some(m) = self.heap.mixin(mixin) else {
                 return Vec::new();
             };
-            let names = self.heap.array_elements(m.slot_names).unwrap_or(&[]);
+            let names = self.heap.array_elements(m.slot_names()).unwrap_or(&[]);
             for &declaration in names {
                 // A slot's name, or since M6 a triple {name. isMutable.
                 // access}.
@@ -1093,8 +1088,8 @@ impl Vm {
     }
 
     fn class_of(&self, v: Value) -> Value {
-        match self.heap.get(v) {
-            Some(o) => o.header.class,
+        match self.heap.class(v) {
+            Some(c) => c,
             None => self.roles.get(Role::SmallIntegerClass),
         }
     }
@@ -1104,10 +1099,10 @@ impl Vm {
             .heap
             .behavior(class)
             .ok_or_else(|| VmError::Malformed("class expected"))?;
-        Ok(if b.superclass == self.nil() {
+        Ok(if b.superclass() == self.nil() {
             None
         } else {
-            Some(b.superclass)
+            Some(b.superclass())
         })
     }
 
@@ -1119,18 +1114,18 @@ impl Vm {
             .ok_or_else(|| VmError::Malformed("class expected"))?;
         let mixin = self
             .heap
-            .mixin(b.mixin)
+            .mixin(b.mixin())
             .ok_or_else(|| VmError::Malformed("mixin expected"))?;
         let methods = self
             .heap
-            .array_elements(mixin.methods)
+            .array_elements(mixin.methods())
             .ok_or_else(|| VmError::Malformed("method array expected"))?;
         for &m in methods {
             let method = self
                 .heap
                 .method(m)
                 .ok_or_else(|| VmError::Malformed("method expected"))?;
-            if self.heap.string_bytes(method.selector) == Some(selector) {
+            if self.heap.string_bytes(method.selector()) == Some(selector) {
                 return Ok(Some(m));
             }
         }
@@ -1138,7 +1133,7 @@ impl Vm {
     }
 
     fn access(&self, method: Value) -> Access {
-        self.heap.method(method).expect("method").header.access
+        self.heap.method(method).expect("method").header().access
     }
 
     fn find_application_of(&self, mixin: Value, mut class: Value) -> Result<Value, VmError> {
@@ -1147,7 +1142,7 @@ impl Vm {
                 .heap
                 .behavior(class)
                 .ok_or_else(|| VmError::MixinApplicationNotFound)?;
-            if b.mixin == mixin {
+            if b.mixin() == mixin {
                 return Ok(class);
             }
             class = self
@@ -1173,9 +1168,9 @@ impl Vm {
                 .ok_or_else(|| VmError::Malformed("class expected"))?;
             let mixin = self
                 .heap
-                .mixin(b.mixin)
+                .mixin(b.mixin())
                 .ok_or_else(|| VmError::Malformed("mixin expected"))?;
-            total += mixin.slot_count as usize;
+            total += mixin.slot_count() as usize;
             c = self.superclass(k)?;
         }
         Ok(total)
@@ -1189,7 +1184,7 @@ impl Vm {
             .heap
             .method(method)
             .ok_or_else(|| VmError::Malformed("method expected"))?
-            .mixin;
+            .mixin();
         let application = self.find_application_of(mixin, self.class_of(receiver))?;
         let above = match self.superclass(application)? {
             Some(s) => self.instance_slot_count(s)?,
@@ -1319,7 +1314,7 @@ impl Vm {
                         .heap
                         .mixin(candidate_mixin)
                         .ok_or_else(|| VmError::Malformed("mixin expected"))?
-                        .enclosing_mixin;
+                        .enclosing_mixin();
                     if enclosing == self.nil() {
                         break;
                     }
@@ -1328,7 +1323,7 @@ impl Vm {
                         .heap
                         .behavior(application)
                         .expect("class")
-                        .enclosing_object;
+                        .enclosing_object();
                     depth += 1;
                 }
                 match found {
@@ -1374,7 +1369,7 @@ impl Vm {
             .heap
             .method(method)
             .ok_or_else(|| VmError::Malformed("method expected"))?
-            .header)
+            .header())
     }
 
     /// The method an ordinary send of `sel` to an instance of `class` runs:
@@ -1439,12 +1434,12 @@ impl Vm {
                 .heap
                 .behavior(application)
                 .expect("class")
-                .enclosing_object;
+                .enclosing_object();
             mixin = self
                 .heap
                 .mixin(mixin)
                 .ok_or_else(|| VmError::Malformed("mixin expected"))?
-                .enclosing_mixin;
+                .enclosing_mixin();
         }
         Ok((receiver, mixin))
     }
@@ -1492,7 +1487,7 @@ impl Vm {
                         .heap
                         .mixin(candidate_mixin)
                         .ok_or_else(|| VmError::Malformed("mixin expected"))?
-                        .enclosing_mixin;
+                        .enclosing_mixin();
                     if enclosing == self.nil() {
                         break;
                     }
@@ -1501,7 +1496,7 @@ impl Vm {
                         .heap
                         .behavior(application)
                         .expect("class")
-                        .enclosing_object;
+                        .enclosing_object();
                 }
                 let class = self.class_of(receiver);
                 self.protected_send(selector, n, receiver, class, host)
@@ -1686,12 +1681,10 @@ impl Vm {
                 };
                 // A contract object (class, metaclass, mixin, method) answers
                 // its contract field at that position, as `vm slotOf:at:` does.
-                let value = match self.heap.get(receiver).map(|o| &o.body) {
-                    Some(Body::Regular(slots)) => slots.get(index).copied(),
-                    Some(body) => {
-                        natives::readable_fields(body).and_then(|f| f.get(index).copied())
-                    }
-                    None => None,
+                let value = match self.heap.regular_slots(receiver) {
+                    Some(slots) => slots.get(index).copied(),
+                    None => natives::readable_fields(&self.heap, receiver)
+                        .and_then(|f| f.get(index).copied()),
                 }
                 .ok_or_else(|| self.bad_slot_access(method, receiver))?;
                 self.stack.truncate(base);
@@ -1707,7 +1700,7 @@ impl Vm {
                 };
                 // A frozen object is never written; a value only by its init
                 // setters, and only with values (design doc section 5).
-                let flags = self.heap.get(receiver).map_or(0, |o| o.header.flags);
+                let flags = self.heap.flags(receiver);
                 let refusal = if flags & FROZEN != 0 {
                     Some(Reason::WrongKind(0))
                 } else if flags & VALUE != 0 && !self.is_value(value) {
@@ -1751,7 +1744,7 @@ impl Vm {
                 self.next_serial += 1;
                 let (code, literals, mixin) = {
                     let m = self.heap.method(method).expect("method");
-                    (m.bytecode.clone(), m.literals, m.mixin)
+                    (m.bytecode().clone(), m.literals(), m.mixin())
                 };
                 self.frames.push(Frame {
                     serial,
@@ -1889,7 +1882,7 @@ impl Vm {
                         target: class,
                     },
                 );
-                self.heap.get_mut(r).expect("new").header.flags |= VALUE;
+                self.heap.add_flags(r, VALUE);
                 self.stack.push(r);
                 Ok(None)
             }
@@ -1921,7 +1914,7 @@ impl Vm {
                         target: nil,
                     },
                 );
-                self.heap.get_mut(handle).expect("new").header.flags |= VALUE;
+                self.heap.add_flags(handle, VALUE);
                 self.stack.push(handle);
                 Ok(None)
             }
@@ -1929,12 +1922,10 @@ impl Vm {
                 packet,
                 far_reference,
             } => {
-                let Some(Body::FarRef { actor, .. }) =
-                    self.heap.get(far_reference).map(|o| &o.body)
-                else {
+                let Some((actor, _)) = self.heap.far_ref(far_reference) else {
                     unreachable!("checked by the native")
                 };
-                let to = *actor as usize;
+                let to = actor as usize;
                 if to >= self.actors.len() {
                     return Err(VmError::Malformed("a far reference to no actor"));
                 }
@@ -2023,13 +2014,14 @@ impl Vm {
                     Body::Array(entry),
                 );
                 let last = natives::last_promise(&self.heap, record);
-                let Some(Body::Promise(p)) = self.heap.get_mut(last).map(|o| &mut o.body) else {
+                let Some(p) = self.heap.promise(last) else {
                     unreachable!("a chain of promise records ends in one")
                 };
-                if p.state == PromiseRecord::PENDING {
-                    p.queue.push(entry);
+                let (state, value) = (p.state(), p.value());
+                if state == PromiseRecord::PENDING {
+                    let array_class = self.roles.get(Role::ArrayClass);
+                    self.heap.push_promise_queue(last, &[entry], array_class);
                 } else {
-                    let (state, value) = (p.state, p.value);
                     self.deliver(entry, state, value);
                 }
                 let nil = self.nil();
@@ -2048,14 +2040,15 @@ impl Vm {
                         target: waiter,
                     },
                 );
-                self.heap.get_mut(far).expect("new").header.flags |= VALUE;
-                let Some(Body::Promise(p)) = self.heap.get_mut(last).map(|o| &mut o.body) else {
+                self.heap.add_flags(far, VALUE);
+                let Some(p) = self.heap.promise(last) else {
                     unreachable!("a chain of promise records ends in one")
                 };
-                if p.state == PromiseRecord::PENDING {
-                    p.waiters.push(far);
+                let (state, value) = (p.state(), p.value());
+                if state == PromiseRecord::PENDING {
+                    let array_class = self.roles.get(Role::ArrayClass);
+                    self.heap.push_promise_waiter(last, far, array_class);
                 } else {
-                    let (state, value) = (p.state, p.value);
                     self.notify(far, state, value);
                 }
                 let nil = self.nil();
@@ -2147,18 +2140,17 @@ impl Vm {
                 let target = self.stack.pop().expect("pushed");
                 let found: Vec<Value> = self
                     .heap
-                    .iter()
-                    .filter(|(_, o)| match &o.body {
-                        Body::Class(b) => {
-                            if by_mixin {
-                                b.mixin == target
-                            } else {
-                                b.superclass == target
-                            }
-                        }
-                        _ => false,
+                    .objects()
+                    .filter(|&v| {
+                        self.heap.format(v) == Some(Format::Class)
+                            && self.heap.behavior(v).is_some_and(|b| {
+                                if by_mixin {
+                                    b.mixin() == target
+                                } else {
+                                    b.superclass() == target
+                                }
+                            })
                     })
-                    .map(|(v, _)| v)
                     .collect();
                 let array_class = self.roles.get(Role::ArrayClass);
                 let answer = self.heap.allocate(
@@ -2177,9 +2169,8 @@ impl Vm {
                 let class = self.stack.pop().expect("pushed");
                 let instances: Vec<Value> = self
                     .heap
-                    .iter()
-                    .filter(|(_, o)| o.header.class == class)
-                    .map(|(v, _)| v)
+                    .objects()
+                    .filter(|&v| self.heap.class(v) == Some(class))
                     .collect();
                 let array_class = self.roles.get(Role::ArrayClass);
                 let answer = self.heap.allocate(
@@ -2255,22 +2246,22 @@ impl Vm {
             .ok_or_else(|| VmError::Malformed("closure expected"))?;
         let defining = self
             .heap
-            .activation(c.defining)
+            .activation(c.defining())
             .ok_or_else(|| VmError::Malformed("activation expected"))?;
-        let (method, receiver) = (defining.method, defining.receiver);
+        let (method, receiver) = (defining.method(), defining.receiver());
         let (code, literals, mixin) = {
             let m = self
                 .heap
                 .method(method)
                 .ok_or_else(|| VmError::Malformed("method expected"))?;
-            (m.bytecode.clone(), m.literals, m.mixin)
+            (m.bytecode().clone(), m.literals(), m.mixin())
         };
-        if c.initial_ip as usize >= code.len() {
+        if c.initial_ip() as usize >= code.len() {
             return Err(VmError::Malformed("closure body outside its method"));
         }
         let base = self.stack.len() - 1 - n;
         let lp = self.stack.len();
-        self.stack.extend(c.copied.iter().copied());
+        self.stack.extend(c.copied().iter().copied());
         let serial = self.next_serial;
         self.next_serial += 1;
         self.frames.push(Frame {
@@ -2283,7 +2274,7 @@ impl Vm {
             bp: base,
             arg_count: n,
             lp,
-            ip: c.initial_ip as usize,
+            ip: c.initial_ip() as usize,
             activation: None,
             closure: Some(closure),
         });
@@ -2316,7 +2307,7 @@ impl Vm {
 
     /// The index of the live frame an activation handle names.
     fn frame_index(&self, activation: Value) -> Option<usize> {
-        let serial = self.heap.activation(activation)?.frame?;
+        let serial = self.heap.activation(activation)?.frame()?;
         self.frames.iter().rposition(|f| f.serial == serial)
     }
 
@@ -2340,16 +2331,25 @@ impl Vm {
             let top = self.frames.len() - 1;
             return Outcome::Answer(self.ensure_activation(top));
         }
-        let Some(record) = self.heap.activation(receiver).cloned() else {
+        let Some((method, record_receiver, closure, detached)) =
+            self.heap.activation(receiver).map(|a| {
+                (
+                    a.method(),
+                    a.receiver(),
+                    a.closure(),
+                    a.detached().is_some(),
+                )
+            })
+        else {
             return Outcome::Fail(Reason::WrongKind(0));
         };
         match native {
-            Native::ActivationMethod => return Outcome::Answer(record.method),
-            Native::ActivationReceiver => return Outcome::Answer(record.receiver),
-            Native::ActivationClosure => return Outcome::Answer(record.closure),
+            Native::ActivationMethod => return Outcome::Answer(method),
+            Native::ActivationReceiver => return Outcome::Answer(record_receiver),
+            Native::ActivationClosure => return Outcome::Answer(closure),
             _ => {}
         }
-        if record.detached.is_some() {
+        if detached {
             return self.detached_native(native, receiver, args);
         }
         let Some(k) = self.frame_index(receiver) else {
@@ -2420,11 +2420,13 @@ impl Vm {
         if !arg_ok {
             return Outcome::Fail(Reason::WrongKind(1));
         }
-        let Some(Body::Activation(record)) = self.heap.get_mut(receiver).map(|o| &mut o.body)
-        else {
-            unreachable!("checked by the caller")
-        };
-        let d = record.detached.as_mut().expect("detached");
+        let d = self
+            .heap
+            .activation(receiver)
+            .and_then(|a| a.detached())
+            .expect("checked by the caller");
+        // A copy: the arms below write the activation (the Simulator's path).
+        let (sender, bci, temps) = (d.sender(), d.bci(), d.temps().to_vec());
         let index = |v: Value, len: usize| -> Result<usize, Reason> {
             match v.as_small_integer() {
                 Some(i) if i >= 1 && i as usize <= len => Ok(i as usize - 1),
@@ -2433,45 +2435,47 @@ impl Vm {
             }
         };
         match native {
-            Native::ActivationSender => Outcome::Answer(d.sender),
-            Native::ActivationBci => Outcome::Answer(d.bci),
+            Native::ActivationSender => Outcome::Answer(sender),
+            Native::ActivationBci => Outcome::Answer(bci),
             Native::ActivationSize => {
-                Outcome::Answer(Value::small_integer(d.temps.len() as i64).expect("small"))
+                Outcome::Answer(Value::small_integer(temps.len() as i64).expect("small"))
             }
-            Native::ActivationTempAt => match index(args[0], d.temps.len()) {
-                Ok(i) => Outcome::Answer(d.temps[i]),
+            Native::ActivationTempAt => match index(args[0], temps.len()) {
+                Ok(i) => Outcome::Answer(temps[i]),
                 Err(r) => Outcome::Fail(r),
             },
-            Native::ActivationTempAtPut => match index(args[0], d.temps.len()) {
+            Native::ActivationTempAtPut => match index(args[0], temps.len()) {
                 Ok(i) => {
-                    d.temps[i] = args[1];
+                    self.heap.set_detached_temp(receiver, i, args[1]);
                     Outcome::Answer(args[1])
                 }
                 Err(r) => Outcome::Fail(r),
             },
             Native::ActivationSetSender => {
-                d.sender = args[0];
+                self.heap.set_detached_sender(receiver, args[0]);
                 Outcome::Answer(receiver)
             }
             Native::ActivationBciPut => {
-                d.bci = args[0];
+                self.heap.set_detached_bci(receiver, args[0]);
                 Outcome::Answer(receiver)
             }
             Native::ActivationSizePut => {
                 let n = args[0].as_small_integer().expect("checked") as usize;
-                d.temps.resize(n, nil);
+                let array_class = self.roles.get(Role::ArrayClass);
+                self.heap
+                    .resize_detached_temps(receiver, n, nil, array_class);
                 Outcome::Answer(receiver)
             }
             Native::ActivationMethodPut => {
-                record.method = args[0];
+                self.heap.set_activation_field(receiver, 0, args[0]);
                 Outcome::Answer(receiver)
             }
             Native::ActivationClosurePut => {
-                record.closure = args[0];
+                self.heap.set_activation_field(receiver, 2, args[0]);
                 Outcome::Answer(receiver)
             }
             Native::ActivationReceiverPut => {
-                record.receiver = args[0];
+                self.heap.set_activation_field(receiver, 1, args[0]);
                 Outcome::Answer(receiver)
             }
             _ => Outcome::Fail(Reason::Unsupported),
@@ -2483,8 +2487,8 @@ impl Vm {
     /// method's or mixin's contract field. Answers whether there was one.
     fn store_slot(&mut self, receiver: Value, index: usize, value: Value) -> bool {
         let program = matches!(
-            self.heap.get(receiver).map(|o| &o.body),
-            Some(Body::Method(_) | Body::Mixin(_))
+            self.heap.format(receiver),
+            Some(Format::Method | Format::Mixin)
         );
         let stored = self.store_slot_unflushed(receiver, index, value);
         if stored && program {
@@ -2494,51 +2498,29 @@ impl Vm {
     }
 
     fn store_slot_unflushed(&mut self, receiver: Value, index: usize, value: Value) -> bool {
-        match self.heap.get_mut(receiver).map(|o| &mut o.body) {
-            Some(Body::Regular(slots)) if index < slots.len() => {
-                slots[index] = value;
-            }
+        if let Some(slots) = self.heap.regular_slots_mut(receiver) {
+            return match slots.get_mut(index) {
+                Some(slot) => {
+                    *slot = value;
+                    true
+                }
+                None => false,
+            };
+        }
+        match self.heap.format(receiver) {
             // The kernel's Ephemeron declares key, value, finalizer.
-            Some(Body::Ephemeron {
-                key,
-                value: v,
-                finalizer,
-            }) if index < 3 => {
-                *[key, v, finalizer][index] = value;
-            }
+            Some(Format::Ephemeron) => self.heap.set_ephemeron_field(receiver, index, value),
             // An unfrozen method or mixin built in Newspeak (M6
             // design 4.1): its setters write its contract fields, in
             // `vm slotOf:at:`'s order. A mixin's slot count follows
             // its slot names.
-            Some(Body::Method(m)) if index < 5 => {
-                *[
-                    &mut m.literals,
-                    &mut m.mixin,
-                    &mut m.selector,
-                    &mut m.source,
-                    &mut m.library,
-                ][index] = value;
+            Some(Format::Method) => self.heap.set_method_field(receiver, index, value),
+            Some(Format::Mixin) => {
+                let count = self.heap.array_elements(value).map_or(0, <[Value]>::len) as u32;
+                self.heap.set_mixin_field(receiver, index, value, count)
             }
-            Some(Body::Mixin(_)) if index < 6 => {
-                let count = self.heap.array_elements(value).map(<[Value]>::len);
-                let Some(Body::Mixin(m)) = self.heap.get_mut(receiver).map(|o| &mut o.body) else {
-                    unreachable!("matched above")
-                };
-                if index == 3 {
-                    m.slot_count = count.unwrap_or(0) as u32;
-                }
-                *[
-                    &mut m.name,
-                    &mut m.methods,
-                    &mut m.enclosing_mixin,
-                    &mut m.slot_names,
-                    &mut m.class_mixin,
-                    &mut m.library,
-                ][index] = value;
-            }
-            _ => return false,
+            _ => false,
         }
-        true
     }
 
     /// `vm continueAt: a with: v` (M6 design 4.4): the frames above the live
@@ -2592,10 +2574,9 @@ impl Vm {
             let temps = self.stack[f.bp + 1..top].to_vec();
             let handle = f.activation.expect("made above");
             let bci = Value::small_integer(f.ip as i64 + 1).expect("small");
-            if let Some(Body::Activation(record)) = self.heap.get_mut(handle).map(|o| &mut o.body) {
-                record.frame = None;
-                record.detached = Some(crate::object::Detached { sender, bci, temps });
-            }
+            let array_class = self.roles.get(Role::ArrayClass);
+            self.heap
+                .detach_activation(handle, sender, bci, temps, array_class);
             sender = handle;
         }
         self.stack.truncate(popped[0].bp);
@@ -2617,7 +2598,7 @@ impl Vm {
         let mut a = top;
         loop {
             let record = self.heap.activation(a).ok_or(Reason::WrongKind(1))?;
-            let Some(d) = &record.detached else {
+            let Some(d) = &record.detached() else {
                 break;
             };
             if chain.len() > MAX_FRAMES {
@@ -2625,21 +2606,21 @@ impl Vm {
             }
             let method = self
                 .heap
-                .method(record.method)
+                .method(record.method())
                 .ok_or(Reason::WrongKind(1))?;
-            let bci = d.bci.as_small_integer().ok_or(Reason::WrongKind(1))?;
-            if bci < 1 || bci as usize > method.bytecode.len() {
+            let bci = d.bci().as_small_integer().ok_or(Reason::WrongKind(1))?;
+            if bci < 1 || bci as usize > method.bytecode().len() {
                 return Err(Reason::WrongKind(1));
             }
-            let arity = match self.heap.closure(record.closure) {
-                Some(c) => c.num_args as usize,
-                None => method.header.arg_count as usize,
+            let arity = match self.heap.closure(record.closure()) {
+                Some(c) => c.num_args() as usize,
+                None => method.header().arg_count as usize,
             };
-            if d.temps.len() < arity {
+            if d.temps().len() < arity {
                 return Err(Reason::WrongKind(1));
             }
             chain.push(a);
-            a = d.sender;
+            a = d.sender();
         }
         if a != current || chain.is_empty() {
             return Err(Reason::WrongKind(1));
@@ -2648,27 +2629,33 @@ impl Vm {
             return Err(Reason::Exhausted(natives::Resource::Stack));
         }
         for &handle in chain.iter().rev() {
-            let Some(Body::Activation(record)) = self.heap.get_mut(handle).map(|o| &mut o.body)
-            else {
-                unreachable!("checked above")
-            };
-            let d = record.detached.take().expect("checked above");
             let serial = self.next_serial;
             self.next_serial += 1;
-            record.frame = Some(serial);
-            let (method, receiver, closure) = (record.method, record.receiver, record.closure);
+            let (_, bci, temps) = self
+                .heap
+                .attach_activation(handle, serial)
+                .expect("checked above");
+            let record = self.heap.activation(handle).expect("checked above");
+            let (method, receiver, closure) =
+                (record.method(), record.receiver(), record.closure());
             let nil = self.nil();
             let closure = (closure != nil).then_some(closure);
             let arity = match closure.and_then(|c| self.heap.closure(c)) {
-                Some(c) => c.num_args as usize,
-                None => self.heap.method(method).expect("checked").header.arg_count as usize,
+                Some(c) => c.num_args() as usize,
+                None => {
+                    self.heap
+                        .method(method)
+                        .expect("checked")
+                        .header()
+                        .arg_count as usize
+                }
             };
             let bp = self.stack.len();
             self.stack.push(closure.unwrap_or(receiver));
-            self.stack.extend(d.temps.iter().copied());
+            self.stack.extend(temps.iter().copied());
             let (code, literals, mixin) = {
                 let m = self.heap.method(method).expect("checked");
-                (m.bytecode.clone(), m.literals, m.mixin)
+                (m.bytecode().clone(), m.literals(), m.mixin())
             };
             self.frames.push(Frame {
                 serial,
@@ -2680,7 +2667,7 @@ impl Vm {
                 bp,
                 arg_count: arity,
                 lp: bp + 1 + arity,
-                ip: d.bci.as_small_integer().expect("checked") as usize - 1,
+                ip: bci.as_small_integer().expect("checked") as usize - 1,
                 activation: Some(handle),
                 closure,
             });
@@ -2699,7 +2686,11 @@ impl Vm {
         arguments: Value,
         host: &mut dyn Host,
     ) -> Result<Value, Reason> {
-        let header = self.heap.method(method).ok_or(Reason::WrongKind(1))?.header;
+        let header = self
+            .heap
+            .method(method)
+            .ok_or(Reason::WrongKind(1))?
+            .header();
         let args = self
             .heap
             .array_elements(arguments)
@@ -2716,12 +2707,10 @@ impl Vm {
                 let index = self
                     .slot_index(method, receiver, header.slot)
                     .map_err(|_| Reason::WrongKind(2))?;
-                let value = match self.heap.get(receiver).map(|o| &o.body) {
-                    Some(Body::Regular(slots)) => slots.get(index).copied(),
-                    Some(body) => {
-                        natives::readable_fields(body).and_then(|f| f.get(index).copied())
-                    }
-                    None => None,
+                let value = match self.heap.regular_slots(receiver) {
+                    Some(slots) => slots.get(index).copied(),
+                    None => natives::readable_fields(&self.heap, receiver)
+                        .and_then(|f| f.get(index).copied()),
                 }
                 .ok_or(Reason::WrongKind(2))?;
                 alloc::vec![small(0), value]
@@ -2730,7 +2719,7 @@ impl Vm {
                 let index = self
                     .slot_index(method, receiver, header.slot)
                     .map_err(|_| Reason::WrongKind(2))?;
-                let flags = self.heap.get(receiver).map_or(0, |o| o.header.flags);
+                let flags = self.heap.flags(receiver);
                 if flags & FROZEN != 0 || (flags & VALUE != 0 && !self.is_value(args[0])) {
                     let failure = self.new_failure(
                         Native::SlotStore,
@@ -2845,10 +2834,8 @@ impl Vm {
 
     /// Marks the handle of a frame that has returned or been unwound as dead.
     fn retire(&mut self, frame: &Frame) {
-        if let Some(a) = frame.activation
-            && let Some(Body::Activation(record)) = self.heap.get_mut(a).map(|o| &mut o.body)
-        {
-            record.frame = None;
+        if let Some(a) = frame.activation {
+            self.heap.set_activation_frame(a, None);
         }
     }
 
@@ -2932,16 +2919,13 @@ impl Vm {
     /// promise record and any value passes as itself; any other object
     /// becomes a new far reference into `from`, held by `to`.
     fn remote_representation(&mut self, v: Value, from: usize, to: usize) -> Value {
-        match self.heap.get(v).map(|o| &o.body) {
+        match self.heap.format(v) {
             None => v,
-            Some(Body::FarRef { actor, target }) => {
-                if *actor as usize == to {
-                    *target
-                } else {
-                    v
-                }
+            Some(Format::FarRef) => {
+                let (actor, target) = self.heap.far_ref(v).expect("a far reference");
+                if actor as usize == to { target } else { v }
             }
-            Some(Body::Promise(_)) => v,
+            Some(Format::Promise) => v,
             _ if from == to => v,
             Some(_) if self.is_value(v) => v,
             Some(_) => {
@@ -2954,7 +2938,7 @@ impl Vm {
                         target: v,
                     },
                 );
-                self.heap.get_mut(r).expect("new").header.flags |= VALUE;
+                self.heap.add_flags(r, VALUE);
                 r
             }
         }
@@ -2966,10 +2950,10 @@ impl Vm {
     /// Every waiter gets a packet. Answers false, changing nothing, if the
     /// record was not pending.
     fn settle(&mut self, record: Value, state: u8, value: Value) -> bool {
-        let pending = matches!(
-            self.heap.get(record).map(|o| &o.body),
-            Some(Body::Promise(p)) if p.state == PromiseRecord::PENDING
-        );
+        let pending = self
+            .heap
+            .promise(record)
+            .is_some_and(|p| p.state() == PromiseRecord::PENDING);
         if !pending {
             return false;
         }
@@ -2983,24 +2967,24 @@ impl Vm {
                 state = PromiseRecord::FORWARDED;
             }
         }
-        let Some(Body::Promise(p)) = self.heap.get_mut(record).map(|o| &mut o.body) else {
-            unreachable!("checked above")
-        };
-        p.state = state;
-        p.value = value;
-        let waiters = core::mem::take(&mut p.waiters);
-        let queue = core::mem::take(&mut p.queue);
+        self.heap.set_promise(record, state, value);
+        let nil = self.nil();
+        let (waiters, queue) = self
+            .heap
+            .take_promise_lists(record, nil)
+            .expect("checked above");
         if state == PromiseRecord::FORWARDED {
             // The queue moves to the end of the chain (or is delivered, if
             // that has settled).
             let last = natives::last_promise(&self.heap, value);
-            let Some(Body::Promise(q)) = self.heap.get_mut(last).map(|o| &mut o.body) else {
+            let Some(q) = self.heap.promise(last) else {
                 unreachable!("a chain of promise records ends in one")
             };
-            if q.state == PromiseRecord::PENDING {
-                q.queue.extend(queue);
+            let (s, v) = (q.state(), q.value());
+            if s == PromiseRecord::PENDING {
+                let array_class = self.roles.get(Role::ArrayClass);
+                self.heap.push_promise_queue(last, &queue, array_class);
             } else {
-                let (s, v) = (q.state, q.value);
                 for entry in queue {
                     self.deliver(entry, s, v);
                 }
@@ -3019,8 +3003,8 @@ impl Vm {
     /// `v` in no actor's terms: a non-value near object of the running actor
     /// becomes a far reference into it (RR-Near-Far); anything else is itself.
     fn neutral(&mut self, v: Value) -> Value {
-        match self.heap.get(v).map(|o| &o.body) {
-            Some(Body::FarRef { .. } | Body::Promise(_)) | None => v,
+        match self.heap.format(v) {
+            Some(Format::FarRef | Format::Promise) | None => v,
             Some(_) if self.is_value(v) => v,
             Some(_) => {
                 let current = self.current as u32;
@@ -3033,7 +3017,7 @@ impl Vm {
                         target: v,
                     },
                 );
-                self.heap.get_mut(r).expect("new").header.flags |= VALUE;
+                self.heap.add_flags(r, VALUE);
                 r
             }
         }
@@ -3055,9 +3039,9 @@ impl Vm {
             }
             return;
         }
-        let to = match self.heap.get(value).map(|o| &o.body) {
-            Some(Body::FarRef { actor, .. }) => *actor,
-            _ => sender,
+        let to = match self.heap.far_ref(value) {
+            Some((actor, _)) => actor,
+            None => sender,
         };
         let mut packet = Vec::with_capacity(elements.len());
         packet.push(value);
@@ -3077,10 +3061,9 @@ impl Vm {
     /// `resolveRemotely: value` (fulfilled, or forwarded to the record
     /// `value`) or `breakRemotely: value`.
     fn notify(&mut self, waiter: Value, state: u8, value: Value) {
-        let Some(Body::FarRef { actor, .. }) = self.heap.get(waiter).map(|o| &o.body) else {
+        let Some((to, _)) = self.heap.far_ref(waiter) else {
             unreachable!("waiters are far references")
         };
-        let to = *actor;
         let selector = if state == PromiseRecord::BROKEN {
             self.symbol("breakRemotely:")
         } else {
@@ -3136,20 +3119,22 @@ impl Vm {
                 .ok_or(2u32)?;
             layouts.push((entry[0], entry[1], remap));
         }
-        // Reshape instances in place: identity, flags and actor are kept.
+        // Reshape instances: identity, flags and actor are kept. An instance
+        // whose size changes moves (the arena does not grow objects in
+        // place); references to it are forwarded below with the rest.
         let nil = self.nil();
+        let mut moved: Vec<(u64, Value)> = Vec::new();
         for (old_class, new_class, remap) in &layouts {
             let instances: Vec<Value> = self
                 .heap
-                .iter()
-                .filter(|(_, o)| o.header.class == *old_class && matches!(o.body, Body::Regular(_)))
-                .map(|(v, _)| v)
+                .objects()
+                .filter(|&v| {
+                    self.heap.class(v) == Some(*old_class)
+                        && self.heap.format(v) == Some(Format::Regular)
+                })
                 .collect();
             for v in instances {
-                let object = self.heap.get_mut(v).expect("an instance");
-                let Body::Regular(old) = &object.body else {
-                    unreachable!("filtered")
-                };
+                let old = self.heap.regular_slots(v).expect("filtered");
                 let slots: Vec<Value> = remap
                     .iter()
                     .map(|&i| {
@@ -3160,17 +3145,20 @@ impl Vm {
                         }
                     })
                     .collect();
-                object.body = Body::Regular(slots);
-                object.header.class = *new_class;
+                let now = self.heap.reshape(v, *new_class, slots);
+                if now != v {
+                    moved.push((v.as_reference().expect("an object"), now));
+                }
             }
         }
         // Forward identities, in the heap and in every root the VM holds.
-        let map: BTreeMap<u64, Value> = olds
+        let mut map: BTreeMap<u64, Value> = olds
             .iter()
             .zip(news.iter())
             .filter(|(o, n)| o != n)
             .map(|(o, n)| (o.as_reference().expect("checked"), *n))
             .collect();
+        map.extend(moved);
         if !map.is_empty() {
             let forward = |v: Value| match v.as_reference() {
                 Some(i) => map.get(&i).copied().unwrap_or(v),
@@ -3211,33 +3199,34 @@ impl Vm {
             if !seen.insert(v.as_reference()) {
                 continue;
             }
-            let Some(object) = self.heap.get_mut(v) else {
+            let Some(format) = self.heap.format(v) else {
                 continue;
             };
-            if object.header.flags & FROZEN != 0 {
+            if self.heap.flags(v) & FROZEN != 0 {
                 continue;
             }
-            match &object.body {
-                Body::Method(m) => {
-                    let literals = m.literals;
-                    object.header.flags |= FROZEN;
+            match format {
+                Format::Method => {
+                    let literals = self.heap.method(v).expect("a method").literals();
+                    self.heap.add_flags(v, FROZEN);
                     pending.push(literals);
                 }
-                Body::Mixin(m) => {
-                    let (methods, class_mixin) = (m.methods, m.class_mixin);
-                    object.header.flags |= FROZEN;
+                Format::Mixin => {
+                    let m = self.heap.mixin(v).expect("a mixin");
+                    let (methods, class_mixin) = (m.methods(), m.class_mixin());
+                    self.heap.add_flags(v, FROZEN);
                     pending.push(methods);
                     pending.push(class_mixin);
                 }
-                Body::Class(b) | Body::Metaclass(b) => {
-                    let mixin = b.mixin;
-                    object.header.flags |= FROZEN;
+                Format::Class | Format::Metaclass => {
+                    let mixin = self.heap.behavior(v).expect("a class").mixin();
+                    self.heap.add_flags(v, FROZEN);
                     pending.push(mixin);
                 }
                 // A mixin's methods, a method's literals: followed, not
                 // frozen, so that only program objects are.
-                Body::Array(e) => {
-                    let e = e.clone();
+                Format::Array => {
+                    let e = self.heap.fields(v).expect("an array").to_vec();
                     pending.extend(e);
                 }
                 _ => {}
@@ -3291,18 +3280,20 @@ impl Vm {
                 HostValue::Ref(r)
             });
         }
-        match self.heap.get(v).map(|o| &o.body) {
-            Some(Body::Float(f)) => Ok(HostValue::Number(*f)),
-            Some(Body::String(b)) => match core::str::from_utf8(b) {
-                Ok(s) => Ok(HostValue::String(String::from(s))),
-                Err(_) => Err(Reason::WrongKind(index)),
-            },
-            Some(Body::Closure(_)) => {
+        match self.heap.format(v) {
+            Some(Format::Float) => Ok(HostValue::Number(self.heap.float(v).expect("a float"))),
+            Some(Format::String) => {
+                match core::str::from_utf8(self.heap.bytes(v).expect("bytes")) {
+                    Ok(s) => Ok(HostValue::String(String::from(s))),
+                    Err(_) => Err(Reason::WrongKind(index)),
+                }
+            }
+            Some(Format::Closure) => {
                 let id = self.expats.len() as u32;
                 self.expats.push((v, self.current as u32));
                 Ok(HostValue::Expat(id))
             }
-            Some(Body::LargeInteger { .. }) => Err(Reason::OutOfRange(index)),
+            Some(Format::LargeInteger) => Err(Reason::OutOfRange(index)),
             _ => Err(Reason::WrongKind(index)),
         }
     }
@@ -3416,20 +3407,20 @@ impl Vm {
             .heap
             .closure(closure)
             .ok_or_else(|| VmError::Malformed("closure expected"))?
-            .defining;
+            .defining();
         for _ in 0..MAX_FRAMES {
             let a = self
                 .heap
                 .activation(home)
                 .ok_or_else(|| VmError::Malformed("activation expected"))?;
-            if a.closure == nil {
+            if a.closure() == nil {
                 return Ok(home);
             }
             home = self
                 .heap
-                .closure(a.closure)
+                .closure(a.closure())
                 .ok_or_else(|| VmError::Malformed("closure expected"))?
-                .defining;
+                .defining();
         }
         Err(VmError::Malformed("closure chain too deep"))
     }
@@ -3451,7 +3442,7 @@ impl Vm {
             return Ok(None);
         };
         let home = self.home_of(closure)?;
-        let home_serial = self.heap.activation(home).and_then(|a| a.frame);
+        let home_serial = self.heap.activation(home).and_then(|a| a.frame());
         let Some(home_serial) = home_serial else {
             return self.upcall(Role::CannotReturnSelector, &[result], host);
         };
@@ -3477,10 +3468,7 @@ impl Vm {
                 let unwind = self.ensure_activation(i);
                 return self.upcall(Role::AboutToReturnThroughSelector, &[result, unwind], host);
             }
-            let marked = self
-                .heap
-                .get(method)
-                .is_some_and(|o| o.header.flags & crate::object::SIMULATION_ROOT != 0);
+            let marked = self.heap.flags(method) & crate::object::SIMULATION_ROOT != 0;
             if marked || blockers.iter().any(|&b| b == method && b != nil) {
                 break;
             }
@@ -3571,7 +3559,7 @@ impl Vm {
         let receiver_class = self
             .heap
             .behavior(class)
-            .and_then(|b| self.heap.string_bytes(b.name))
+            .and_then(|b| self.heap.string_bytes(b.name()))
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_else(|| String::from("?"));
         VmError::BadSlotAccess {
@@ -3583,7 +3571,7 @@ impl Vm {
     fn method_selector(&self, method: Value) -> String {
         self.heap
             .method(method)
-            .and_then(|m| self.heap.string_bytes(m.selector))
+            .and_then(|m| self.heap.string_bytes(m.selector()))
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_else(|| String::from("?"))
     }
@@ -3676,12 +3664,12 @@ impl Vm {
                 .heap
                 .behavior(application)
                 .expect("class")
-                .enclosing_object;
+                .enclosing_object();
             mixin = self
                 .heap
                 .mixin(mixin)
                 .ok_or_else(|| VmError::Malformed("mixin expected"))?
-                .enclosing_mixin;
+                .enclosing_mixin();
         }
         Ok(receiver)
     }
@@ -4213,18 +4201,15 @@ impl Vm {
                     op::POP_INTO_INDIRECT_LOCAL => Some(self.pop()?),
                     _ => Some(self.top()?),
                 };
-                let ok = match self
-                    .heap
-                    .get_mut(vector)
-                    .map(|o| (&mut o.body, o.header.flags))
-                {
-                    Some((Body::Array(elements), flags)) if index < elements.len() => match value {
+                let frozen = value.is_some() && self.heap.flags(vector) & FROZEN != 0;
+                let ok = match self.heap.array_elements_mut(vector) {
+                    Some(elements) if index < elements.len() => match value {
                         None => {
                             let v = elements[index];
                             self.stack.push(v);
                             true
                         }
-                        Some(_) if flags & FROZEN != 0 => false,
+                        Some(_) if frozen => false,
                         Some(v) => {
                             elements[index] = v;
                             true
@@ -4273,20 +4258,19 @@ impl Vm {
                 {
                     return Err(self.invalid());
                 }
-                let copied = self.stack.split_off(self.stack.len() - copied_count);
                 let top = self.frames.len() - 1;
                 let defining = self.ensure_activation(top);
                 let class = self.roles.get(Role::ClosureClass);
-                let closure = self.heap.allocate(
+                let from = self.stack.len() - copied_count;
+                let closure = self.heap.allocate_closure(
                     class,
                     Space::Actor(self.current as u32),
-                    Body::Closure(crate::object::Closure {
-                        defining,
-                        initial_ip: next as u32,
-                        num_args,
-                        copied,
-                    }),
+                    defining,
+                    next as u32,
+                    num_args,
+                    &self.stack[from..],
                 );
+                self.stack.truncate(from);
                 self.stack.push(closure);
                 self.frames.last_mut().expect("a frame").ip = next + length;
                 None
@@ -4336,7 +4320,7 @@ impl HostCallbacks for Vm {
         let arity = self
             .heap
             .closure(closure)
-            .map_or(0, |c| c.num_args as usize);
+            .map_or(0, |c| c.num_args() as usize);
         let mut values: Vec<Value> = args
             .iter()
             .take(arity)

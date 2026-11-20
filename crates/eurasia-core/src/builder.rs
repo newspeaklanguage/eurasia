@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use crate::bytecode::COMMON_SELECTORS;
 use crate::natives::Native;
 use crate::object::{
-    Access, Behavior, Body, FROZEN, Heap, Method, MethodHeader, MethodKind, Mixin, Space,
+    Access, Behavior, Body, FROZEN, Format, Heap, Method, MethodHeader, MethodKind, Mixin, Space,
 };
 use crate::roles::{Role, Roles};
 use crate::value::Value;
@@ -81,7 +81,7 @@ impl ImageBuilder {
         b.metaclass_class = b.define_class("Metaclass", nil);
         b.object = b.define_class("Object", nil);
         let undefined = b.define_class("UndefinedObject", b.object);
-        b.heap.get_mut(nil).expect("nil").header.class = undefined;
+        b.heap.set_class(nil, undefined);
         let true_class = b.define_class("True", b.object);
         let false_class = b.define_class("False", b.object);
         b.true_ = b
@@ -118,16 +118,15 @@ impl ImageBuilder {
         // Strings and arrays allocated before their classes existed get them now.
         let fix: Vec<(Value, bool)> = b
             .heap
-            .iter()
-            .filter_map(|(v, o)| match o.body {
-                Body::String(_) => Some((v, true)),
-                Body::Array(_) => Some((v, false)),
+            .objects()
+            .filter_map(|v| match b.heap.format(v) {
+                Some(Format::String) => Some((v, true)),
+                Some(Format::Array) => Some((v, false)),
                 _ => None,
             })
             .collect();
         for (v, is_string) in fix {
-            b.heap.get_mut(v).expect("object").header.class =
-                if is_string { string } else { array };
+            b.heap.set_class(v, if is_string { string } else { array });
         }
         let mut table = Vec::new();
         for (selector, arity) in COMMON_SELECTORS {
@@ -162,7 +161,7 @@ impl ImageBuilder {
         let v = self
             .heap
             .allocate(class, Space::Program, Body::String(s.as_bytes().to_vec()));
-        self.heap.get_mut(v).expect("string").header.flags = FROZEN;
+        self.heap.set_flags(v, FROZEN);
         v
     }
 
@@ -179,13 +178,11 @@ impl ImageBuilder {
         let name_string = self.string(name);
         let mixin = self.new_mixin(name_string, self.nil);
         let meta_mixin = self.new_mixin(name_string, self.nil);
-        if let Some(Body::Mixin(m)) = self.heap.get_mut(mixin).map(|o| &mut o.body) {
-            m.class_mixin = meta_mixin;
-        }
+        self.heap.set_mixin_field(mixin, 4, meta_mixin, 0);
         let meta_super = if superclass == self.nil {
             self.nil
         } else {
-            self.heap.get(superclass).expect("superclass").header.class
+            self.heap.class(superclass).expect("superclass")
         };
         let metaclass = self.heap.allocate(
             self.metaclass_class,
@@ -211,17 +208,11 @@ impl ImageBuilder {
                 library: self.nil,
             }),
         );
-        if let Some(Body::Metaclass(b)) = self.heap.get_mut(metaclass).map(|o| &mut o.body) {
-            b.this_class = class;
-        }
+        self.heap.set_this_class(metaclass, class);
         if self.metaclass_class == self.nil {
             // The first class defined is Metaclass itself.
             self.metaclass_class = class;
-            self.heap
-                .get_mut(metaclass)
-                .expect("metaclass")
-                .header
-                .class = class;
+            self.heap.set_class(metaclass, class);
         }
         class
     }
@@ -242,21 +233,19 @@ impl ImageBuilder {
                 library: self.nil,
             }),
         );
-        self.heap.get_mut(v).expect("mixin").header.flags = FROZEN;
+        self.heap.set_flags(v, FROZEN);
         v
     }
 
     /// Declares `count` slots in `class`'s mixin.
     pub fn set_slot_count(&mut self, class: Value, count: u32) {
         let mixin = self.mixin_of(class);
-        if let Some(Body::Mixin(m)) = self.heap.get_mut(mixin).map(|o| &mut o.body) {
-            m.slot_count = count;
-        }
+        self.heap.set_mixin_slot_count(mixin, count);
     }
 
     /// The mixin of `class`.
     pub fn mixin_of(&self, class: Value) -> Value {
-        self.heap.behavior(class).expect("class").mixin
+        self.heap.behavior(class).expect("class").mixin()
     }
 
     /// Adds a method to `class`'s mixin.
@@ -319,11 +308,13 @@ impl ImageBuilder {
                 library: self.nil,
             }),
         );
-        self.heap.get_mut(m).expect("method").header.flags = FROZEN;
-        let methods = self.heap.mixin(mixin).expect("mixin").methods;
-        if let Some(Body::Array(elements)) = self.heap.get_mut(methods).map(|o| &mut o.body) {
-            elements.push(m);
-        }
+        self.heap.set_flags(m, FROZEN);
+        // Arrays do not grow: the mixin gets a longer one.
+        let old = self.heap.mixin(mixin).expect("mixin").methods();
+        let mut elements = self.heap.array_elements(old).expect("an array").to_vec();
+        elements.push(m);
+        let methods = self.array(elements);
+        self.heap.set_mixin_field(mixin, 1, methods, 0);
         m
     }
 

@@ -8,8 +8,10 @@
 //! observations of everything else, and drops it. Survivors keep their
 //! allocation order and their sequence numbers, so identity order and
 //! identity hashes (`eq:kernel-identity-hash`) are unchanged and no identity
-//! is ever reused (`eq:gc-wrapper-state`); only arena indices change, and
-//! every reference is rewritten through a [`Forwarding`].
+//! is ever reused (`eq:gc-wrapper-state`); only arena offsets change, and
+//! every reference is rewritten through a [`Forwarding`]. Survivors slide
+//! down the arena in place; the byte space and the code table are compacted
+//! with them.
 //!
 //! Weakness (`eq:gc-roots-and-successors`, `eq:gc-reachability`):
 //! - a WeakArray's elements are weak; an element whose object is collected
@@ -23,30 +25,46 @@
 //! safepoints the interpreter chooses (between instructions, and inside
 //! `vm garbageCollect`), never inside a native.
 
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::object::{Body, FROZEN, Heap, SHARED, Space, VALUE};
+use crate::object::{Code, FROZEN, Format, HEADER, Heap, SHARED, Space, VALUE};
 use crate::value::Value;
 
-/// Where each object of a collected heap went.
+/// Where each object of a collected heap went: a compressor's tables. A
+/// bit per arena word, set over every surviving object's words, and for
+/// each block of 64 words the number of surviving words before it; an
+/// object's new offset is its block's count plus the surviving words before
+/// it in its block.
 pub struct Forwarding {
-    /// Old arena index to new arena index; `u64::MAX` for a collected object.
-    new_index: Vec<u64>,
+    live: Vec<u64>,
+    base: Vec<u64>,
 }
 
-/// Marks an object dropped by the collection.
-const COLLECTED: u64 = u64::MAX;
-
 impl Forwarding {
+    #[inline]
+    fn is_live(&self, o: usize) -> bool {
+        self.live[o / 64] & (1 << (o % 64)) != 0
+    }
+
+    #[inline]
+    fn new_offset(&self, o: usize) -> u64 {
+        let below = self.live[o / 64] & ((1u64 << (o % 64)) - 1);
+        self.base[o / 64] + u64::from(below.count_ones())
+    }
+
     /// The value after the collection. A reference to a collected object is
     /// a VM bug: roots and strong fields always survive.
+    #[inline]
     pub fn forward(&self, v: Value) -> Value {
         match v.as_reference() {
             Some(i) => {
-                let n = self.new_index[i as usize];
-                debug_assert_ne!(n, COLLECTED, "a reference to a collected object");
-                Value::reference(n).expect("index in range")
+                debug_assert!(
+                    self.is_live(i as usize),
+                    "a reference to a collected object"
+                );
+                Value::reference(self.new_offset(i as usize)).expect("offset in range")
             }
             None => v,
         }
@@ -54,8 +72,7 @@ impl Forwarding {
 
     /// Whether the object `v` referred to survived (immediates always do).
     pub fn survived(&self, v: Value) -> bool {
-        v.as_reference()
-            .is_none_or(|i| self.new_index[i as usize] != COLLECTED)
+        v.as_reference().is_none_or(|i| self.is_live(i as usize))
     }
 }
 
@@ -68,60 +85,6 @@ pub struct Statistics {
     pub after: usize,
 }
 
-/// Calls `f` on every strong reference field of `body`: not a WeakArray's
-/// elements, nor an Ephemeron's fields (the marker treats those itself).
-fn for_each_strong(body: &Body, mut f: impl FnMut(Value)) {
-    match body {
-        Body::Regular(e) | Body::Array(e) => e.iter().copied().for_each(f),
-        Body::WeakArray(_) | Body::Ephemeron { .. } => {}
-        Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => {}
-        Body::Method(m) => [m.literals, m.mixin, m.selector, m.source, m.library]
-            .into_iter()
-            .for_each(f),
-        Body::Mixin(m) => [
-            m.name,
-            m.methods,
-            m.enclosing_mixin,
-            m.slot_names,
-            m.class_mixin,
-            m.library,
-        ]
-        .into_iter()
-        .for_each(f),
-        Body::Class(b) | Body::Metaclass(b) => [
-            b.mixin,
-            b.superclass,
-            b.enclosing_object,
-            b.name,
-            b.this_class,
-            b.library,
-        ]
-        .into_iter()
-        .for_each(f),
-        Body::Closure(c) => {
-            f(c.defining);
-            c.copied.iter().copied().for_each(f);
-        }
-        Body::Activation(a) => {
-            [a.method, a.receiver, a.closure]
-                .into_iter()
-                .for_each(&mut f);
-            if let Some(d) = &a.detached {
-                f(d.sender);
-                f(d.bci);
-                d.temps.iter().copied().for_each(f);
-            }
-        }
-        Body::FarRef { target, .. } => f(*target),
-        Body::Promise(p) => {
-            f(p.value);
-            f(p.owner);
-            p.waiters.iter().copied().for_each(&mut f);
-            p.queue.iter().copied().for_each(f);
-        }
-    }
-}
-
 impl Heap {
     /// Forwards identities (`vm commit:`'s forwarding pairs): every
     /// reference to an object that `forward` maps is replaced by its image,
@@ -129,121 +92,52 @@ impl Heap {
     /// frames already running keep their code (`reflection-semantics.tex`,
     /// the observation table).
     pub fn forward_identities(&mut self, forward: &impl Fn(Value) -> Value) {
-        for object in &mut self.objects {
-            object.header.class = forward(object.header.class);
-            match &mut object.body {
-                Body::Activation(a) => {
-                    a.receiver = forward(a.receiver);
-                    a.closure = forward(a.closure);
-                    if let Some(d) = &mut a.detached {
-                        d.sender = forward(d.sender);
-                        d.temps.iter_mut().for_each(|v| *v = forward(*v));
-                    }
+        for v in self.objects() {
+            let o = self.start(v).expect("an object");
+            self.words[o] = forward(self.words[o]);
+            let code = self.code_at(o);
+            if !code.has_references() {
+                continue;
+            }
+            for (i, w) in self.contents_mut(o).iter_mut().enumerate() {
+                if !(code == Code::Activation && i == 1) {
+                    *w = forward(*w);
                 }
-                body => map_all(body, forward),
             }
         }
     }
 }
 
-/// Rewrites every reference field of `body`, weak ones included.
-fn map_all(body: &mut Body, f: &impl Fn(Value) -> Value) {
-    let each = |e: &mut Vec<Value>| e.iter_mut().for_each(|v| *v = f(*v));
-    match body {
-        Body::Regular(e) | Body::Array(e) | Body::WeakArray(e) => each(e),
-        Body::Ephemeron {
-            key,
-            value,
-            finalizer,
-        } => {
-            *key = f(*key);
-            *value = f(*value);
-            *finalizer = f(*finalizer);
-        }
-        Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => {}
-        Body::Method(m) => {
-            for v in [
-                &mut m.literals,
-                &mut m.mixin,
-                &mut m.selector,
-                &mut m.source,
-                &mut m.library,
-            ] {
-                *v = f(*v);
-            }
-        }
-        Body::Mixin(m) => {
-            for v in [
-                &mut m.name,
-                &mut m.methods,
-                &mut m.enclosing_mixin,
-                &mut m.slot_names,
-                &mut m.class_mixin,
-                &mut m.library,
-            ] {
-                *v = f(*v);
-            }
-        }
-        Body::Class(b) | Body::Metaclass(b) => {
-            for v in [
-                &mut b.mixin,
-                &mut b.superclass,
-                &mut b.enclosing_object,
-                &mut b.name,
-                &mut b.this_class,
-                &mut b.library,
-            ] {
-                *v = f(*v);
-            }
-        }
-        Body::Closure(c) => {
-            c.defining = f(c.defining);
-            each(&mut c.copied);
-        }
-        Body::Activation(a) => {
-            a.method = f(a.method);
-            a.receiver = f(a.receiver);
-            a.closure = f(a.closure);
-            if let Some(d) = &mut a.detached {
-                d.sender = f(d.sender);
-                d.bci = f(d.bci);
-                each(&mut d.temps);
-            }
-        }
-        Body::FarRef { target, .. } => *target = f(*target),
-        Body::Promise(p) => {
-            p.value = f(p.value);
-            p.owner = f(p.owner);
-            each(&mut p.waiters);
-            each(&mut p.queue);
-        }
-    }
-}
-
-/// The marker's state: the strongly reachable set and the objects still to
-/// scan.
+/// The marker's state: the strongly reachable set (by word offset) and the
+/// objects still to scan.
 struct Marker {
-    marked: Vec<bool>,
+    /// A bit per arena word: set at the start of every marked object.
+    marked: Vec<u64>,
     work: Vec<usize>,
 }
 
 impl Marker {
-    fn mark(&mut self, v: Value) {
-        if let Some(i) = v.as_reference() {
-            let i = i as usize;
-            if let Some(m) = self.marked.get_mut(i)
-                && !*m
-            {
-                *m = true;
-                self.work.push(i);
-            }
+    #[inline]
+    fn bit(&self, o: usize) -> bool {
+        self.marked[o / 64] & (1 << (o % 64)) != 0
+    }
+
+    #[inline]
+    fn mark(&mut self, heap: &Heap, v: Value) {
+        if let Some(o) = heap.start(v)
+            && !self.bit(o)
+        {
+            self.marked[o / 64] |= 1 << (o % 64);
+            self.work.push(o);
         }
     }
 
     /// Whether `v` is strongly reachable so far (immediates always are).
     fn is_marked(&self, v: Value) -> bool {
-        v.as_reference()
-            .is_none_or(|i| self.marked.get(i as usize).copied().unwrap_or(true))
+        v.as_reference().is_none_or(|i| {
+            let i = i as usize;
+            i / 64 >= self.marked.len() || self.bit(i)
+        })
     }
 }
 
@@ -273,59 +167,51 @@ impl Heap {
         nil: Value,
         keep_weak: bool,
     ) -> (Forwarding, Statistics) {
-        let n = self.objects.len();
+        let before = self.count;
+        let blocks = self.words.len().div_ceil(64);
         let mut m = Marker {
-            marked: vec![false; n],
+            marked: vec![0; blocks],
             work: Vec::new(),
         };
-        m.mark(nil);
-        roots.iter().for_each(|&v| m.mark(v));
+        m.mark(self, nil);
+        roots.iter().for_each(|&v| m.mark(self, v));
         // Ephemerons whose key is not (yet) known to be reachable.
         let mut pending: Vec<usize> = Vec::new();
         loop {
-            while let Some(i) = m.work.pop() {
-                let object = &self.objects[i];
-                m.mark(object.header.class);
-                match &object.body {
-                    Body::Ephemeron {
-                        key,
-                        value,
-                        finalizer,
-                    } => {
+            while let Some(o) = m.work.pop() {
+                m.mark(self, self.words[o]);
+                match self.code_at(o) {
+                    Code::Ephemeron => {
+                        let c = self.contents(o);
+                        let (key, value, finalizer) = (c[0], c[1], c[2]);
                         if keep_weak {
-                            m.mark(*key);
+                            m.mark(self, key);
                         }
-                        if m.is_marked(*key) {
-                            m.mark(*value);
-                            m.mark(*finalizer);
+                        if m.is_marked(key) {
+                            m.mark(self, value);
+                            m.mark(self, finalizer);
                         } else {
-                            pending.push(i);
+                            pending.push(o);
                         }
                     }
-                    body => {
-                        let mut refs = Vec::new();
-                        for_each_strong(body, |v| refs.push(v));
-                        if keep_weak && let Body::WeakArray(e) = body {
-                            refs.extend(e.iter().copied());
+                    Code::WeakArray if !keep_weak => {}
+                    code if code.has_references() => {
+                        let n = self.contents(o).len();
+                        for i in 0..n {
+                            let v = self.words[o + HEADER + i];
+                            m.mark(self, v);
                         }
-                        refs.into_iter().for_each(|v| m.mark(v));
                     }
+                    _ => {}
                 }
             }
             // An ephemeron whose key has become reachable enables its value.
             let mut enabled = Vec::new();
-            pending.retain(|&i| {
-                let Body::Ephemeron {
-                    key,
-                    value,
-                    finalizer,
-                } = &self.objects[i].body
-                else {
-                    unreachable!("pending ephemerons are ephemerons")
-                };
-                if m.is_marked(*key) {
-                    enabled.push(*value);
-                    enabled.push(*finalizer);
+            pending.retain(|&o| {
+                let c = self.contents(o);
+                if m.is_marked(c[0]) {
+                    enabled.push(c[1]);
+                    enabled.push(c[2]);
                     false
                 } else {
                     true
@@ -334,65 +220,106 @@ impl Heap {
             if enabled.is_empty() {
                 break;
             }
-            enabled.into_iter().for_each(|v| m.mark(v));
+            enabled.into_iter().for_each(|v| m.mark(self, v));
         }
 
         // Clear weak observations of collected objects.
-        for &i in &pending {
-            if let Body::Ephemeron {
-                key,
-                value,
-                finalizer,
-            } = &mut self.objects[i].body
-            {
-                *key = nil;
-                *value = nil;
-                *finalizer = nil;
-            }
+        for &o in &pending {
+            self.contents_mut(o).fill(nil);
         }
-        let marked = m.marked;
-        let alive = |v: Value| {
-            v.as_reference()
-                .is_none_or(|i| marked.get(i as usize).copied().unwrap_or(true))
-        };
-        for (i, object) in self.objects.iter_mut().enumerate() {
-            if marked[i]
-                && let Body::WeakArray(e) = &mut object.body
-            {
-                for v in e.iter_mut() {
-                    if !alive(*v) {
-                        *v = nil;
+        // The live words: every word of every marked object. Weak arrays'
+        // collected elements become nil on the way.
+        let mut live = vec![0u64; blocks];
+        let mut o = 0;
+        while o < self.words.len() {
+            let n = self.object_words(o);
+            if m.bit(o) {
+                if self.code_at(o) == Code::WeakArray {
+                    for w in &mut self.words[o + HEADER..o + n] {
+                        if !m.is_marked(*w) {
+                            *w = nil;
+                        }
                     }
                 }
+                set_bits(&mut live, o, o + n);
             }
+            o += n;
         }
+        let mut base = Vec::with_capacity(blocks);
+        let mut total = 0u64;
+        for &bits in &live {
+            base.push(total);
+            total += u64::from(bits.count_ones());
+        }
+        let forwarding = Forwarding { live, base };
 
-        // Keep the survivors in allocation order and rewrite references.
-        let mut new_index = vec![COLLECTED; n];
-        let mut next = 0u64;
-        for (i, &keep) in marked.iter().enumerate() {
-            if keep {
-                new_index[i] = next;
-                next += 1;
+        // Slide the survivors down, compacting bytes and codes with them.
+        let mut bytes = Vec::new();
+        let mut codes = Vec::new();
+        let mut count = 0;
+        let mut o = 0;
+        let end = self.words.len();
+        while o < end {
+            let n = self.object_words(o);
+            if forwarding.is_live(o) {
+                let to = forwarding.new_offset(o) as usize;
+                let code = self.code_at(o);
+                self.words.copy_within(o..o + n, to);
+                if code.is_bytes() {
+                    let range = self.byte_range(to);
+                    let at = bytes.len();
+                    bytes.extend_from_slice(&self.bytes[range]);
+                    self.words[to + HEADER] = Value::small_integer(at as i64).expect("small");
+                } else if code == Code::Method {
+                    let c = self.words[to + HEADER + 7];
+                    let i = c.as_small_integer().expect("a code index") as usize;
+                    self.words[to + HEADER + 7] =
+                        Value::small_integer(codes.len() as i64).expect("small");
+                    codes.push(self.codes[i].clone());
+                }
+                count += 1;
             }
+            o += n;
         }
-        let forwarding = Forwarding { new_index };
-        let old = core::mem::take(&mut self.objects);
-        self.objects = old
-            .into_iter()
-            .zip(marked.iter())
-            .filter_map(|(o, &keep)| keep.then_some(o))
-            .collect();
+        self.words.truncate(total as usize);
+        self.bytes = bytes;
+        self.codes = codes;
+        self.count = count;
+        // Rewrite references.
         let forward = |v: Value| forwarding.forward(v);
-        for object in &mut self.objects {
-            object.header.class = forward(object.header.class);
-            map_all(&mut object.body, &forward);
+        let mut o = 0;
+        while o < self.words.len() {
+            self.words[o] = forward(self.words[o]);
+            let n = self.object_words(o);
+            if self.code_at(o).has_references() {
+                for w in &mut self.words[o + HEADER..o + n] {
+                    *w = forward(*w);
+                }
+            }
+            o += n;
         }
         let statistics = Statistics {
-            before: n,
-            after: self.objects.len(),
+            before,
+            after: self.count,
         };
         (forwarding, statistics)
+    }
+}
+
+/// Sets bits `from` to `to` (exclusive) of `bits`.
+fn set_bits(bits: &mut [u64], from: usize, to: usize) {
+    let mut i = from;
+    while i < to {
+        let w = i / 64;
+        let lo = i % 64;
+        let hi = (to - w * 64).min(64);
+        let mask = if hi - lo == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << (hi - lo)) - 1) << lo
+        };
+        bits[w] |= mask;
+        i = w * 64 + hi;
     }
 }
 
@@ -409,94 +336,83 @@ impl Heap {
     /// are copied like strong ones (a template is never collected into).
     /// Answers the copy of `root`, or `root` itself if it is shared.
     pub fn clone_graph(&mut self, root: Value, space: Space) -> Value {
-        let n = self.objects.len();
-        let mut copy_of: Vec<u64> = vec![COLLECTED; n];
+        let mut seen: BTreeMap<usize, ()> = BTreeMap::new();
         // Breadth first; `order` is both the queue and the discovery order.
         let mut order: Vec<usize> = Vec::new();
-        let visit = |v: Value, heap: &Heap, copy_of: &mut Vec<u64>, order: &mut Vec<usize>| {
-            if let Some(i) = v.as_reference() {
-                let i = i as usize;
-                if i < n && copy_of[i] == COLLECTED && !heap.is_shared(i) {
-                    copy_of[i] = 0;
-                    order.push(i);
+        let visit =
+            |v: Value, heap: &Heap, seen: &mut BTreeMap<usize, ()>, order: &mut Vec<usize>| {
+                if let Some(o) = heap.start(v)
+                    && !seen.contains_key(&o)
+                    && !heap.is_shared(o)
+                {
+                    seen.insert(o, ());
+                    order.push(o);
                 }
-            }
-        };
-        visit(root, self, &mut copy_of, &mut order);
+            };
+        visit(root, self, &mut seen, &mut order);
         let mut head = 0;
         while head < order.len() {
-            let i = order[head];
+            let o = order[head];
             head += 1;
-            let object = &self.objects[i];
-            let mut refs = Vec::new();
-            refs.push(object.header.class);
-            every_reference(&object.body, |v| refs.push(v));
+            let mut refs = alloc::vec![self.words[o]];
+            if self.code_at(o).has_references() {
+                refs.extend_from_slice(self.contents(o));
+            }
             for v in refs {
-                visit(v, self, &mut copy_of, &mut order);
+                visit(v, self, &mut seen, &mut order);
             }
         }
         // Allocate the copies, in discovery order, then rewrite them.
-        let mut new_index: Vec<u64> = (0..n as u64).collect();
-        for &i in &order {
-            let original = self.objects[i].clone();
+        let mut copy_of: BTreeMap<u64, Value> = BTreeMap::new();
+        let mut copies = Vec::with_capacity(order.len());
+        for &o in &order {
+            let v = Value::reference(o as u64).expect("in range");
+            let original = self.object(v).expect("an object");
             let copy = self.allocate(original.header.class, space, original.body);
-            if let Some(o) = self.get_mut(copy) {
-                o.header.flags = original.header.flags;
-            }
-            new_index[i] = copy.as_reference().expect("a reference");
+            self.set_flags(copy, original.header.flags);
+            copy_of.insert(o as u64, copy);
+            copies.push(copy);
         }
         let forward = |v: Value| match v.as_reference() {
-            Some(i) if (i as usize) < n => {
-                Value::reference(new_index[i as usize]).expect("in range")
-            }
-            _ => v,
+            Some(i) => copy_of.get(&i).copied().unwrap_or(v),
+            None => v,
         };
-        for &i in &order {
-            let k = new_index[i] as usize;
-            let object = &mut self.objects[k];
-            object.header.class = forward(object.header.class);
-            map_all(&mut object.body, &forward);
+        for copy in copies {
+            let o = self.start(copy).expect("a copy");
+            self.words[o] = forward(self.words[o]);
+            if self.code_at(o).has_references() {
+                for w in self.contents_mut(o) {
+                    *w = forward(*w);
+                }
+            }
         }
         forward(root)
     }
 
-    /// Whether object `i` is shared by every actor rather than copied with
+    /// Whether object `o` is shared by every actor rather than copied with
     /// a platform (see [`Heap::clone_graph`]).
-    fn is_shared(&self, i: usize) -> bool {
-        let object = &self.objects[i];
-        if object.header.flags & (FROZEN | VALUE | SHARED) != 0
-            || object.header.space == Space::Program
-        {
+    fn is_shared(&self, o: usize) -> bool {
+        let v = Value::reference(o as u64).expect("in range");
+        if self.flags(v) & (FROZEN | VALUE | SHARED) != 0 || self.space(v) == Some(Space::Program) {
             return true;
         }
-        match &object.body {
-            Body::Method(_) | Body::Mixin(_) | Body::FarRef { .. } | Body::Promise(_) => true,
-            Body::Class(b) | Body::Metaclass(b) => match b.enclosing_object.as_reference() {
-                Some(e) => (e as usize) == i || self.is_shared(e as usize),
-                None => true,
-            },
+        match self.format(v) {
+            Some(Format::Method | Format::Mixin | Format::FarRef | Format::Promise) => true,
+            Some(Format::Class | Format::Metaclass) => {
+                match self.start(self.behavior(v).expect("a class").enclosing_object()) {
+                    Some(e) => e == o || self.is_shared(e),
+                    None => true,
+                }
+            }
             _ => false,
         }
-    }
-}
-
-/// Calls `f` on every reference field of `body`, weak ones included.
-fn every_reference(body: &Body, f: impl FnMut(Value)) {
-    match body {
-        Body::WeakArray(e) => e.iter().copied().for_each(f),
-        Body::Ephemeron {
-            key,
-            value,
-            finalizer,
-        } => [*key, *value, *finalizer].into_iter().for_each(f),
-        other => for_each_strong(other, f),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object::Space;
+    use crate::object::{Body, Space};
 
     /// A heap whose object 0 is nil and object 1 a class for everything.
     fn heap() -> (Heap, Value, Value) {
@@ -515,18 +431,16 @@ mod tests {
     }
 
     fn seq(h: &Heap, v: Value) -> u64 {
-        h.get(v).unwrap().header.seq
+        h.seq(v).unwrap()
     }
 
     #[test]
     fn unreachable_objects_and_cycles_go_and_survivors_keep_their_identity() {
         let (mut h, nil, class) = heap();
         let kept = object(&mut h, class, Vec::new());
-        let a = object(&mut h, class, Vec::new());
+        let a = object(&mut h, class, alloc::vec![nil]);
         let b = object(&mut h, class, alloc::vec![a]);
-        if let Body::Regular(s) = &mut h.get_mut(a).unwrap().body {
-            s.push(b); // a cycle with no root
-        }
+        h.regular_slots_mut(a).unwrap()[0] = b; // a cycle with no root
         let root = object(&mut h, class, alloc::vec![kept]);
         let (root_seq, kept_seq) = (seq(&h, root), seq(&h, kept));
         let (fwd, stats) = h.collect(&[class, root], nil);
@@ -534,9 +448,7 @@ mod tests {
         assert!(!fwd.survived(a) && !fwd.survived(b));
         let root = fwd.forward(root);
         assert_eq!(seq(&h, root), root_seq);
-        let Body::Regular(s) = &h.get(root).unwrap().body else {
-            panic!()
-        };
+        let s = h.regular_slots(root).unwrap();
         assert_eq!(seq(&h, s[0]), kept_seq);
         // Allocation continues after the highest sequence number ever used.
         let fresh = object(&mut h, class, Vec::new());
@@ -554,9 +466,7 @@ mod tests {
             Body::WeakArray(alloc::vec![gone, kept, Value::small_integer(7).unwrap()]),
         );
         let (fwd, _) = h.collect(&[weak, kept], nil);
-        let Body::WeakArray(e) = &h.get(fwd.forward(weak)).unwrap().body else {
-            panic!()
-        };
+        let e = h.fields(fwd.forward(weak)).unwrap();
         assert_eq!(e[0], fwd.forward(nil));
         assert_eq!(e[1], fwd.forward(kept));
         assert_eq!(e[2], Value::small_integer(7).unwrap());
@@ -575,10 +485,8 @@ mod tests {
     }
 
     fn fields(h: &Heap, e: Value) -> (Value, Value) {
-        let Body::Ephemeron { key, value, .. } = &h.get(e).unwrap().body else {
-            panic!()
-        };
-        (*key, *value)
+        let [key, value, _] = h.ephemeron(e).unwrap();
+        (key, value)
     }
 
     #[test]

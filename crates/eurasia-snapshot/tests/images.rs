@@ -57,13 +57,13 @@ fn loading_preserves_sequence_numbers_and_the_allocation_counter() {
     let bytes = write_image(&heap, &roles, None);
     let (loaded, loaded_roles) = read_image(&bytes).expect("loads");
     assert_eq!(loaded.allocation_counter(), heap.allocation_counter());
-    let original: Vec<u64> = heap.iter().map(|(_, o)| o.header.seq).collect();
-    let after: Vec<u64> = loaded.iter().map(|(_, o)| o.header.seq).collect();
+    let original: Vec<u64> = heap.objects().map(|v| heap.seq(v).unwrap()).collect();
+    let after: Vec<u64> = loaded.objects().map(|v| loaded.seq(v).unwrap()).collect();
     assert_eq!(original, after);
     // Same objects in the same places, so roles map to the same sequence numbers.
     for &role in Role::ALL {
-        let a = heap.get(roles.get(role)).map(|o| o.header.seq);
-        let b = loaded.get(loaded_roles.get(role)).map(|o| o.header.seq);
+        let a = heap.seq(roles.get(role));
+        let b = loaded.seq(loaded_roles.get(role));
         assert_eq!(a, b, "{role:?}");
     }
 }
@@ -151,13 +151,13 @@ fn closures_and_dead_activations_round_trip() {
     let c = loaded
         .closure(closure)
         .expect("the closure, at the same index");
-    assert_eq!((c.initial_ip, c.num_args, c.copied.len()), (4, 1, 2));
-    assert_eq!(c.copied[0], Value::small_integer(7).unwrap());
+    assert_eq!((c.initial_ip(), c.num_args(), c.copied().len()), (4, 1, 2));
+    assert_eq!(c.copied()[0], Value::small_integer(7).unwrap());
     assert!(
         loaded
-            .activation(c.defining)
+            .activation(c.defining())
             .expect("activation")
-            .frame
+            .frame()
             .is_none()
     );
 }
@@ -185,6 +185,12 @@ fn checkpoints_keep_frames_and_detached_activations() {
             detached: None,
         }),
     );
+    let array_class = b.role(Role::ArrayClass).unwrap();
+    let temps = b.heap.allocate(
+        array_class,
+        Space::Actor(0),
+        Body::Array(vec![seven, nil, live]),
+    );
     let detached = b.heap.allocate(
         activation_class,
         Space::Actor(0),
@@ -196,7 +202,7 @@ fn checkpoints_keep_frames_and_detached_activations() {
             detached: Some(Detached {
                 sender: live,
                 bci: seven,
-                temps: vec![seven, nil, live],
+                temps,
             }),
         }),
     );
@@ -237,19 +243,14 @@ fn checkpoints_keep_frames_and_detached_activations() {
     let (loaded, roles2, machine) = read_checkpoint(&bytes).expect("loads");
     assert_eq!(machine.as_ref(), Some(&state));
     assert_eq!(write_image(&loaded, &roles2, machine.as_ref()), bytes);
-    assert_eq!(loaded.activation(live).unwrap().frame, Some(3));
-    let d = loaded
-        .activation(detached)
-        .unwrap()
-        .detached
-        .clone()
-        .unwrap();
+    assert_eq!(loaded.activation(live).unwrap().frame(), Some(3));
+    let d = loaded.activation(detached).unwrap().detached().unwrap();
     assert_eq!(
-        (d.sender, d.bci, d.temps),
+        (d.sender(), d.bci(), d.temps().to_vec()),
         (live, seven, vec![seven, nil, live])
     );
     // A snapshot (no machine state) saves a frame's handle dead.
     let (plain, _) = read_image(&write_image(&heap, &roles, None)).expect("loads");
-    assert_eq!(plain.activation(live).unwrap().frame, None);
-    assert!(plain.activation(detached).unwrap().detached.is_some());
+    assert_eq!(plain.activation(live).unwrap().frame(), None);
+    assert!(plain.activation(detached).unwrap().detached().is_some());
 }

@@ -198,7 +198,7 @@ fn invalid_bytecode_is_an_error_not_a_crash() {
 fn identity_hash_is_the_allocation_sequence_number() {
     let k = kernel();
     let (heap, _) = k.b.finish();
-    let mut seqs: Vec<u64> = heap.iter().map(|(_, o)| o.header.seq).collect();
+    let mut seqs: Vec<u64> = heap.objects().map(|v| heap.seq(v).unwrap()).collect();
     let sorted = {
         let mut s = seqs.clone();
         s.sort_unstable();

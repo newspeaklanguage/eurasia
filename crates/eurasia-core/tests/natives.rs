@@ -325,10 +325,8 @@ fn nan_results_are_canonical() {
     let mut w = world();
     let neg = w.float(-1.0);
     let nan = w.answer(Native::FloatSqrt, neg, &[]);
-    match w.heap.get(nan).unwrap().body {
-        Body::Float(f) => assert_eq!(f.to_bits(), f64::NAN.to_bits()),
-        _ => panic!("not a float"),
-    }
+    let f = w.heap.float(nan).expect("a float");
+    assert_eq!(f.to_bits(), f64::NAN.to_bits());
 }
 
 #[test]
@@ -367,7 +365,7 @@ fn allocation_and_indexed_access() {
         w.fails(Native::ClassBasicNew, array_class, &[]),
         Reason::NotInstantiable
     );
-    w.heap.get_mut(a).unwrap().header.flags = FROZEN;
+    w.heap.set_flags(a, FROZEN);
     assert_eq!(
         w.fails(Native::IndexedAtPut, a, &[si(1), si(1)]),
         Reason::WrongKind(0)
@@ -385,10 +383,7 @@ fn basic_new_sizes_instances_from_the_mixin_chain() {
     let (heap, roles) = b.finish();
     let mut w = World { heap, roles };
     let instance = w.answer(Native::ClassBasicNew, c, &[]);
-    match &w.heap.get(instance).unwrap().body {
-        Body::Regular(slots) => assert_eq!(slots.len(), 5),
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(w.heap.regular_slots(instance).expect("regular").len(), 5);
 }
 
 #[test]
@@ -409,7 +404,7 @@ fn copying_and_replacing() {
     );
     let bytes = w.answer(Native::CopyByteArrayFromTo, s, &[si(1), si(5)]);
     assert_eq!(
-        w.heap.get(bytes).unwrap().header.class,
+        w.heap.class(bytes).unwrap(),
         w.roles.get(Role::ByteArrayClass)
     );
     // Overlapping replace within one array.

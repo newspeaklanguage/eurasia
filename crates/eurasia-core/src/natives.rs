@@ -19,8 +19,8 @@ use core::cmp::Ordering;
 use crate::bigint::BigInt;
 use crate::host::{HOST_GLOBAL, Host, HostOp};
 use crate::object::{
-    Access, Behavior, Body, FROZEN, Heap, Method, MethodHeader, MethodKind, Mixin, PromiseRecord,
-    Space, VALUE, VALUE_CLASS,
+    Access, Behavior, Body, FROZEN, Format, Heap, Method, MethodHeader, MethodKind, Mixin,
+    PromiseRecord, Space, VALUE, VALUE_CLASS,
 };
 use crate::roles::{Role, Roles};
 use crate::value::{SmallInteger, Value};
@@ -235,7 +235,7 @@ natives! {
 /// instances get their layout from the mixins along the chain.
 pub fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Outcome {
     // An instance-side mixin: one whose class-side mixin is a mixin.
-    let Some((name, cm)) = ctx.heap.mixin(m).map(|x| (x.name, x.class_mixin)) else {
+    let Some((name, cm)) = ctx.heap.mixin(m).map(|x| (x.name(), x.class_mixin())) else {
         return Outcome::Fail(Reason::WrongKind(1));
     };
     if ctx.heap.mixin(cm).is_none() {
@@ -249,26 +249,26 @@ pub fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Ou
     } else {
         s
     };
-    let Some(Body::Class(_)) = ctx.heap.get(reference).map(|o| &o.body) else {
+    if ctx.heap.format(reference) != Some(Format::Class) {
         return Outcome::Fail(Reason::WrongKind(2));
-    };
-    let super_meta = ctx.heap.get(reference).expect("class").header.class;
-    let Some(super_meta_object) = ctx.heap.get(super_meta) else {
+    }
+    let super_meta = ctx.heap.class(reference).expect("class");
+    if ctx.heap.format(super_meta) != Some(Format::Metaclass) {
         return Outcome::Fail(Reason::WrongKind(2));
-    };
-    let metaclass_class = super_meta_object.header.class;
-    let Body::Metaclass(meta_behavior) = &super_meta_object.body else {
-        return Outcome::Fail(Reason::WrongKind(2));
-    };
-    let meta_super = meta_behavior.superclass;
+    }
+    let metaclass_class = ctx.heap.class(super_meta).expect("metaclass");
+    let meta_super = ctx
+        .heap
+        .behavior(super_meta)
+        .expect("metaclass")
+        .superclass();
     // A value class: the superclass is one (its chain includes Value). Its
     // enclosing object must be a value, and its mixin may declare no mutable
     // slot (a setter other than the private init` ones) (design doc section
     // 5: the checks happen at mixin application until the spec lets the
     // compiler know value classes).
-    let value_class = s != nil
-        && (ctx.heap.get(s).expect("class").header.flags & VALUE_CLASS != 0
-            || s == ctx.roles.get(Role::ValueClass));
+    let value_class =
+        s != nil && (ctx.heap.flags(s) & VALUE_CLASS != 0 || s == ctx.roles.get(Role::ValueClass));
     if value_class {
         if !ctx.is_value(eo) {
             return Outcome::Fail(Reason::WrongKind(3));
@@ -303,12 +303,10 @@ pub fn apply_mixin(m: Value, s: Value, eo: Value, ctx: &mut NativeContext) -> Ou
             library: nil,
         }),
     );
-    if let Some(Body::Metaclass(b)) = ctx.heap.get_mut(metaclass).map(|o| &mut o.body) {
-        b.this_class = class;
-    }
+    ctx.heap.set_this_class(metaclass, class);
     // A class (and its metaclass) whose enclosing object is a value is one.
-    ctx.heap.get_mut(class).expect("class").header.flags |= class_flags;
-    ctx.heap.get_mut(metaclass).expect("metaclass").header.flags |= class_flags & VALUE;
+    ctx.heap.add_flags(class, class_flags);
+    ctx.heap.add_flags(metaclass, class_flags & VALUE);
     Outcome::Answer(class)
 }
 
@@ -320,7 +318,7 @@ pub fn new_far_reference(ctx: &mut NativeContext<'_>, actor: u32, target: Value)
     let r = ctx
         .heap
         .allocate(class, space, Body::FarRef { actor, target });
-    ctx.heap.get_mut(r).expect("new").header.flags |= VALUE;
+    ctx.heap.add_flags(r, VALUE);
     r
 }
 
@@ -345,14 +343,11 @@ fn alien_reference(ctx: &NativeContext<'_>, v: Value) -> Option<u32> {
 
 /// The host reference of an Alien, if `v` is one.
 pub fn alien_reference_in(heap: &Heap, roles: &Roles, v: Value) -> Option<u32> {
-    let o = heap.get(v)?;
-    if o.header.class != roles.get(Role::AlienClass) {
+    if heap.class(v)? != roles.get(Role::AlienClass) || heap.format(v)? != Format::Regular {
         return None;
     }
-    match &o.body {
-        Body::Regular(slots) if slots.len() == 1 => slots[0]
-            .as_small_integer()
-            .and_then(|r| u32::try_from(r).ok()),
+    match heap.fields(v)? {
+        [slot] => slot.as_small_integer().and_then(|r| u32::try_from(r).ok()),
         _ => None,
     }
 }
@@ -360,10 +355,9 @@ pub fn alien_reference_in(heap: &Heap, roles: &Roles, v: Value) -> Option<u32> {
 /// Whether `v` is an Alien that did not survive a restore into a new host
 /// ([`crate::Vm::restored_into_new_host`] gives it the reference -1).
 pub fn is_dead_alien(heap: &Heap, roles: &Roles, v: Value) -> bool {
-    heap.get(v).is_some_and(|o| {
-        o.header.class == roles.get(Role::AlienClass)
-            && matches!(&o.body, Body::Regular(s) if s.len() == 1 && s[0].as_small_integer() == Some(-1))
-    })
+    heap.class(v) == Some(roles.get(Role::AlienClass))
+        && heap.format(v) == Some(Format::Regular)
+        && matches!(heap.fields(v), Some([s]) if s.as_small_integer() == Some(-1))
 }
 
 /// The arguments of a host call: the `fixed` ones (indices 1, 2, ...), then
@@ -493,29 +487,22 @@ fn well_formed(bytes: &[u8]) -> bool {
 }
 
 /// The method `v`, if it is one and not frozen (installed).
-fn unfrozen_method<'h>(ctx: &'h mut NativeContext<'_>, v: Value) -> Option<&'h mut Method> {
-    let o = ctx.heap.get_mut(v)?;
-    if o.header.flags & FROZEN != 0 {
-        return None;
-    }
-    match &mut o.body {
-        Body::Method(m) => Some(m),
-        _ => None,
-    }
+fn is_unfrozen_method(ctx: &NativeContext<'_>, v: Value) -> bool {
+    ctx.heap.format(v) == Some(Format::Method) && ctx.heap.flags(v) & FROZEN == 0
 }
 
 /// Whether `v` is a promise record.
 pub fn is_promise(heap: &Heap, v: Value) -> bool {
-    matches!(heap.get(v).map(|o| &o.body), Some(Body::Promise(_)))
+    heap.format(v) == Some(Format::Promise)
 }
 
 /// The promise record at the end of `record`'s forwarding chain.
 pub fn last_promise(heap: &Heap, record: Value) -> Value {
     let mut r = record;
-    while let Some(Body::Promise(p)) = heap.get(r).map(|o| &o.body)
-        && p.state == PromiseRecord::FORWARDED
+    while let Some(p) = heap.promise(r)
+        && p.state() == PromiseRecord::FORWARDED
     {
-        r = p.value;
+        r = p.value();
     }
     r
 }
@@ -523,8 +510,8 @@ pub fn last_promise(heap: &Heap, record: Value) -> Value {
 /// `v`, in no actor's terms, as actor `actor` sees it: a far reference into
 /// it is its target (RR-Far-Home); anything else is itself.
 pub fn localize(heap: &Heap, v: Value, actor: u32) -> Value {
-    match heap.get(v).map(|o| &o.body) {
-        Some(Body::FarRef { actor: a, target }) if *a == actor => *target,
+    match heap.far_ref(v) {
+        Some((a, target)) if a == actor => target,
         _ => v,
     }
 }
@@ -534,14 +521,14 @@ pub fn localize(heap: &Heap, v: Value, actor: u32) -> Value {
 /// setters (`` X`slot: ``), which memoize a class; that class is a value when
 /// its enclosing object, the value being checked, is one.
 fn has_mutable_slot(heap: &Heap, m: Value) -> bool {
-    let Some(methods) = heap.mixin(m).and_then(|x| heap.array_elements(x.methods)) else {
+    let Some(methods) = heap.mixin(m).and_then(|x| heap.array_elements(x.methods())) else {
         return false;
     };
     methods.iter().any(|&method| {
         heap.method(method).is_some_and(|record| {
-            record.header.kind == crate::object::MethodKind::Setter
+            record.header().kind == crate::object::MethodKind::Setter
                 && !heap
-                    .string_bytes(record.selector)
+                    .string_bytes(record.selector())
                     .is_some_and(|s| s.starts_with(b"init`") || s.ends_with(b"`slot:"))
         })
     })
@@ -857,20 +844,12 @@ fn integer_of(heap: &Heap, v: Value) -> Option<BigInt> {
     if let Some(n) = v.as_small_integer() {
         return Some(BigInt::from_i64(n));
     }
-    match &heap.get(v)?.body {
-        Body::LargeInteger {
-            negative,
-            magnitude,
-        } => Some(BigInt::from_bytes(*negative, magnitude)),
-        _ => None,
-    }
+    let (negative, magnitude) = heap.large_integer(v)?;
+    Some(BigInt::from_bytes(negative, magnitude))
 }
 
 fn float_of(heap: &Heap, v: Value) -> Option<f64> {
-    match &heap.get(v)?.body {
-        Body::Float(f) => Some(*f),
-        _ => None,
-    }
+    heap.float(v)
 }
 
 fn number_of(heap: &Heap, v: Value) -> Option<Num> {
@@ -1217,42 +1196,67 @@ fn signed_exponent(s: String) -> String {
     }
 }
 
-/// The bytes of a String or ByteArray.
-fn bytes_of(heap: &Heap, v: Value) -> Option<&[u8]> {
-    match &heap.get(v)?.body {
-        Body::String(b) | Body::Bytes(b) => Some(b),
+/// The elements of an Array or WeakArray.
+fn elements(heap: &Heap, v: Value) -> Option<&[Value]> {
+    match heap.format(v)? {
+        Format::Array | Format::WeakArray => heap.fields(v),
         _ => None,
     }
+}
+
+/// The bytes of a String or ByteArray.
+fn bytes_of(heap: &Heap, v: Value) -> Option<&[u8]> {
+    heap.bytes(v)
 }
 
 /// The fields `vm slotOf:at:` reads: a regular object's slots, an
 /// ephemeron's key, value and finalizer, or a contract object's fields in the
 /// snapshot format's edge order (format section 5).
-pub(crate) fn readable_fields(body: &Body) -> Option<Vec<Value>> {
-    Some(match body {
-        Body::Regular(slots) => slots.clone(),
-        Body::Ephemeron {
-            key,
-            value,
-            finalizer,
-        } => alloc::vec![*key, *value, *finalizer],
-        Body::Class(b) => alloc::vec![b.mixin, b.superclass, b.enclosing_object, b.name, b.library],
-        Body::Metaclass(b) => alloc::vec![
-            b.mixin,
-            b.superclass,
-            b.enclosing_object,
-            b.this_class,
-            b.library
-        ],
-        Body::Mixin(m) => alloc::vec![
-            m.name,
-            m.methods,
-            m.enclosing_mixin,
-            m.slot_names,
-            m.class_mixin,
-            m.library
-        ],
-        Body::Method(m) => alloc::vec![m.literals, m.mixin, m.selector, m.source, m.library],
+pub(crate) fn readable_fields(heap: &Heap, v: Value) -> Option<Vec<Value>> {
+    Some(match heap.format(v)? {
+        Format::Regular => heap.fields(v)?.to_vec(),
+        Format::Ephemeron => heap.ephemeron(v)?.to_vec(),
+        Format::Class => {
+            let b = heap.behavior(v)?;
+            alloc::vec![
+                b.mixin(),
+                b.superclass(),
+                b.enclosing_object(),
+                b.name(),
+                b.library()
+            ]
+        }
+        Format::Metaclass => {
+            let b = heap.behavior(v)?;
+            alloc::vec![
+                b.mixin(),
+                b.superclass(),
+                b.enclosing_object(),
+                b.this_class(),
+                b.library()
+            ]
+        }
+        Format::Mixin => {
+            let m = heap.mixin(v)?;
+            alloc::vec![
+                m.name(),
+                m.methods(),
+                m.enclosing_mixin(),
+                m.slot_names(),
+                m.class_mixin(),
+                m.library()
+            ]
+        }
+        Format::Method => {
+            let m = heap.method(v)?;
+            alloc::vec![
+                m.literals(),
+                m.mixin(),
+                m.selector(),
+                m.source(),
+                m.library()
+            ]
+        }
         _ => return None,
     })
 }
@@ -1268,8 +1272,8 @@ fn instance_slots(heap: &Heap, roles: &Roles, class: Value) -> Option<usize> {
             return Some(total);
         }
         let b = heap.behavior(c)?;
-        total += heap.mixin(b.mixin)?.slot_count as usize;
-        c = b.superclass;
+        total += heap.mixin(b.mixin())?.slot_count() as usize;
+        c = b.superclass();
     }
     None
 }
@@ -1338,7 +1342,7 @@ fn selector_arity(selector: &[u8]) -> usize {
 
 fn activate_closure(receiver: Value, args: Vec<Value>, ctx: &NativeContext<'_>) -> Outcome {
     match ctx.heap.closure(receiver) {
-        Some(c) if c.num_args as usize == args.len() => Outcome::ActivateClosure {
+        Some(c) if c.num_args() as usize == args.len() => Outcome::ActivateClosure {
             closure: receiver,
             args,
         },
@@ -1405,13 +1409,14 @@ pub fn invoke(
             None => Outcome::Fail(Reason::WrongKind(0)),
         },
         Native::ObjectIdentical => Outcome::Answer(ctx.boolean(receiver == arg(0))),
-        Native::ObjectClass => Outcome::Answer(match ctx.heap.get(receiver) {
-            Some(o) => o.header.class,
-            None => ctx.roles.get(Role::SmallIntegerClass),
-        }),
-        Native::ObjectIdentityHash => match ctx.heap.get(receiver) {
+        Native::ObjectClass => Outcome::Answer(
+            ctx.heap
+                .class(receiver)
+                .unwrap_or_else(|| ctx.roles.get(Role::SmallIntegerClass)),
+        ),
+        Native::ObjectIdentityHash => match ctx.heap.seq(receiver) {
             // eq:kernel-identity-hash with h the identity on SmallIntegers.
-            Some(o) => Outcome::Answer(small((o.header.seq & ((1 << 62) - 1)) as i64)),
+            Some(seq) => Outcome::Answer(small((seq & ((1 << 62) - 1)) as i64)),
             None => Outcome::Answer(receiver),
         },
         Native::StringConcatenate => {
@@ -1454,7 +1459,7 @@ pub fn invoke(
         | Native::ClosureValue1
         | Native::ClosureValue2
         | Native::ClosureValue3 => match ctx.heap.closure(receiver) {
-            Some(c) if c.num_args as usize == args.len() => Outcome::ActivateReceiver,
+            Some(c) if c.num_args() as usize == args.len() => Outcome::ActivateReceiver,
             Some(_) => Outcome::Fail(Reason::Arity),
             None => Outcome::Fail(Reason::WrongKind(0)),
         },
@@ -1466,7 +1471,7 @@ pub fn invoke(
             None => Outcome::Fail(Reason::WrongKind(1)),
         },
         Native::ClosureNumArgs => match ctx.heap.closure(receiver) {
-            Some(c) => Outcome::Answer(small(i64::from(c.num_args))),
+            Some(c) => Outcome::Answer(small(i64::from(c.num_args()))),
             None => Outcome::Fail(Reason::WrongKind(0)),
         },
         Native::FloatAdd => float_arithmetic(ctx, receiver, arg(0), |a, b| a + b, "addFromFloat:"),
@@ -1617,19 +1622,12 @@ pub fn invoke(
             match instance_slots(ctx.heap, ctx.roles, receiver) {
                 Some(n) => {
                     let nil = ctx.nil();
-                    let instance =
-                        ctx.heap
-                            .allocate(receiver, ctx.space, Body::Regular(alloc::vec![nil; n]));
+                    let instance = ctx.heap.allocate_regular(receiver, ctx.space, n, nil);
                     // An instance of a value class is a value from allocation;
                     // its init setters check what it is given (the end of
                     // construction is not marked yet: design doc section 5).
-                    if ctx
-                        .heap
-                        .get(receiver)
-                        .map(|o| o.header.flags & VALUE_CLASS != 0)
-                        == Some(true)
-                    {
-                        ctx.heap.get_mut(instance).expect("new").header.flags |= VALUE;
+                    if ctx.heap.flags(receiver) & VALUE_CLASS != 0 {
+                        ctx.heap.add_flags(instance, VALUE);
                     }
                     Outcome::Answer(instance)
                 }
@@ -1661,14 +1659,12 @@ pub fn invoke(
             Outcome::Answer(ctx.heap.allocate(receiver, ctx.space, body))
         }
         Native::IndexedAt => {
-            let result = match ctx.heap.get(receiver).map(|o| &o.body) {
-                Some(Body::Array(e)) | Some(Body::WeakArray(e)) => {
-                    index(arg(0), e.len()).map(|i| e[i])
-                }
-                Some(Body::Bytes(b)) | Some(Body::String(b)) => {
-                    index(arg(0), b.len()).map(|i| small(i64::from(b[i])))
-                }
-                _ => Err(Reason::WrongKind(0)),
+            let result = if let Some(e) = elements(ctx.heap, receiver) {
+                index(arg(0), e.len()).map(|i| e[i])
+            } else if let Some(b) = ctx.heap.bytes(receiver) {
+                index(arg(0), b.len()).map(|i| small(i64::from(b[i])))
+            } else {
+                Err(Reason::WrongKind(0))
             };
             match result {
                 Ok(v) => Outcome::Answer(v),
@@ -1677,16 +1673,20 @@ pub fn invoke(
         }
         Native::IndexedAtPut => {
             let value = arg(1);
-            let Some(o) = ctx.heap.get_mut(receiver) else {
-                return Outcome::Fail(Reason::WrongKind(0));
-            };
-            if o.header.flags & FROZEN != 0 {
+            let format = ctx.heap.format(receiver);
+            if format.is_none() || ctx.heap.flags(receiver) & FROZEN != 0 {
                 return Outcome::Fail(Reason::WrongKind(0));
             }
-            let result = match &mut o.body {
-                Body::Array(e) | Body::WeakArray(e) => index(arg(0), e.len()).map(|i| e[i] = value),
-                Body::Bytes(b) => match value.as_small_integer() {
-                    Some(byte @ 0..=255) => index(arg(0), b.len()).map(|i| b[i] = byte as u8),
+            let result = match format {
+                Some(Format::Array | Format::WeakArray) => {
+                    let e = ctx.heap.fields_mut(receiver).expect("an array");
+                    index(arg(0), e.len()).map(|i| e[i] = value)
+                }
+                Some(Format::Bytes) => match value.as_small_integer() {
+                    Some(byte @ 0..=255) => {
+                        let b = ctx.heap.bytes_mut(receiver).expect("bytes");
+                        index(arg(0), b.len()).map(|i| b[i] = byte as u8)
+                    }
                     Some(_) => Err(Reason::OutOfRange(2)),
                     None => Err(Reason::WrongKind(2)),
                 },
@@ -1697,31 +1697,35 @@ pub fn invoke(
                 Err(r) => Outcome::Fail(r),
             }
         }
-        Native::IndexedSize => match ctx.heap.get(receiver).map(|o| &o.body) {
-            Some(Body::Array(e)) | Some(Body::WeakArray(e)) => {
+        Native::IndexedSize => {
+            if let Some(e) = elements(ctx.heap, receiver) {
                 Outcome::Answer(small(e.len() as i64))
+            } else if let Some(b) = ctx.heap.bytes(receiver) {
+                Outcome::Answer(small(b.len() as i64))
+            } else {
+                Outcome::Fail(Reason::WrongKind(0))
             }
-            Some(Body::Bytes(b)) | Some(Body::String(b)) => Outcome::Answer(small(b.len() as i64)),
-            _ => Outcome::Fail(Reason::WrongKind(0)),
-        },
+        }
         Native::CopyFromTo | Native::CopyStringFromTo | Native::CopyByteArrayFromTo => {
-            let class = ctx.heap.get(receiver).map(|o| o.header.class);
-            let copy = match ctx.heap.get(receiver).map(|o| &o.body) {
-                Some(Body::Array(e)) if native == Native::CopyFromTo => {
+            let class = ctx.heap.class(receiver);
+            let format = ctx.heap.format(receiver);
+            let copy = match format {
+                Some(Format::Array) if native == Native::CopyFromTo => {
+                    let e = ctx.heap.fields(receiver).expect("an array");
                     range(arg(0), arg(1), e.len(), 1).map(|r| Body::Array(e[r].to_vec()))
                 }
-                Some(Body::Bytes(b)) | Some(Body::String(b)) => range(arg(0), arg(1), b.len(), 1)
-                    .map(|r| {
+                Some(Format::Bytes | Format::String) => {
+                    let b = ctx.heap.bytes(receiver).expect("bytes");
+                    range(arg(0), arg(1), b.len(), 1).map(|r| {
                         let bytes = b[r].to_vec();
                         match native {
                             Native::CopyStringFromTo => Body::String(bytes),
                             Native::CopyByteArrayFromTo => Body::Bytes(bytes),
-                            _ => match ctx.heap.get(receiver).map(|o| &o.body) {
-                                Some(Body::String(_)) => Body::String(bytes),
-                                _ => Body::Bytes(bytes),
-                            },
+                            _ if format == Some(Format::String) => Body::String(bytes),
+                            _ => Body::Bytes(bytes),
                         }
-                    }),
+                    })
+                }
                 _ => Err(Reason::WrongKind(0)),
             };
             match copy {
@@ -1746,25 +1750,28 @@ pub fn invoke(
                 Values(Vec<Value>),
                 Bytes(Vec<u8>),
             }
-            let src = match ctx.heap.get(source).map(|o| &o.body) {
-                Some(Body::Array(e)) | Some(Body::WeakArray(e)) => Src::Values(e.clone()),
-                Some(Body::Bytes(b)) | Some(Body::String(b)) => Src::Bytes(b.clone()),
-                _ => return Outcome::Fail(Reason::WrongKind(3)),
+            let src = if let Some(e) = elements(ctx.heap, source) {
+                Src::Values(e.to_vec())
+            } else if let Some(b) = ctx.heap.bytes(source) {
+                Src::Bytes(b.to_vec())
+            } else {
+                return Outcome::Fail(Reason::WrongKind(3));
             };
-            let Some(o) = ctx.heap.get_mut(receiver) else {
-                return Outcome::Fail(Reason::WrongKind(0));
-            };
-            if o.header.flags & FROZEN != 0 {
+            let format = ctx.heap.format(receiver);
+            if format.is_none() || ctx.heap.flags(receiver) & FROZEN != 0 {
                 return Outcome::Fail(Reason::WrongKind(0));
             }
+            let heap = &mut *ctx.heap;
             let src_len = match &src {
                 Src::Values(v) => v.len(),
                 Src::Bytes(b) => b.len(),
             };
             let result = (|| -> Result<(), Reason> {
-                let len = match &o.body {
-                    Body::Array(e) | Body::WeakArray(e) => e.len(),
-                    Body::Bytes(b) => b.len(),
+                let len = match format {
+                    Some(Format::Array | Format::WeakArray) => {
+                        heap.fields(receiver).expect("array").len()
+                    }
+                    Some(Format::Bytes) => heap.bytes(receiver).expect("bytes").len(),
                     _ => return Err(Reason::WrongKind(0)),
                 };
                 let target = range(start, stop, len, 1)?;
@@ -1775,11 +1782,13 @@ pub fn invoke(
                     return Err(Reason::OutOfRange(4));
                 }
                 let s0 = s0 as usize - 1;
-                match (&mut o.body, &src) {
-                    (Body::Array(e) | Body::WeakArray(e), Src::Values(v)) => {
+                match (format, &src) {
+                    (Some(Format::Array | Format::WeakArray), Src::Values(v)) => {
+                        let e = heap.fields_mut(receiver).expect("array");
                         e[target.clone()].copy_from_slice(&v[s0..s0 + target.len()]);
                     }
-                    (Body::Bytes(b), Src::Bytes(s)) => {
+                    (Some(Format::Bytes), Src::Bytes(s)) => {
+                        let b = heap.bytes_mut(receiver).expect("bytes");
                         b[target.clone()].copy_from_slice(&s[s0..s0 + target.len()]);
                     }
                     _ => return Err(Reason::WrongKind(3)),
@@ -1902,24 +1911,21 @@ pub fn invoke(
                     detached: Some(crate::object::Detached {
                         sender: nil,
                         bci: nil,
-                        temps: Vec::new(),
+                        temps: nil,
                     }),
                 }),
             ))
         }
-        Native::VmMarkSimulationRoot => match ctx.heap.get_mut(arg(0)) {
-            Some(o) if matches!(o.body, Body::Method(_)) => {
-                o.header.flags |= crate::object::SIMULATION_ROOT;
+        Native::VmMarkSimulationRoot => {
+            if ctx.heap.format(arg(0)) == Some(Format::Method) {
+                ctx.heap.add_flags(arg(0), crate::object::SIMULATION_ROOT);
                 Outcome::Answer(arg(0))
+            } else {
+                Outcome::Fail(Reason::WrongKind(1))
             }
-            _ => Outcome::Fail(Reason::WrongKind(1)),
-        },
+        }
         Native::VmIsSimulationRoot => Outcome::Answer(
-            ctx.boolean(
-                ctx.heap
-                    .get(arg(0))
-                    .is_some_and(|o| o.header.flags & crate::object::SIMULATION_ROOT != 0),
-            ),
+            ctx.boolean(ctx.heap.flags(arg(0)) & crate::object::SIMULATION_ROOT != 0),
         ),
         Native::VmContinueAt => Outcome::ContinueAt {
             activation: arg(0),
@@ -1932,7 +1938,7 @@ pub fn invoke(
             arguments: arg(2),
         },
         Native::DefiningActivationOf => match ctx.heap.closure(arg(0)) {
-            Some(c) => Outcome::Answer(c.defining),
+            Some(c) => Outcome::Answer(c.defining()),
             None => Outcome::Fail(Reason::WrongKind(1)),
         },
         Native::VmAllInstancesOf => Outcome::AllInstances(arg(0)),
@@ -1979,9 +1985,10 @@ pub fn invoke(
             } else {
                 Role::Lineage
             };
-            match ctx.heap.get(ctx.roles.get(role)).map(|o| &o.body) {
-                Some(Body::Bytes(b)) => {
-                    let copy = b.clone();
+            let id = ctx.roles.get(role);
+            match ctx.heap.format(id) {
+                Some(Format::Bytes) => {
+                    let copy = ctx.heap.bytes(id).expect("bytes").to_vec();
                     Outcome::Answer(ctx.new_bytes_object(Role::ByteArrayClass, Body::Bytes(copy)))
                 }
                 _ => Outcome::Answer(ctx.roles.get(Role::Nil)),
@@ -2000,30 +2007,30 @@ pub fn invoke(
             by_mixin: false,
         },
         Native::ClosureNumCopied => match ctx.heap.closure(arg(0)) {
-            Some(c) => Outcome::Answer(small(c.copied.len() as i64)),
+            Some(c) => Outcome::Answer(small(c.copied().len() as i64)),
             None => Outcome::Fail(Reason::WrongKind(1)),
         },
         Native::ClosureInitialPc => match ctx.heap.closure(arg(0)) {
-            Some(c) => Outcome::Answer(small(i64::from(c.initial_ip) + 1)),
+            Some(c) => Outcome::Answer(small(i64::from(c.initial_ip()) + 1)),
             None => Outcome::Fail(Reason::WrongKind(1)),
         },
         Native::ClosureCopiedAt => {
             let Some(c) = ctx.heap.closure(arg(0)) else {
                 return Outcome::Fail(Reason::WrongKind(1));
             };
-            match small_index(arg(1)).filter(|&i| i >= 1 && i as usize <= c.copied.len()) {
-                Some(i) => Outcome::Answer(c.copied[i as usize - 1]),
+            match small_index(arg(1)).filter(|&i| i >= 1 && i as usize <= c.copied().len()) {
+                Some(i) => Outcome::Answer(c.copied()[i as usize - 1]),
                 None => Outcome::Fail(Reason::OutOfRange(2)),
             }
         }
         Native::ClosureCopiedAtPut => {
             let value = arg(2);
-            let Some(Body::Closure(c)) = ctx.heap.get_mut(arg(0)).map(|o| &mut o.body) else {
+            let Some(count) = ctx.heap.closure(arg(0)).map(|c| c.copied().len()) else {
                 return Outcome::Fail(Reason::WrongKind(1));
             };
-            match small_index(arg(1)).filter(|&i| i >= 1 && i as usize <= c.copied.len()) {
+            match small_index(arg(1)).filter(|&i| i >= 1 && i as usize <= count) {
                 Some(i) => {
-                    c.copied[i as usize - 1] = value;
+                    ctx.heap.set_closure_copied(arg(0), i as usize - 1, value);
                     Outcome::Answer(value)
                 }
                 None => Outcome::Fail(Reason::OutOfRange(2)),
@@ -2078,7 +2085,7 @@ pub fn invoke(
         }
         Native::VmSlotOfAt => {
             let (object, i) = (arg(0), arg(1));
-            match ctx.heap.get(object).and_then(|o| readable_fields(&o.body)) {
+            match readable_fields(ctx.heap, object) {
                 Some(fields) => match index(i, fields.len()) {
                     Ok(k) => Outcome::Answer(fields[k]),
                     Err(Reason::WrongKind(_)) => Outcome::Fail(Reason::WrongKind(2)),
@@ -2089,30 +2096,28 @@ pub fn invoke(
         }
         Native::VmSlotOfAtPut => {
             let (object, i, value) = (arg(0), arg(1), arg(2));
-            let Some(o) = ctx.heap.get_mut(object) else {
-                return Outcome::Fail(Reason::WrongKind(1));
-            };
-            if o.header.flags & (FROZEN | VALUE) != 0 {
+            let format = ctx.heap.format(object);
+            if format.is_none() || ctx.heap.flags(object) & (FROZEN | VALUE) != 0 {
                 return Outcome::Fail(Reason::WrongKind(1));
             }
-            let slot = match &mut o.body {
-                Body::Regular(slots) => index(i, slots.len()).map(|k| &mut slots[k]),
-                Body::Ephemeron {
-                    key,
-                    value: v,
-                    finalizer,
-                } => match i.as_small_integer() {
-                    Some(1) => Ok(key),
-                    Some(2) => Ok(v),
-                    Some(3) => Ok(finalizer),
+            let slot = match format {
+                Some(Format::Regular) => {
+                    index(i, ctx.heap.regular_slots(object).expect("regular").len())
+                }
+                Some(Format::Ephemeron) => match i.as_small_integer() {
+                    Some(k @ 1..=3) => Ok(k as usize - 1),
                     Some(_) => Err(Reason::OutOfRange(2)),
                     None => Err(Reason::WrongKind(2)),
                 },
                 _ => Err(Reason::WrongKind(1)),
             };
             match slot {
-                Ok(s) => {
-                    *s = value;
+                Ok(k) => {
+                    if format == Some(Format::Regular) {
+                        ctx.heap.regular_slots_mut(object).expect("regular")[k] = value;
+                    } else {
+                        ctx.heap.set_ephemeron_field(object, k, value);
+                    }
                     Outcome::Answer(value)
                 }
                 Err(Reason::WrongKind(1)) => Outcome::Fail(Reason::WrongKind(1)),
@@ -2120,29 +2125,28 @@ pub fn invoke(
                 Err(_) => Outcome::Fail(Reason::OutOfRange(2)),
             }
         }
-        Native::VmClassOf => Outcome::Answer(match ctx.heap.get(arg(0)) {
-            Some(o) => o.header.class,
-            None => ctx.roles.get(Role::SmallIntegerClass),
-        }),
+        Native::VmClassOf => Outcome::Answer(
+            ctx.heap
+                .class(arg(0))
+                .unwrap_or_else(|| ctx.roles.get(Role::SmallIntegerClass)),
+        ),
         Native::VmIsIdenticalTo => Outcome::Answer(ctx.boolean(arg(0) == arg(1))),
-        Native::VmIdentityHashOf => match ctx.heap.get(arg(0)) {
-            Some(o) => Outcome::Answer(small((o.header.seq & ((1 << 62) - 1)) as i64)),
+        Native::VmIdentityHashOf => match ctx.heap.seq(arg(0)) {
+            Some(seq) => Outcome::Answer(small((seq & ((1 << 62) - 1)) as i64)),
             None => Outcome::Answer(arg(0)),
         },
         Native::VmInstantiate => invoke(Native::ClassBasicNew, arg(0), &[], ctx),
         Native::VmApplyMixin => apply_mixin(arg(0), arg(1), arg(2), ctx),
         Native::VmIsCanonical => {
-            let frozen = match ctx.heap.get(arg(0)) {
-                Some(o) => o.header.flags & FROZEN != 0,
+            let frozen = match ctx.heap.format(arg(0)) {
+                Some(_) => ctx.heap.flags(arg(0)) & FROZEN != 0,
                 // Immediates are values.
                 None => true,
             };
             Outcome::Answer(ctx.boolean(frozen))
         }
         Native::VmSetCanonical => {
-            if let Some(o) = ctx.heap.get_mut(arg(0)) {
-                o.header.flags |= FROZEN;
-            }
+            ctx.heap.add_flags(arg(0), FROZEN);
             Outcome::Answer(arg(0))
         }
         Native::VmPerformWith => {
@@ -2165,9 +2169,9 @@ pub fn invoke(
         }
         Native::VmNewActor => Outcome::NewActor,
         Native::VmSpawn => Outcome::Spawn(arg(0)),
-        Native::MethodHeader => match ctx.heap.get(receiver).map(|o| &o.body) {
-            Some(Body::Method(m)) => Outcome::Answer(small(psoup_header(&m.header))),
-            _ => Outcome::Fail(Reason::WrongKind(0)),
+        Native::MethodHeader => match ctx.heap.method(receiver) {
+            Some(m) => Outcome::Answer(small(psoup_header(&m.header()))),
+            None => Outcome::Fail(Reason::WrongKind(0)),
         },
         Native::MethodHeaderPut => {
             let Some(word) = arg(0).as_small_integer() else {
@@ -2176,37 +2180,35 @@ pub fn invoke(
             let Some(header) = header_from_psoup(word) else {
                 return Outcome::Fail(Reason::WrongKind(1));
             };
-            match unfrozen_method(ctx, receiver) {
-                Some(m) => {
-                    m.header = header;
-                    Outcome::Answer(receiver)
-                }
-                None => Outcome::Fail(Reason::WrongKind(0)),
+            if is_unfrozen_method(ctx, receiver) {
+                ctx.heap.set_method_header(receiver, header);
+                Outcome::Answer(receiver)
+            } else {
+                Outcome::Fail(Reason::WrongKind(0))
             }
         }
         Native::MethodBytecode => {
-            let Some(Body::Method(m)) = ctx.heap.get(receiver).map(|o| &o.body) else {
+            let Some(m) = ctx.heap.method(receiver) else {
                 return Outcome::Fail(Reason::WrongKind(0));
             };
-            let bytes = m.bytecode.to_vec();
+            let bytes = m.bytecode().to_vec();
             let class = ctx.roles.get(Role::ByteArrayClass);
             let space = ctx.space;
             Outcome::Answer(ctx.heap.allocate(class, space, Body::Bytes(bytes)))
         }
         Native::MethodBytecodePut => {
-            let Some(Body::Bytes(bytes)) = ctx.heap.get(arg(0)).map(|o| &o.body) else {
+            if ctx.heap.format(arg(0)) != Some(Format::Bytes) {
                 return Outcome::Fail(Reason::WrongKind(1));
-            };
-            let bytes = bytes.clone();
+            }
+            let bytes = ctx.heap.bytes(arg(0)).expect("bytes").to_vec();
             if !well_formed(&bytes) {
                 return Outcome::Fail(Reason::WrongKind(1));
             }
-            match unfrozen_method(ctx, receiver) {
-                Some(m) => {
-                    m.bytecode = bytes.into();
-                    Outcome::Answer(receiver)
-                }
-                None => Outcome::Fail(Reason::WrongKind(0)),
+            if is_unfrozen_method(ctx, receiver) {
+                ctx.heap.set_method_bytecode(receiver, bytes.into());
+                Outcome::Answer(receiver)
+            } else {
+                Outcome::Fail(Reason::WrongKind(0))
             }
         }
         Native::VmHostGlobal => Outcome::Answer(new_alien(ctx, HOST_GLOBAL)),
@@ -2235,23 +2237,19 @@ pub fn invoke(
             host_call(ctx, HostOp::InstanceOf, receiver, &[arg(0)], None, None)
         }
         Native::VmFarReferenceTo => {
-            let Some(Body::FarRef { actor, .. }) = ctx.heap.get(arg(0)).map(|o| &o.body) else {
+            let Some((actor, _)) = ctx.heap.far_ref(arg(0)) else {
                 return Outcome::Fail(Reason::WrongKind(1));
             };
-            let actor = *actor;
             if !ctx.is_value(arg(1)) {
                 return Outcome::Fail(Reason::WrongKind(2));
             }
             Outcome::Answer(new_far_reference(ctx, actor, arg(1)))
         }
         Native::VmPost => {
-            if !matches!(ctx.heap.get(arg(0)).map(|o| &o.body), Some(Body::Array(_))) {
+            if ctx.heap.format(arg(0)) != Some(Format::Array) {
                 return Outcome::Fail(Reason::WrongKind(1));
             }
-            if !matches!(
-                ctx.heap.get(arg(1)).map(|o| &o.body),
-                Some(Body::FarRef { .. })
-            ) {
+            if ctx.heap.format(arg(1)) != Some(Format::FarRef) {
                 return Outcome::Fail(Reason::WrongKind(2));
             }
             Outcome::Post {
@@ -2259,10 +2257,9 @@ pub fn invoke(
                 far_reference: arg(1),
             }
         }
-        Native::VmIsFarReference => Outcome::Answer(ctx.boolean(matches!(
-            ctx.heap.get(arg(0)).map(|o| &o.body),
-            Some(Body::FarRef { .. })
-        ))),
+        Native::VmIsFarReference => {
+            Outcome::Answer(ctx.boolean(ctx.heap.format(arg(0)) == Some(Format::FarRef)))
+        }
         Native::VmCurrentMessageLoop => Outcome::CurrentMessageLoop,
         Native::VmNewPromise => {
             let Space::Actor(current) = ctx.space else {
@@ -2278,8 +2275,8 @@ pub fn invoke(
                     state: PromiseRecord::PENDING,
                     value: ctx.nil(),
                     owner,
-                    waiters: Vec::new(),
-                    queue: Vec::new(),
+                    waiters: ctx.nil(),
+                    queue: ctx.nil(),
                 }),
             ))
         }
@@ -2305,13 +2302,13 @@ pub fn invoke(
                 return Outcome::Fail(Reason::Unsupported);
             };
             let last = last_promise(ctx.heap, arg(0));
-            let Some(Body::Promise(p)) = ctx.heap.get(last).map(|o| &o.body) else {
+            let Some(p) = ctx.heap.promise(last) else {
                 unreachable!("a chain of promise records ends in one")
             };
-            let (state, value, owner) = (p.state, p.value, p.owner);
+            let (state, value, owner) = (p.state(), p.value(), p.owner());
             let payload = if state == PromiseRecord::PENDING {
-                match ctx.heap.get(owner).map(|o| &o.body) {
-                    Some(Body::FarRef { actor, target }) if *actor == current => *target,
+                match ctx.heap.far_ref(owner) {
+                    Some((actor, target)) if actor == current => target,
                     _ => last,
                 }
             } else {
@@ -2340,11 +2337,13 @@ pub fn invoke(
             if !is_promise(ctx.heap, arg(0)) {
                 return Outcome::Fail(Reason::WrongKind(1));
             }
-            match ctx.heap.get(arg(1)).map(|o| &o.body) {
-                Some(Body::Array(e)) if e.len() >= 2 => Outcome::PromiseSend {
-                    record: arg(0),
-                    message: arg(1),
-                },
+            match ctx.heap.format(arg(1)) {
+                Some(Format::Array) if ctx.heap.fields(arg(1)).expect("array").len() >= 2 => {
+                    Outcome::PromiseSend {
+                        record: arg(0),
+                        message: arg(1),
+                    }
+                }
                 _ => Outcome::Fail(Reason::WrongKind(2)),
             }
         }

@@ -11,8 +11,8 @@ use eurasia_core::Value;
 use eurasia_core::machine::{ActorState, FrameState, MachineState};
 use eurasia_core::object::Detached;
 use eurasia_core::object::{
-    Access, Activation, Behavior, Body, Closure, FLAGS, Heap, HeapError, Method, MethodHeader,
-    MethodKind, Mixin, Object, PromiseRecord, Space,
+    Access, Activation, Behavior, Body, Closure, FLAGS, Format, Heap, HeapError, Method,
+    MethodHeader, MethodKind, Mixin, Object, PromiseRecord, Space,
 };
 use eurasia_core::roles::{Role, Roles, RolesError};
 
@@ -141,14 +141,19 @@ impl fmt::Display for LoadError {
 /// state of a checkpoint, then the roles. Without a machine state, live
 /// activations are saved dead (a snapshot starts afresh).
 pub fn write_image(heap: &Heap, roles: &Roles, machine: Option<&MachineState>) -> Vec<u8> {
-    // Group objects by space, each group in allocation order.
-    let mut groups: BTreeMap<(u8, u32), Vec<(Value, &Object)>> = BTreeMap::new();
-    for (v, o) in heap.iter() {
+    // Group objects by space, each group in allocation order (sequence
+    // order: a reshaped object can sit later in the arena than its number).
+    let mut groups: BTreeMap<(u8, u32), Vec<(Value, Object)>> = BTreeMap::new();
+    for v in heap.objects() {
+        let o = heap.object(v).expect("an object");
         let key = match o.header.space {
             Space::Program => (0, 0),
             Space::Actor(n) => (1, n),
         };
         groups.entry(key).or_default().push((v, o));
+    }
+    for objects in groups.values_mut() {
+        objects.sort_by_key(|(_, o)| o.header.seq);
     }
     // Node numbers in file order.
     let mut node_of: BTreeMap<u64, u64> = BTreeMap::new();
@@ -485,10 +490,7 @@ fn write_node(w: &mut Writer, o: &Object, keep_frames: bool) {
         // A frame's handle is saved live only with the frames (a
         // checkpoint); a detached activation with its state.
         Body::Activation(a) => match (&a.detached, a.frame) {
-            (Some(d), _) => {
-                w.u8(2);
-                w.uv(d.temps.len() as u64);
-            }
+            (Some(_), _) => w.u8(2),
             (None, Some(serial)) if keep_frames => {
                 w.u8(1);
                 w.uv(serial);
@@ -496,11 +498,7 @@ fn write_node(w: &mut Writer, o: &Object, keep_frames: bool) {
             (None, _) => w.u8(0),
         },
         Body::FarRef { actor, .. } => w.uv((*actor).into()),
-        Body::Promise(p) => {
-            w.uv(p.state.into());
-            w.uv(p.waiters.len() as u64);
-            w.uv(p.queue.len() as u64);
-        }
+        Body::Promise(p) => w.uv(p.state.into()),
     }
 }
 
@@ -554,16 +552,13 @@ fn write_edges(w: &mut Writer, o: &Object, to_node: &dyn Fn(Value) -> Value) {
             if let Some(d) = &a.detached {
                 v(d.sender);
                 v(d.bci);
-                d.temps.iter().for_each(|&x| v(x));
+                v(d.temps);
             }
         }
         Body::FarRef { target, .. } => v(*target),
-        Body::Promise(p) => {
-            v(p.value);
-            v(p.owner);
-            p.waiters.iter().for_each(|&x| v(x));
-            p.queue.iter().for_each(|&x| v(x));
-        }
+        Body::Promise(p) => [p.value, p.owner, p.waiters, p.queue]
+            .into_iter()
+            .for_each(v),
         Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => {}
     }
 }
@@ -666,12 +661,14 @@ pub fn read_checkpoint(bytes: &[u8]) -> Result<(Heap, Roles, Option<MachineState
     }
 
     // Allocation order: sort by sequence number, then map node numbers to
-    // arena indices.
+    // the arena offsets the objects will have, in that order.
     let mut order: Vec<usize> = (0..nodes.len()).collect();
     order.sort_by_key(|&i| nodes[i].seq);
     let mut index_of_node = alloc::vec![0u64; nodes.len()];
-    for (arena, &i) in order.iter().enumerate() {
-        index_of_node[i] = arena as u64;
+    let mut offset = 0u64;
+    for &i in &order {
+        index_of_node[i] = offset;
+        offset += Heap::words_for(&nodes[i].body) as u64;
     }
     let resolve = |node: u64, v: Value| -> Result<Value, LoadError> {
         match v.as_reference() {
@@ -711,11 +708,14 @@ pub fn read_checkpoint(bytes: &[u8]) -> Result<(Heap, Roles, Option<MachineState
     // Fields the format does not store (a class's this_class, a metaclass's
     // name) are nil.
     let nil = roles.get(Role::Nil);
-    for i in 0..heap.len() {
-        let v = Value::reference(i as u64).expect("in range");
-        match heap.get_mut(v).map(|o| &mut o.body) {
-            Some(Body::Class(b)) => b.this_class = nil,
-            Some(Body::Metaclass(b)) => b.name = nil,
+    for v in heap.objects() {
+        match heap.format(v) {
+            Some(Format::Class) => {
+                heap.set_this_class(v, nil);
+            }
+            Some(Format::Metaclass) => {
+                heap.set_behavior_field(v, 3, nil);
+            }
             _ => {}
         }
     }
@@ -862,7 +862,7 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
                     Some(Detached {
                         sender: p,
                         bci: p,
-                        temps: alloc::vec![p; len(r)?],
+                        temps: p,
                     }),
                 ),
                 _ => return Err(LoadError::UnknownKind { node, kind }),
@@ -884,14 +884,12 @@ fn read_node(r: &mut Reader<'_>, node: u64, placeholder: Value) -> Result<(u8, B
                 .ok()
                 .filter(|&s| s <= PromiseRecord::FORWARDED)
                 .ok_or(LoadError::UnknownKind { node, kind })?;
-            let waiters = len(r)?;
-            let queue = len(r)?;
             Body::Promise(PromiseRecord {
                 state,
                 value: p,
                 owner: p,
-                waiters: alloc::vec![p; waiters],
-                queue: alloc::vec![p; queue],
+                waiters: p,
+                queue: p,
             })
         }
         _ => return Err(LoadError::UnknownKind { node, kind }),
@@ -906,9 +904,9 @@ fn edge_count(body: &Body) -> usize {
         Body::Mixin(_) => 6,
         Body::Method(_) | Body::Class(_) | Body::Metaclass(_) => 5,
         Body::Closure(c) => 1 + c.copied.len(),
-        Body::Activation(a) => 3 + a.detached.as_ref().map_or(0, |d| 2 + d.temps.len()),
+        Body::Activation(a) => 3 + a.detached.as_ref().map_or(0, |_| 3),
         Body::FarRef { .. } => 1,
-        Body::Promise(p) => 2 + p.waiters.len() + p.queue.len(),
+        Body::Promise(_) => 4,
         Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => 0,
     }
 }
@@ -985,7 +983,7 @@ fn fill_body(
                 Some(_) => Some(Detached {
                     sender: resolve(e[3])?,
                     bci: resolve(e[4])?,
-                    temps: all(&e[5..])?,
+                    temps: resolve(e[5])?,
                 }),
                 None => None,
             },
@@ -997,8 +995,8 @@ fn fill_body(
         Body::Promise(p) => Body::Promise(PromiseRecord {
             value: resolve(e[0])?,
             owner: resolve(e[1])?,
-            waiters: all(&e[2..2 + p.waiters.len()])?,
-            queue: all(&e[2 + p.waiters.len()..])?,
+            waiters: resolve(e[2])?,
+            queue: resolve(e[3])?,
             ..p
         }),
         other => other,

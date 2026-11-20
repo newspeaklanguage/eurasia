@@ -255,7 +255,7 @@ fn the_bottom_frame_has_no_sender() {
     // main: vm print: (thisActivation sender == nil) printString... we print
     // via a selector answering 'bottom' when the sender is nil.
     let mut k = activation_kernel();
-    let undefined = k.b.heap.get(k.b.nil).unwrap().header.class;
+    let undefined = k.b.heap.class(k.b.nil).unwrap();
     let lit = k.b.string("bottom");
     k.b.method(
         undefined,
