@@ -223,6 +223,16 @@ struct CacheEntry {
     target: Target,
 }
 
+/// How [`Vm::run_simple`]'s inner loop ends.
+enum Exit {
+    /// At the instruction where the event loop polls the host.
+    Polls,
+    /// At an instruction for `step`.
+    Step,
+    /// After a send it made itself.
+    Sent(Option<Completion>),
+}
+
 /// The common selectors (0 to 13: `+` to `=`) with SmallInteger fast paths.
 const SMALL_INTEGER_FAST_PATHS: usize = 14;
 
@@ -3733,24 +3743,24 @@ impl Vm {
                 self.roles.get(Role::False),
             );
             let code_len = code.len();
-            let polls = loop {
+            let exit = loop {
                 if !first {
                     // The event loop's countdown for this instruction; at the
                     // one that polls, let the event loop run it.
                     if self.interrupt_countdown == 1 {
-                        break true;
+                        break Exit::Polls;
                     }
                     self.interrupt_countdown -= 1;
                 }
                 first = false;
                 let len = self.stack.len();
                 if ip >= code_len {
-                    break false;
+                    break Exit::Step;
                 }
                 let opcode = code[ip];
                 let ilen = instruction_length(opcode);
                 if ip + ilen > code_len {
-                    break false;
+                    break Exit::Step;
                 }
                 let next = ip + ilen;
                 let b1 = if ilen > 1 { code[ip + 1] } else { 0 };
@@ -3759,17 +3769,17 @@ impl Vm {
                 match opcode {
                     0..=15 => match next.checked_sub((opcode & 15) as usize) {
                         Some(target) => ip = target,
-                        None => break false,
+                        None => break Exit::Step,
                     },
                     16..=31 => ip = next + (opcode & 15) as usize,
                     op::BRANCH_BACK => match next.checked_sub(wide) {
                         Some(target) => ip = target,
-                        None => break false,
+                        None => break Exit::Step,
                     },
                     op::BRANCH => ip = next + wide,
                     32..=63 | op::BRANCH_IF_TRUE | op::BRANCH_IF_FALSE => {
                         if len <= lp {
-                            break false;
+                            break Exit::Step;
                         }
                         let v = self.stack[len - 1];
                         let condition = matches!(opcode, 32..=47 | op::BRANCH_IF_TRUE);
@@ -3778,7 +3788,7 @@ impl Vm {
                         } else if v == fl {
                             !condition
                         } else {
-                            break false;
+                            break Exit::Step;
                         };
                         self.stack.pop();
                         let forward = if opcode < 64 {
@@ -3795,7 +3805,7 @@ impl Vm {
                             (opcode & 7) as usize
                         };
                         if p == 0 || p > arg_count || bp + 1 + (arg_count - p) >= len {
-                            break false;
+                            break Exit::Step;
                         }
                         self.stack.push(self.stack[bp + 1 + (arg_count - p)]);
                         ip = next;
@@ -3807,7 +3817,7 @@ impl Vm {
                             (opcode & 7) as usize
                         };
                         if lp + i >= len {
-                            break false;
+                            break Exit::Step;
                         }
                         self.stack.push(self.stack[lp + i]);
                         ip = next;
@@ -3821,7 +3831,7 @@ impl Vm {
                         // `step` checks the slot before popping; a slot at the
                         // top is left to it as well.
                         if lp + i + 1 >= len || len <= lp {
-                            break false;
+                            break Exit::Step;
                         }
                         let v = self.stack[len - 1];
                         self.stack.pop();
@@ -3835,7 +3845,7 @@ impl Vm {
                             (opcode & 7) as usize
                         };
                         if lp + i >= len || len <= lp {
-                            break false;
+                            break Exit::Step;
                         }
                         self.stack[lp + i] = self.stack[len - 1];
                         ip = next;
@@ -3847,7 +3857,7 @@ impl Vm {
                             (opcode & 7) as usize
                         };
                         let Some(v) = self.literal(i) else {
-                            break false;
+                            break Exit::Step;
                         };
                         self.stack.push(v);
                         ip = next;
@@ -3874,14 +3884,14 @@ impl Vm {
                     }
                     op::POP => {
                         if len <= lp {
-                            break false;
+                            break Exit::Step;
                         }
                         self.stack.pop();
                         ip = next;
                     }
                     op::DUP => {
                         if len <= lp {
-                            break false;
+                            break Exit::Step;
                         }
                         self.stack.push(self.stack[len - 1]);
                         ip = next;
@@ -3897,35 +3907,168 @@ impl Vm {
                             .push(Value::small_integer(n.into()).expect("small"));
                         ip = next;
                     }
-                    176..=189 => {
-                        if len < lp + 2 {
-                            break false;
+                    // A send whose cached method is an accessor with a known
+                    // slot: the slot is read or written here, without the
+                    // send path (EURASIA_PERFORMANCE_2026-11-19.md section
+                    // 12). Anything else, a miss included, goes to `step`.
+                    64..=111
+                    | 176..=207
+                    | op::ORDINARY_SEND
+                    | op::SELF_SEND
+                    | op::IMPLICIT_RECEIVER_SEND => {
+                        // SmallInteger arithmetic and comparisons first.
+                        if (176..=189).contains(&opcode)
+                            && len >= lp + 2
+                            && let (Some(a), Some(b)) = (
+                                self.stack[len - 2].as_small_integer(),
+                                self.stack[len - 1].as_small_integer(),
+                            )
+                            && let Some(v) = self.small_integer_op((opcode - 176) as usize, a, b)
+                        {
+                            self.stack.pop();
+                            self.stack[len - 2] = v;
+                            ip = next;
+                            continue;
                         }
-                        let (Some(a), Some(b)) = (
-                            self.stack[len - 2].as_small_integer(),
-                            self.stack[len - 1].as_small_integer(),
-                        ) else {
-                            break false;
+                        let short = |kind: Rule| {
+                            (
+                                kind,
+                                Some((opcode & 7) as usize),
+                                ((opcode >> 3) & 1) as usize,
+                            )
                         };
-                        match self.small_integer_op((opcode - 176) as usize, a, b) {
-                            Some(v) => {
-                                self.stack.pop();
-                                self.stack[len - 2] = v;
-                                ip = next;
+                        let (rule, index, n) = match opcode {
+                            64..=79 => short(Rule::Ordinary),
+                            80..=95 => short(Rule::SelfSend),
+                            96..=111 => short(Rule::ImplicitReceiver),
+                            176..=207 => (Rule::Ordinary, None, 0),
+                            _ => {
+                                let rule = match opcode {
+                                    op::ORDINARY_SEND => Rule::Ordinary,
+                                    op::SELF_SEND => Rule::SelfSend,
+                                    _ => Rule::ImplicitReceiver,
+                                };
+                                (
+                                    rule,
+                                    Some(b1 as usize | ((b2 as usize & 0x0f) << 8)),
+                                    (b2 >> 4) as usize,
+                                )
                             }
-                            None => break false,
+                        };
+                        // A common send's selector and arity are in the table.
+                        let (selector, n) = match index {
+                            Some(i) => match self.literal(i) {
+                                Some(sel) => (sel, n),
+                                None => break Exit::Step,
+                            },
+                            None => {
+                                let k = (opcode - 176) as usize;
+                                let table = self.roles.get(Role::CommonSelectors);
+                                match self.heap.array_elements(table).and_then(|e| {
+                                    Some((*e.get(2 * k)?, e.get(2 * k + 1)?.as_small_integer()?))
+                                }) {
+                                    Some((sel, arity)) if arity >= 0 => (sel, arity as usize),
+                                    _ => break Exit::Step,
+                                }
+                            }
+                        };
+                        let ordinary = rule == Rule::Ordinary;
+                        if len < lp + n + usize::from(ordinary) {
+                            break Exit::Step;
                         }
+                        let (key, key_mixin) = if ordinary {
+                            (self.stack[len - 1 - n], nil)
+                        } else {
+                            (receiver, mixin)
+                        };
+                        let class = self.class_of(key);
+                        let Some(e) =
+                            self.lookup_cache[cache_index(class, selector, key_mixin, rule)]
+                        else {
+                            break Exit::Step;
+                        };
+                        if e.class != class
+                            || e.selector != selector
+                            || e.mixin != key_mixin
+                            || e.rule != rule
+                        {
+                            break Exit::Step;
+                        }
+                        let slot = e.target.slot;
+                        let object = match e.target.receiver {
+                            TargetReceiver::Present => key,
+                            TargetReceiver::Frame => receiver,
+                            TargetReceiver::Fixed(r) => r,
+                        };
+                        match (e.target.header.kind, n, slot) {
+                            (MethodKind::Getter, 0, Some(slot)) => {
+                                let Some(&v) =
+                                    self.heap.regular_slots(object).and_then(|s| s.get(slot))
+                                else {
+                                    break Exit::Step;
+                                };
+                                if ordinary {
+                                    self.stack[len - 1] = v;
+                                } else {
+                                    self.stack.push(v);
+                                }
+                            }
+                            (MethodKind::Setter, 1, Some(slot)) => {
+                                // A frozen object or a value: `step`, which refuses
+                                // or checks the value.
+                                if self.heap.flags(object) & (FROZEN | VALUE) != 0 {
+                                    break Exit::Step;
+                                }
+                                let value = self.stack[len - 1];
+                                let Some(s) = self
+                                    .heap
+                                    .regular_slots_mut(object)
+                                    .and_then(|s| s.get_mut(slot))
+                                else {
+                                    break Exit::Step;
+                                };
+                                *s = value;
+                                // The answer is the receiver.
+                                if ordinary {
+                                    self.stack.pop();
+                                } else {
+                                    self.stack[len - 1] = object;
+                                }
+                            }
+                            // Any other method the cache found: the send, from here
+                            // (what `step` would do, without looking it up again).
+                            _ => {
+                                let t = e.target;
+                                self.frames.last_mut().expect("a frame").ip = next;
+                                match t.receiver {
+                                    TargetReceiver::Present => {}
+                                    TargetReceiver::Frame => self.insert_receiver(receiver, n),
+                                    TargetReceiver::Fixed(r) => self.insert_receiver(r, n),
+                                }
+                                break Exit::Sent(
+                                    self.activate_with(t.method, t.header, n, host, t.slot)?,
+                                );
+                            }
+                        }
+                        ip = next;
                     }
-                    _ => break false,
+                    _ => break Exit::Step,
                 }
             };
-            self.frames.last_mut().expect("a frame").ip = ip;
-            if polls {
-                return Ok(Step::Continue);
-            }
-            // Any other instruction, by `step`.
-            if let Step::Done(done) = self.step(host)? {
-                return Ok(Step::Done(done));
+            match exit {
+                Exit::Polls => {
+                    self.frames.last_mut().expect("a frame").ip = ip;
+                    return Ok(Step::Continue);
+                }
+                // Any other instruction, by `step`.
+                Exit::Step => {
+                    self.frames.last_mut().expect("a frame").ip = ip;
+                    if let Step::Done(done) = self.step(host)? {
+                        return Ok(Step::Done(done));
+                    }
+                }
+                Exit::Sent(Some(done)) => return Ok(Step::Done(done)),
+                Exit::Sent(None) => {}
             }
             // The event loop's checks for the next instruction: back to it
             // when it has something to do (no frame left, a collection or
