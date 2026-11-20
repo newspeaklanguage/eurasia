@@ -1647,11 +1647,14 @@ pub fn invoke(
             }
             let n = n as usize;
             let nil = ctx.nil();
-            let body = if receiver == ctx.roles.get(Role::ArrayClass) {
-                Body::Array(alloc::vec![nil; n])
-            } else if receiver == ctx.roles.get(Role::WeakArrayClass) {
-                Body::WeakArray(alloc::vec![nil; n])
-            } else if receiver == ctx.roles.get(Role::ByteArrayClass) {
+            let weak = receiver == ctx.roles.get(Role::WeakArrayClass);
+            if weak || receiver == ctx.roles.get(Role::ArrayClass) {
+                return Outcome::Answer(
+                    ctx.heap
+                        .allocate_array_of(receiver, ctx.space, weak, n, nil),
+                );
+            }
+            let body = if receiver == ctx.roles.get(Role::ByteArrayClass) {
                 Body::Bytes(alloc::vec![0; n])
             } else {
                 return Outcome::Fail(Reason::NotInstantiable);

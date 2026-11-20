@@ -859,6 +859,20 @@ impl Heap {
         })
     }
 
+    /// Allocates an Array (`weak`: a WeakArray) of `n` elements, all
+    /// `fill`, without building its description first (`new:`).
+    pub fn allocate_array_of(
+        &mut self,
+        class: Value,
+        space: Space,
+        weak: bool,
+        n: usize,
+        fill: Value,
+    ) -> Value {
+        let code = if weak { Code::WeakArray } else { Code::Array };
+        self.allocate_filled(class, space, code, n, |w| w.resize(w.len() + n, fill))
+    }
+
     /// Allocates a Regular object of `n` slots, all `fill` (`basicNew`).
     pub fn allocate_regular(&mut self, class: Value, space: Space, n: usize, fill: Value) -> Value {
         self.allocate_filled(class, space, Code::Regular, n, |w| {

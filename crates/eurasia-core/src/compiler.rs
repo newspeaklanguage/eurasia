@@ -333,6 +333,9 @@ pub const IC_RETURN_SELF: u32 = 12;
 /// closure): the slot is a closure target, the VM's index; closures with
 /// that target's body have their frames pushed in compiled code.
 pub const IC_CLOSURE: u32 = 13;
+/// The function of a method target that is a native's: `call` runs it;
+/// compiled code pushes no frame for it.
+pub const NATIVE_FUNCTION: u32 = u32::MAX;
 /// The bit of a `call` target that makes it a closure target (of the
 /// index in the low bits) rather than a method's.
 pub const CLOSURE_TARGET: u32 = 1 << 31;
@@ -1616,6 +1619,12 @@ impl Func {
             .sub()
             .i32c(MAX_NESTED as i32)
             .op(0x48) // lt_s
+            .op(0x71);
+        // a method's, not a native's
+        self.get(L_INDEX)
+            .ld32(TARGET_FUNCTION)
+            .i32c(NATIVE_FUNCTION as i32)
+            .op(0x47)
             .op(0x71);
         // sp + 1 (a receiver inserted) + locals + headroom <= the room
         self.get(L_SP)

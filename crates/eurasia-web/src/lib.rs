@@ -369,7 +369,7 @@ pub extern "C" fn eurasia_rt_nlr(vm: *mut Vm, value: i64, next: i32, sp: i32) ->
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_rt_call(vm: *mut Vm, target: i32, next: i32, sp: i32) -> i32 {
     from_compiled(vm, sp, |vm| {
-        vm.compiled_call(target as u32 as usize, next as usize)
+        vm.compiled_call(&mut WebHost, target as u32 as usize, next as usize)
     })
 }
 

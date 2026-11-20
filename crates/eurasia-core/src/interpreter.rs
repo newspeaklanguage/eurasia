@@ -4436,6 +4436,42 @@ impl Vm {
         Some(id)
     }
 
+    /// The index of the inline-cache target for native method `method` sent
+    /// with `n` arguments, its receiver from `receiver`, made if need be
+    /// (its function [`NATIVE_FUNCTION`](crate::compiler::NATIVE_FUNCTION):
+    /// `call` runs it, compiled code pushes no frame); `None` if the table
+    /// is full.
+    fn native_target(&mut self, method: Value, n: usize, receiver: TargetReceiver) -> Option<u32> {
+        let (receiver_kind, fixed, receiver_key) = match receiver {
+            TargetReceiver::Present => (0, Value::from_bits(0), 0),
+            TargetReceiver::Frame => (1, Value::from_bits(0), 1),
+            TargetReceiver::Fixed(r) => (2, r, r.to_bits()),
+        };
+        let key = (method.to_bits(), receiver_key);
+        if let Some(&id) = self.jit_target_index.get(&key) {
+            return Some(id);
+        }
+        if self.jit_targets.len() >= MAX_JIT_TARGETS {
+            return None;
+        }
+        let nil = self.nil();
+        self.jit_targets.push(TargetEntry {
+            method,
+            literals: nil,
+            mixin: nil,
+            fixed,
+            function: crate::compiler::NATIVE_FUNCTION,
+            literal_offset: 0,
+            literal_count: 0,
+            locals: 0,
+            args: n as u32,
+            receiver_kind,
+        });
+        let id = (self.jit_targets.len() - 1) as u32;
+        self.jit_target_index.insert(key, id);
+        Some(id)
+    }
+
     /// Common selector `k` and its arity.
     #[inline]
     fn common_selector(&self, k: usize) -> Option<(Value, usize)> {
@@ -4595,10 +4631,11 @@ impl Vm {
 
     /// For compiled code: a send whose inline cache holds `target`
     /// ([`Vm::direct_call`]; with [`CLOSURE_TARGET`](crate::compiler::CLOSURE_TARGET),
-    /// a closure's `value` native) from the top frame's instruction, which
-    /// continues at `next`. Where the callee cannot be entered now,
-    /// [`MISS`](crate::compiler::MISS): the site makes the general send.
-    pub fn compiled_call(&mut self, target: usize, next: usize) -> i32 {
+    /// a closure target; a native's, [`Vm::native_target`]) from the top
+    /// frame's instruction, which continues at `next`. Where the callee
+    /// cannot be entered now, [`MISS`](crate::compiler::MISS): the site
+    /// makes the general send.
+    pub fn compiled_call(&mut self, host: &mut dyn Host, target: usize, next: usize) -> i32 {
         let closure = crate::compiler::CLOSURE_TARGET as usize;
         if target & closure != 0 {
             // A closure target: the closure's frame pushed, if it can be.
@@ -4619,11 +4656,34 @@ impl Vm {
             }
             return crate::compiler::MISS;
         }
-        if target >= self.jit_targets.len() || !self.may_enter_callee() {
+        let Some(&t) = self.jit_targets.get(target) else {
+            return crate::compiler::MISS;
+        };
+        if t.function == crate::compiler::NATIVE_FUNCTION {
+            // A native, run here as the general send would.
+            let before = self.before_compiled_call();
+            self.jit_regs.ic_kind = 0;
+            self.frames.last_mut().expect("a frame").ip = next;
+            let n = t.args as usize;
+            match t.receiver() {
+                TargetReceiver::Present => {}
+                TargetReceiver::Frame => {
+                    let r = self.frames.last().expect("a frame").receiver;
+                    self.insert_receiver(r, n);
+                }
+                TargetReceiver::Fixed(r) => self.insert_receiver(r, n),
+            }
+            let result = match self.method_header(t.method) {
+                Ok(header) => self.activate_with(t.method, header, n, host, None),
+                Err(e) => Err(e),
+            };
+            return self.after_compiled_call(before, result, next, false);
+        }
+        if !self.may_enter_callee() {
             return crate::compiler::MISS;
         }
         self.frames.last_mut().expect("a frame").ip = next;
-        self.enter_target(self.jit_targets[target])
+        self.enter_target(t)
     }
 
     /// A send of literal `index` by `rule` with `n` arguments from the top
@@ -4721,14 +4781,25 @@ impl Vm {
                     _ => 0,
                 };
                 let t = e.target;
+                // Another native: the inline cache can hold it as a target
+                // that `call` runs directly.
+                let native = if kind == 0 {
+                    self.native_target(t.method, n, t.receiver)
+                } else {
+                    None
+                };
+                let class = self.class_of(object);
                 if let TargetReceiver::Frame = t.receiver {
                     self.insert_receiver(receiver, n);
                 }
                 let result = self.activate_with(t.method, t.header, n, host, t.slot);
+                let r = &mut *self.jit_regs;
                 if kind != 0 {
-                    let class = self.class_of(object);
-                    let r = &mut *self.jit_regs;
                     r.ic_kind = kind;
+                    r.ic_class = class.to_bits();
+                } else if let Some(id) = native {
+                    r.ic_kind = crate::compiler::IC_METHOD;
+                    r.ic_slot = id;
                     r.ic_class = class.to_bits();
                 }
                 Some(result)
@@ -5489,10 +5560,12 @@ impl Vm {
             op::PUSH_NEW_ARRAY => {
                 let nil = self.nil();
                 let class = self.roles.get(Role::ArrayClass);
-                let a = self.heap.allocate(
+                let a = self.heap.allocate_array_of(
                     class,
                     Space::Actor(self.current as u32),
-                    Body::Array(alloc::vec![nil; bytes[1] as usize]),
+                    false,
+                    bytes[1] as usize,
+                    nil,
                 );
                 self.stack.push(a);
                 None
