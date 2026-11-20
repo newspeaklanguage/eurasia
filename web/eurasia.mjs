@@ -146,6 +146,7 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
             tick: vm.eurasia_rt_tick,
             call: vm.eurasia_rt_call,
             closure: vm.eurasia_rt_closure,
+            nlr: vm.eurasia_rt_nlr,
           } });
           const table = vm.__indirect_function_table;
           const index = table.grow(1);

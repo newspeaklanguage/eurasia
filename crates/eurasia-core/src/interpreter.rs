@@ -195,6 +195,16 @@ const _: () = {
     assert!(offset_of!(TargetEntry, literal_count) == c::TARGET_LITERAL_COUNT as usize);
     assert!(offset_of!(TargetEntry, locals) == c::TARGET_LOCALS as usize);
     assert!(offset_of!(TargetEntry, receiver_kind) == c::TARGET_RECEIVER_KIND as usize);
+    assert!(size_of::<ClosureTarget>() == c::CTARGET_SIZE as usize);
+    assert!(offset_of!(ClosureTarget, method) == c::CTARGET_METHOD as usize);
+    assert!(offset_of!(ClosureTarget, literals) == c::CTARGET_LITERALS as usize);
+    assert!(offset_of!(ClosureTarget, mixin) == c::CTARGET_MIXIN as usize);
+    assert!(offset_of!(ClosureTarget, initial_ip) == c::CTARGET_INITIAL_IP as usize);
+    assert!(offset_of!(ClosureTarget, function) == c::CTARGET_FUNCTION as usize);
+    assert!(offset_of!(ClosureTarget, block) == c::CTARGET_BLOCK as usize);
+    assert!(offset_of!(ClosureTarget, literal_offset) == c::CTARGET_LITERAL_OFFSET as usize);
+    assert!(offset_of!(ClosureTarget, literal_count) == c::CTARGET_LITERAL_COUNT as usize);
+    assert!(offset_of!(ClosureTarget, args) == c::CTARGET_ARGS as usize);
 };
 
 /// An optional Value in one word: 0 (SmallInteger 0, never an activation
@@ -336,6 +346,25 @@ impl TargetEntry {
     }
 }
 
+/// A closure body that compiled code's closure inline caches enter
+/// directly: closures of `method` whose body starts at `initial_ip` (a
+/// SmallInteger) and take `args` arguments. Compiled code reads the table:
+/// its layout is fixed (`crate::compiler`'s `CTARGET_` offsets).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ClosureTarget {
+    method: Value,
+    literals: Value,
+    mixin: Value,
+    initial_ip: Value,
+    function: u32,
+    block: u32,
+    /// As in [`TargetEntry`].
+    literal_offset: u32,
+    literal_count: u32,
+    args: u32,
+}
+
 /// Inline-cache targets per lookup-cache epoch, at most.
 const MAX_JIT_TARGETS: usize = 1 << 14;
 
@@ -446,6 +475,11 @@ pub struct Vm {
     jit_targets: Vec<TargetEntry>,
     /// Each target's index, by its method and receiver.
     jit_target_index: alloc::collections::BTreeMap<(u64, u64), u32>,
+    /// The targets of compiled code's closure inline caches, by index, and
+    /// each one's index by its method and body; cleared with the lookup
+    /// cache.
+    jit_closure_targets: Vec<ClosureTarget>,
+    jit_closure_target_index: alloc::collections::BTreeMap<(u64, u32), u32>,
     /// For each arithmetic or comparison common selector (0 to 13), whether
     /// SmallInteger's method for it is the native the fast path computes:
     /// 0 not yet known, 1 yes, 2 no. Cleared with the lookup cache.
@@ -535,6 +569,8 @@ impl Vm {
             small_integer_fast: [0; SMALL_INTEGER_FAST_PATHS],
             jit_targets: Vec::new(),
             jit_target_index: alloc::collections::BTreeMap::new(),
+            jit_closure_targets: Vec::new(),
+            jit_closure_target_index: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -547,6 +583,8 @@ impl Vm {
         self.jit_regs.epoch = self.jit_regs.epoch.wrapping_add(1).max(1);
         self.jit_targets.clear();
         self.jit_target_index.clear();
+        self.jit_closure_targets.clear();
+        self.jit_closure_target_index.clear();
         self.small_integer_fast = [0; SMALL_INTEGER_FAST_PATHS];
         let nil = self.nil();
         for f in &mut self.frames {
@@ -4067,6 +4105,7 @@ impl Vm {
         r.frames_len = self.frames.len() as u32;
         r.frames_cap = self.frames.capacity() as u32;
         r.targets = self.jit_targets.as_ptr() as usize as u32;
+        r.closure_targets = self.jit_closure_targets.as_ptr() as usize as u32;
         r.stack_cap = self.stack.capacity() as u32;
         r.jit_base = self.jit_base as u32;
         r.stepping = u32::from(self.step_limit.is_some());
@@ -4155,7 +4194,7 @@ impl Vm {
         n: usize,
         next_ip: usize,
     ) -> i32 {
-        use crate::compiler::{RULE_COMMON, RULE_ORDINARY, RULE_SELF, RULE_SUPER};
+        use crate::compiler::{RULE_COMMON, RULE_ORDINARY, RULE_OUTER, RULE_SELF, RULE_SUPER};
         let lookup = match rule {
             RULE_ORDINARY => Some(Rule::Ordinary),
             RULE_SELF => Some(Rule::SelfSend),
@@ -4163,6 +4202,8 @@ impl Vm {
             // the frame's mixin.
             RULE_SUPER => Some(Rule::Super),
             RULE_COMMON => None,
+            // Outer sends too, by their depth.
+            r if r >= RULE_OUTER => Some(Rule::Outer((r - RULE_OUTER) as usize)),
             _ => Some(Rule::ImplicitReceiver),
         };
         // A common send's arity is its selector's (the arithmetic's slow
@@ -4208,6 +4249,9 @@ impl Vm {
         let result = match cached {
             Some(r) => r,
             None if rule == RULE_COMMON => self.common_send(literal, host),
+            None if rule >= RULE_OUTER => {
+                self.outer_send(literal, n, (rule - RULE_OUTER) as usize, host)
+            }
             None => {
                 let kind = match rule {
                     RULE_ORDINARY => SendKind::Ordinary,
@@ -4279,12 +4323,15 @@ impl Vm {
                 return None;
             }
             let native = t.header.native;
+            let target = self.closure_target(key, n);
             let status = self.direct_closure(native, n, next_ip)?;
-            let class = self.class_of(key);
-            let r = &mut *self.jit_regs;
-            r.ic_kind = crate::compiler::IC_METHOD;
-            r.ic_slot = crate::compiler::CLOSURE_TARGET | native;
-            r.ic_class = class.to_bits();
+            if let Some(id) = target {
+                let class = self.class_of(key);
+                let r = &mut *self.jit_regs;
+                r.ic_kind = crate::compiler::IC_CLOSURE;
+                r.ic_slot = id;
+                r.ic_class = class.to_bits();
+            }
             return Some(status);
         }
         if t.header.kind != MethodKind::Ordinary {
@@ -4344,6 +4391,49 @@ impl Vm {
         r.ic_slot = id as u32;
         r.ic_class = class.to_bits();
         Some(status)
+    }
+
+    /// The index of the closure target for `closure`'s body (taking `n`
+    /// arguments, its method compiled), made if need be; `None` if there is
+    /// none, or the table is full.
+    fn closure_target(&mut self, closure: Value, n: usize) -> Option<u32> {
+        let c = self.heap.closure(closure)?;
+        if c.num_args() as usize != n {
+            return None;
+        }
+        let (defining, initial_ip) = (c.defining(), c.initial_ip());
+        let method = self.heap.activation(defining)?.method();
+        let key = (method.to_bits(), initial_ip);
+        if let Some(&id) = self.jit_closure_target_index.get(&key) {
+            return Some(id);
+        }
+        if self.jit_closure_targets.len() >= MAX_JIT_TARGETS {
+            return None;
+        }
+        let (function, block) = self.heap.compiled_entry(method, initial_ip as usize)?;
+        let (literals, mixin) = {
+            let m = self.heap.method(method)?;
+            (m.literals(), m.mixin())
+        };
+        let arena = self.heap.words.as_ptr() as usize;
+        let (literal_offset, literal_count) =
+            self.heap.array_elements(literals).map_or((0, 0), |e| {
+                ((e.as_ptr() as usize - arena) as u32, e.len() as u32)
+            });
+        self.jit_closure_targets.push(ClosureTarget {
+            method,
+            literals,
+            mixin,
+            initial_ip: Value::small_integer(i64::from(initial_ip))?,
+            function,
+            block,
+            literal_offset,
+            literal_count,
+            args: n as u32,
+        });
+        let id = (self.jit_closure_targets.len() - 1) as u32;
+        self.jit_closure_target_index.insert(key, id);
+        Some(id)
     }
 
     /// Common selector `k` and its arity.
@@ -4511,9 +4601,17 @@ impl Vm {
     pub fn compiled_call(&mut self, target: usize, next: usize) -> i32 {
         let closure = crate::compiler::CLOSURE_TARGET as usize;
         if target & closure != 0 {
-            // A closure's `value` native: its frame pushed, if it can be.
-            let native = (target & !closure) as u32;
-            let n = Native::from_id(native).map_or(0, |v| v.arity());
+            // A closure target: the closure's frame pushed, if it can be.
+            let Some(t) = self.jit_closure_targets.get(target & !closure) else {
+                return crate::compiler::MISS;
+            };
+            let native = match t.args {
+                0 => Native::ClosureValue,
+                1 => Native::ClosureValue1,
+                2 => Native::ClosureValue2,
+                _ => Native::ClosureValue3,
+            } as u32;
+            let n = t.args as usize;
             if self.may_enter_callee()
                 && let Some(status) = self.direct_closure(native, n, next)
             {
@@ -4561,7 +4659,7 @@ impl Vm {
                 }
                 if own {
                     self.jit_cache(object, slot);
-                } else if e.rule == Rule::ImplicitReceiver
+                } else if matches!(e.rule, Rule::ImplicitReceiver | Rule::Outer(_))
                     && let TargetReceiver::Fixed(_) = e.target.receiver
                 {
                     // An enclosing object's slot: keyed by the frame
@@ -4797,6 +4895,18 @@ impl Vm {
     fn refresh_after_return(&mut self) {
         self.refresh_jit_regs();
         self.jit_regs.depth = self.frames.len() as u32;
+    }
+
+    /// For compiled code: the non-local return of `value` by the top frame
+    /// (a closure's), whose instruction continues at `next` (where an
+    /// upcall, `cannotReturn:` or `aboutToReturn:through:`, leaves it), as
+    /// the interpreter makes it without the generic step; see
+    /// [`crate::compiler`] for the answer.
+    pub fn compiled_nlr(&mut self, host: &mut dyn Host, value: Value, next: usize) -> i32 {
+        let before = self.before_compiled_call();
+        self.frames.last_mut().expect("a frame").ip = next;
+        let result = self.non_local_return(value, host);
+        self.after_compiled_call(before, result, next, true)
     }
 
     /// For compiled code: the top frame's closure push at `ip`, as the

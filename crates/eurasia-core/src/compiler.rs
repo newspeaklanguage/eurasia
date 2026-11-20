@@ -147,6 +147,8 @@ pub struct Regs {
     pub jit_base: u32,
     /// Whether a step limit is set (1): compiled code then pushes no frame.
     pub stepping: u32,
+    /// The closure targets' address (each [`CTARGET_SIZE`] bytes).
+    pub closure_targets: u32,
 }
 
 const _: () = {
@@ -162,6 +164,7 @@ const _: () = {
     assert!(offset_of!(Regs, stack_cap) == R_STACK_CAP as usize);
     assert!(offset_of!(Regs, jit_base) == R_JIT_BASE as usize);
     assert!(offset_of!(Regs, stepping) == R_STEPPING as usize);
+    assert!(offset_of!(Regs, closure_targets) == R_CLOSURE_TARGETS as usize);
 };
 
 /// A frame's layout on wasm32 (the interpreter's `Frame`, checked there):
@@ -212,6 +215,36 @@ pub const TARGET_LITERAL_COUNT: u32 = 40;
 pub const TARGET_LOCALS: u32 = 44;
 /// See [`TARGET_SIZE`].
 pub const TARGET_RECEIVER_KIND: u32 = 52;
+/// A closure target's layout (the interpreter's `ClosureTarget`, checked
+/// there): its size and its fields' offsets.
+pub const CTARGET_SIZE: u32 = 56;
+/// See [`CTARGET_SIZE`].
+pub const CTARGET_METHOD: u32 = 0;
+/// See [`CTARGET_SIZE`].
+pub const CTARGET_LITERALS: u32 = 8;
+/// See [`CTARGET_SIZE`].
+pub const CTARGET_MIXIN: u32 = 16;
+/// See [`CTARGET_SIZE`].
+pub const CTARGET_INITIAL_IP: u32 = 24;
+/// See [`CTARGET_SIZE`].
+pub const CTARGET_FUNCTION: u32 = 32;
+/// See [`CTARGET_SIZE`].
+pub const CTARGET_BLOCK: u32 = 36;
+/// See [`CTARGET_SIZE`].
+pub const CTARGET_LITERAL_OFFSET: u32 = 40;
+/// See [`CTARGET_SIZE`].
+pub const CTARGET_LITERAL_COUNT: u32 = 44;
+/// See [`CTARGET_SIZE`].
+pub const CTARGET_ARGS: u32 = 48;
+// A closure's contents (after the header): its defining activation, its
+// body's first instruction and argument count (SmallIntegers), then the
+// copied values; an activation's: its frame, method and receiver first.
+const CLOSURE_DEFINING: u32 = SLOTS;
+const CLOSURE_INITIAL_IP: u32 = SLOTS + 8;
+const CLOSURE_NUM_ARGS: u32 = SLOTS + 16;
+const CLOSURE_COPIED: u32 = SLOTS + 24;
+const ACTIVATION_METHOD: u32 = SLOTS + 8;
+const ACTIVATION_RECEIVER: u32 = SLOTS + 16;
 /// Frames at most (the interpreter's limit).
 const MAX_FRAMES: u32 = crate::interpreter::MAX_FRAMES as u32;
 /// Compiled callees nested in the host's stack, at most (the VM's limit).
@@ -249,6 +282,7 @@ const R_TARGETS: u32 = 148;
 const R_STACK_CAP: u32 = 152;
 const R_JIT_BASE: u32 = 156;
 const R_STEPPING: u32 = 160;
+const R_CLOSURE_TARGETS: u32 = 164;
 
 // The object header (newspeak/EURASIA_ARENA_DESIGN): class, sequence number,
 // meta (format 5 bits, flags 5, space 21, remembered 1, size 32); then the
@@ -289,14 +323,18 @@ pub const IC_BIT_AND: u32 = 8;
 pub const IC_BIT_OR: u32 = 9;
 /// See [`IC_BIT_AND`].
 pub const IC_BIT_XOR: u32 = 10;
-/// An inline cache of an implicit-receiver send that reads a slot of an
+/// An inline cache of an implicit-receiver or outer send that reads a slot of an
 /// enclosing object (the site's object), read in compiled code.
 pub const IC_OUTER_GETTER: u32 = 11;
 /// An inline cache of a method that answers its receiver, answered in
 /// compiled code.
 pub const IC_RETURN_SELF: u32 = 12;
-/// The bit of an [`IC_METHOD`] target that makes it a closure's `value`
-/// native (of the id in the low bits) rather than a method.
+/// An inline cache of a closure's `value` send (an ordinary send to a
+/// closure): the slot is a closure target, the VM's index; closures with
+/// that target's body have their frames pushed in compiled code.
+pub const IC_CLOSURE: u32 = 13;
+/// The bit of a `call` target that makes it a closure target (of the
+/// index in the low bits) rather than a method's.
 pub const CLOSURE_TARGET: u32 = 1 << 31;
 /// The format code of an Array.
 const CODE_ARRAY: i64 = 3;
@@ -311,6 +349,8 @@ pub const RULE_SUPER: i32 = 2;
 pub const RULE_IMPLICIT: i32 = 3;
 /// A common-selector send.
 pub const RULE_COMMON: i32 = 4;
+/// An outer send `d` levels out is rule `RULE_OUTER + d`.
+pub const RULE_OUTER: i32 = 5;
 
 // Imported functions, in import order.
 const F_SEND: u32 = 0;
@@ -320,13 +360,15 @@ const F_STEP: u32 = 3;
 const F_TICK: u32 = 4;
 const F_CALL: u32 = 5;
 const F_CLOSURE: u32 = 6;
-const IMPORTED: u32 = 7;
+const F_NLR: u32 = 7;
+const IMPORTED: u32 = 8;
 
 // Types.
 const T_RUN: u32 = 0; // (i32, i32, i32) -> i32: run, interpret, step, tick
 const T_SEND: u32 = 1; // (i32 x 6) -> i32
 const T_RET: u32 = 2; // (i32, i64, i32) -> i32
 const T_CALL: u32 = 3; // (i32 x 4) -> i32
+const T_NLR: u32 = 4; // (i32, i64, i32, i32) -> i32
 
 // Locals of `run`: the parameters, then i32s, then i64s.
 const L_VM: u32 = 0;
@@ -408,6 +450,8 @@ enum Ins {
     /// A closure push, by the runtime's `closure`; compiled code goes on at
     /// the given index, past the closure's body.
     Closure(usize),
+    /// A `^` in a closure body: a non-local return, by the runtime's `nlr`.
+    NonLocalReturn(Ret),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -507,6 +551,11 @@ fn decode(code: &[u8]) -> Option<(Vec<(usize, usize, Ins)>, Vec<usize>)> {
                 literal: ext_sel,
                 args: ext_args,
             },
+            op::OUTER_SEND if i32::from(b3) <= i32::MAX - RULE_OUTER => Ins::Send {
+                rule: RULE_OUTER + i32::from(b3),
+                literal: ext_sel,
+                args: ext_args,
+            },
             op::SUPER_SEND => Ins::Send {
                 rule: RULE_SUPER,
                 literal: ext_sel,
@@ -537,17 +586,23 @@ fn decode(code: &[u8]) -> Option<(Vec<(usize, usize, Ins)>, Vec<usize>)> {
         ip = next;
     }
     // A `^` outside every closure body (in an inlined block, say) is in a
-    // method's frame, where it is a local return.
+    // method's frame, where it is a local return; inside one, a non-local
+    // return.
     for entry in &mut out {
         let o = code[entry.0];
-        if (171..=175).contains(&o) && !bodies.iter().any(|b| b.contains(&entry.0)) {
-            entry.2 = Ins::Return(match o {
+        if (171..=175).contains(&o) {
+            let r = match o {
                 171 => Ret::Nil,
                 172 => Ret::False,
                 173 => Ret::True,
                 174 => Ret::Self_,
                 _ => Ret::Top,
-            });
+            };
+            entry.2 = if bodies.iter().any(|b| b.contains(&entry.0)) {
+                Ins::NonLocalReturn(r)
+            } else {
+                Ins::Return(r)
+            };
         }
     }
     Some((out, closures))
@@ -596,7 +651,7 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                 leaders.push(t);
                 leaders.push(next);
             }
-            Ins::Return(_) => leaders.push(next),
+            Ins::Return(_) | Ins::NonLocalReturn(_) => leaders.push(next),
             Ins::Send { .. } | Ins::Arith(_) | Ins::Indirect { .. } => leaders.push(next),
             Ins::Step(after) | Ins::Closure(after) => {
                 leaders.push(after);
@@ -980,25 +1035,21 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                     }
                 }
             }
+            Ins::NonLocalReturn(r) => {
+                f.ret_value(r);
+                f.set(L_R64);
+                f.get(L_VM)
+                    .get(L_R64)
+                    .i32c(next as i32)
+                    .get(L_SP)
+                    .call(F_NLR)
+                    .set(L_R);
+                f.after_call();
+                // The frame does not go on.
+                f.interpret(next);
+            }
             Ins::Return(r) => {
-                match r {
-                    Ret::Top => {
-                        f.dec_sp();
-                        f.top_value_at_sp();
-                    }
-                    Ret::Self_ => {
-                        f.get(L_SELF);
-                    }
-                    Ret::Nil => {
-                        f.get(L_NIL);
-                    }
-                    Ret::True => {
-                        f.get(L_TRUE);
-                    }
-                    Ret::False => {
-                        f.get(L_FALSE);
-                    }
-                }
+                f.ret_value(r);
                 f.set(L_R64);
                 f.pop_frame();
                 f.get(L_VM).get(L_R64);
@@ -1695,6 +1746,185 @@ impl Func {
             .add()
             .set(L_R)
     }
+    /// Whether the closure in `a` (at `addr`; after [`Func::site_hit`]), the
+    /// receiver of a `value` send of `args` arguments, can have its frame
+    /// pushed here for the hit entry's closure target (its index in
+    /// `slot`): the target's body and method, `args` arguments, no step
+    /// limit and no safepoint due, room for a frame and for its copied
+    /// values plus the headroom. Leaves the target's address in `index`
+    /// and the defining activation's in `kind`.
+    fn push_closure_ok(&mut self, args: u32) -> &mut Func {
+        self.reg32(R_CLOSURE_TARGETS)
+            .get(L_SLOT)
+            .i32c(CTARGET_SIZE as i32)
+            .op(0x6c)
+            .add()
+            .set(L_INDEX);
+        // the defining activation's address
+        self.reg32(R_ARENA)
+            .get(L_ADDR)
+            .ld64(CLOSURE_DEFINING)
+            .i64c(1)
+            .op(0x88)
+            .op(0xa7)
+            .i32c(3)
+            .op(0x74)
+            .add()
+            .set(L_KIND);
+        self.get(L_ADDR)
+            .ld64(CLOSURE_INITIAL_IP)
+            .get(L_INDEX)
+            .ld64(CTARGET_INITIAL_IP)
+            .op(0x51);
+        self.get(L_ADDR)
+            .ld64(CLOSURE_NUM_ARGS)
+            .i64c(i64::from(args) << 1)
+            .op(0x51)
+            .op(0x71);
+        self.get(L_KIND)
+            .ld64(ACTIVATION_METHOD)
+            .get(L_INDEX)
+            .ld64(CTARGET_METHOD)
+            .op(0x51)
+            .op(0x71);
+        self.reg32(R_STEPPING)
+            .reg32(R_DUE)
+            .op(0x72)
+            .op(0x45)
+            .op(0x71);
+        self.reg32(R_FRAMES_LEN)
+            .reg32(R_FRAMES_CAP)
+            .op(0x49)
+            .op(0x71);
+        self.reg32(R_FRAMES_LEN)
+            .i32c(MAX_FRAMES as i32 - 1)
+            .op(0x49)
+            .op(0x71);
+        self.reg32(R_FRAMES_LEN)
+            .i32c(1)
+            .add()
+            .reg32(R_JIT_BASE)
+            .sub()
+            .i32c(MAX_NESTED as i32)
+            .op(0x48)
+            .op(0x71);
+        // sp + copied (size - 3) + headroom <= the room
+        self.get(L_SP)
+            .i32c(HEADROOM as i32 - 3)
+            .add()
+            .get(L_ADDR)
+            .ld64(META)
+            .i64c(32)
+            .op(0x88)
+            .op(0xa7)
+            .add()
+            .reg32(R_STACK_CAP)
+            .op(0x4d)
+            .op(0x71)
+    }
+    /// Pushes the frame of the closure in `a` (after
+    /// [`Func::push_closure_ok`]) for its `value` send of `args` arguments,
+    /// which continues at `next`, as the VM's `direct_closure` does: the
+    /// copied values its first locals, the caller's `ip` at `next`, the
+    /// registers set for the body's block; `r` is then [`CALLEE`] plus its
+    /// function.
+    fn push_closure_frame(&mut self, args: u32, next: usize) -> &mut Func {
+        // the receiver, the defining activation's, in `b`; bp in `kind`
+        self.get(L_KIND).ld64(ACTIVATION_RECEIVER).set(L_B);
+        self.get(L_SP).i32c(1 + args as i32).sub().set(L_KIND);
+        // the caller's ip
+        self.reg32(R_FRAMES_LEN).i32c(1).sub().frame_addr();
+        self.i32c(next as i32).st32(FRAME_IP);
+        // the new frame, at `slot`
+        self.reg32(R_FRAMES_LEN).frame_addr().set(L_SLOT);
+        self.get(L_SLOT).get(L_SP).st32(FRAME_LP);
+        self.get(L_SLOT).get(L_KIND).st32(FRAME_BP);
+        self.get(L_SLOT).i32c(args as i32).st32(FRAME_ARG_COUNT);
+        self.get(L_SLOT).i32c(0).st32(FRAME_CODE);
+        self.get(L_SLOT)
+            .get(L_INDEX)
+            .ld64(CTARGET_INITIAL_IP)
+            .i64c(1)
+            .op(0x87)
+            .op(0xa7)
+            .st32(FRAME_IP);
+        self.get(L_SLOT).reg64(R_SERIAL).st64(FRAME_SERIAL);
+        self.set_reg64(R_SERIAL, |f| {
+            f.reg64(R_SERIAL).i64c(1).op(0x7c);
+        });
+        for (from, to) in [
+            (CTARGET_METHOD, FRAME_METHOD),
+            (CTARGET_LITERALS, FRAME_LITERALS),
+            (CTARGET_MIXIN, FRAME_MIXIN),
+        ] {
+            self.get(L_SLOT).get(L_INDEX).ld64(from).st64(to);
+        }
+        self.get(L_SLOT).get(L_B).st64(FRAME_RECEIVER);
+        self.get(L_SLOT).i64c(0).st64(FRAME_ACTIVATION);
+        self.get(L_SLOT).get(L_A).st64(FRAME_CLOSURE);
+        // the copied values, pushed: `r` of them, from `addr` on
+        self.get(L_ADDR)
+            .ld64(META)
+            .i64c(32)
+            .op(0x88)
+            .op(0xa7)
+            .i32c(3)
+            .sub()
+            .set(L_R);
+        self.get(L_ADDR)
+            .i32c(CLOSURE_COPIED as i32)
+            .add()
+            .set(L_ADDR);
+        self.op(0x02).op(0x40).op(0x03).op(0x40); // block, loop
+        self.get(L_R).op(0x45).op(0x0d).uleb(1);
+        self.push_addr().get(L_ADDR).load().store();
+        self.inc_sp();
+        self.get(L_ADDR).i32c(8).add().set(L_ADDR);
+        self.get(L_R).i32c(1).sub().set(L_R);
+        self.op(0x0c).uleb(0).op(0x0b).op(0x0b);
+        // the count and the registers
+        self.set_reg32(R_FRAMES_LEN, |f| {
+            f.reg32(R_FRAMES_LEN).i32c(1).add();
+        });
+        self.set_reg32(R_DEPTH, |f| {
+            f.reg32(R_FRAMES_LEN);
+        });
+        self.set_reg32(R_SP, |f| {
+            f.get(L_SP);
+        });
+        self.set_reg32(R_BP, |f| {
+            f.get(L_KIND);
+        });
+        self.set_reg32(R_LP, |f| {
+            f.get(L_SLOT).ld32(FRAME_LP);
+        });
+        self.set_reg32(R_ARGC, |f| {
+            f.i32c(args as i32);
+        });
+        self.set_reg32(R_LITERALS, |f| {
+            f.reg32(R_ARENA)
+                .get(L_INDEX)
+                .ld32(CTARGET_LITERAL_OFFSET)
+                .add();
+        });
+        self.set_reg32(R_LITERAL_COUNT, |f| {
+            f.get(L_INDEX).ld32(CTARGET_LITERAL_COUNT);
+        });
+        self.set_reg64(R_RECEIVER, |f| {
+            f.get(L_B);
+        });
+        self.set_reg32(R_BLOCK, |f| {
+            f.get(L_INDEX).ld32(CTARGET_BLOCK);
+        });
+        self.set_reg32(R_IC_KIND, |f| {
+            f.i32c(0);
+        });
+        self.get(L_INDEX)
+            .ld32(CTARGET_FUNCTION)
+            .i32c(CALLEE)
+            .add()
+            .set(L_R)
+    }
     /// The local return of the value in `r64`, when a compiled caller in
     /// this wasm stack takes it (the frame is deeper than the one the host
     /// entered, which returns to the host, which must adopt the stack) and
@@ -1737,10 +1967,8 @@ impl Func {
     fn send(&mut self, rule: i32, literal: u32, args: u32, next: usize) -> &mut Func {
         // A common send is an ordinary send of its selector (the
         // runtime tries SmallInteger's fast paths first).
-        let cacheable = matches!(
-            rule,
-            RULE_ORDINARY | RULE_SELF | RULE_SUPER | RULE_IMPLICIT | RULE_COMMON
-        );
+        // Every rule: ordinary, self, super, implicit, common, outer.
+        let cacheable = rule >= RULE_ORDINARY;
         let site = if cacheable {
             Some(self.new_site())
         } else {
@@ -1762,7 +1990,7 @@ impl Func {
                 self.op(0x0c).uleb(2); // br: the send's end
                 self.op(0x0b);
             }
-            if args == 0 && rule == RULE_IMPLICIT {
+            if args == 0 && (rule == RULE_IMPLICIT || rule >= RULE_OUTER) {
                 // An enclosing object's slot, read here.
                 self.get(L_KIND).i32c(IC_OUTER_GETTER as i32).op(0x46);
                 self.op(0x04).op(0x7f);
@@ -1814,6 +2042,27 @@ impl Func {
                     self.op(0x0c).uleb(2); // br: the send's end
                     self.op(0x0b);
                 }
+            }
+            if ordinary && args <= 3 {
+                // A closure's `value`: its frame pushed here when the closure
+                // has the cached body and there is room, else by `call`.
+                self.get(L_KIND).i32c(IC_CLOSURE as i32).op(0x46);
+                self.op(0x04).op(0x40);
+                self.push_closure_ok(args);
+                self.op(0x04).op(0x40);
+                self.push_closure_frame(args, next);
+                self.op(0x0c).uleb(2); // br: after the call
+                self.op(0x0b);
+                self.get(L_VM)
+                    .get(L_SLOT)
+                    .i32c(CLOSURE_TARGET as i32)
+                    .op(0x72)
+                    .i32c(next as i32)
+                    .get(L_SP)
+                    .call(F_CALL)
+                    .set(L_R);
+                self.get(L_R).i32c(MISS).op(0x47).op(0x0d).uleb(1);
+                self.op(0x0b);
             }
             // A compiled method: its frame pushed here when there is room
             // and nothing else to do, else by `call`.
@@ -1903,6 +2152,16 @@ impl Func {
         }
         self
     }
+    /// Pushes the value a return answers (popping it, for `^` of the top).
+    fn ret_value(&mut self, r: Ret) -> &mut Func {
+        match r {
+            Ret::Top => self.dec_sp().top_value_at_sp(),
+            Ret::Self_ => self.get(L_SELF),
+            Ret::Nil => self.get(L_NIL),
+            Ret::True => self.get(L_TRUE),
+            Ret::False => self.get(L_FALSE),
+        }
+    }
     /// Leaves the frame at instruction `ip` for the interpreter, and returns.
     fn interpret(&mut self, ip: usize) -> &mut Func {
         self.get(L_VM)
@@ -1942,11 +2201,12 @@ fn module(body: &[u8], sites: u32) -> Vec<u8> {
     const I64: u8 = 0x7e;
     let mut m = alloc::vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
     // Types, in the order of the T_ constants.
-    let types: [(&[u8], &[u8]); 4] = [
+    let types: [(&[u8], &[u8]); 5] = [
         (&[I32, I32, I32], &[I32]),
         (&[I32, I32, I32, I32, I32, I32], &[I32]),
         (&[I32, I64, I32], &[I32]),
         (&[I32, I32, I32, I32], &[I32]),
+        (&[I32, I64, I32, I32], &[I32]),
     ];
     let mut t = Vec::new();
     uleb(&mut t, types.len() as u32);
@@ -1968,6 +2228,7 @@ fn module(body: &[u8], sites: u32) -> Vec<u8> {
         ("tick", T_RUN),
         ("call", T_CALL),
         ("closure", T_RUN),
+        ("nlr", T_NLR),
     ];
     let mut im = Vec::new();
     uleb(&mut im, functions.len() as u32 + 2);

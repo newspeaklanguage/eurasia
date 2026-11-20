@@ -353,6 +353,18 @@ pub extern "C" fn eurasia_rt_closure(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
     from_compiled(vm, sp, |vm| vm.compiled_closure(ip as usize))
 }
 
+/// For compiled code: a non-local return of `value` ([`Vm::compiled_nlr`]), the stack at height `sp`.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_nlr(vm: *mut Vm, value: i64, next: i32, sp: i32) -> i32 {
+    from_compiled(vm, sp, |vm| {
+        vm.compiled_nlr(
+            &mut WebHost,
+            eurasia_core::Value::from_bits(value as u64),
+            next as usize,
+        )
+    })
+}
+
 /// For compiled code: a send its inline cache holds the target of ([`Vm::compiled_call`]), the stack at height `sp`.
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_rt_call(vm: *mut Vm, target: i32, next: i32, sp: i32) -> i32 {
