@@ -228,6 +228,33 @@ struct CacheEntry {
     target: Target,
 }
 
+/// A compiled method that compiled code's inline caches enter directly
+/// ([`Vm::compiled_call`]): what activating it needs, looked up once per
+/// lookup-cache epoch.
+struct JitTarget {
+    code: Rc<[u8]>,
+    entry: TargetEntry,
+}
+
+/// What [`Vm::enter_target`] needs of a [`JitTarget`] besides its code.
+#[derive(Clone, Copy)]
+struct TargetEntry {
+    method: Value,
+    function: u32,
+    literals: Value,
+    /// The literals' first element, in bytes from the arena's start, and
+    /// how many there are.
+    literal_offset: u32,
+    literal_count: u32,
+    mixin: Value,
+    locals: usize,
+    args: usize,
+    receiver: TargetReceiver,
+}
+
+/// Inline-cache targets per lookup-cache epoch, at most.
+const MAX_JIT_TARGETS: usize = 1 << 14;
+
 /// How [`Vm::run_simple`]'s inner loop ends.
 enum Exit {
     /// At the instruction where the event loop polls the host.
@@ -326,6 +353,11 @@ pub struct Vm {
     /// The registers compiled code reads ([`crate::compiler::Regs`]), boxed
     /// so that their address holds while it runs.
     jit_regs: alloc::boxed::Box<crate::compiler::Regs>,
+    /// The targets of compiled code's method inline caches, by index;
+    /// cleared with the lookup cache, whose epoch the caches check.
+    jit_targets: Vec<JitTarget>,
+    /// Each target's index, by its method and receiver.
+    jit_target_index: alloc::collections::BTreeMap<(u64, u64), u32>,
     /// For each arithmetic or comparison common selector (0 to 13), whether
     /// SmallInteger's method for it is the native the fast path computes:
     /// 0 not yet known, 1 yes, 2 no. Cleared with the lookup cache.
@@ -412,6 +444,8 @@ impl Vm {
                 ..crate::compiler::Regs::default()
             }),
             small_integer_fast: [0; SMALL_INTEGER_FAST_PATHS],
+            jit_targets: Vec::new(),
+            jit_target_index: alloc::collections::BTreeMap::new(),
         }
     }
 
@@ -422,6 +456,8 @@ impl Vm {
         self.lookup_cache.fill(None);
         // Compiled code's inline caches go with it.
         self.jit_regs.epoch = self.jit_regs.epoch.wrapping_add(1).max(1);
+        self.jit_targets.clear();
+        self.jit_target_index.clear();
         self.small_integer_fast = [0; SMALL_INTEGER_FAST_PATHS];
         let nil = self.nil();
         for f in &mut self.frames {
@@ -3550,11 +3586,15 @@ impl Vm {
         let top = self.frames.len() - 1;
         for i in (0..top).rev() {
             if self.frames[i].serial == home_serial {
-                let popped = self.frames.split_off(i);
-                for f in &popped {
-                    self.retire(f);
+                // In place: no new vector for the frames cut.
+                for k in i..self.frames.len() {
+                    if let Some(a) = self.frames[k].activation {
+                        self.heap.set_activation_frame(a, None);
+                    }
                 }
-                self.stack.truncate(popped[0].bp);
+                let bp = self.frames[i].bp;
+                self.frames.truncate(i);
+                self.stack.truncate(bp);
                 self.stack.push(result);
                 return Ok(None);
             }
@@ -3899,6 +3939,7 @@ impl Vm {
         r.literals = literals;
         r.literal_count = literal_count;
         r.arena = self.heap.words.as_ptr() as usize as u32;
+        r.bytes = self.heap.bytes.as_ptr() as usize as u32;
         r.boundary = self.heap.boundary as u32;
         r.receiver = receiver.to_bits();
         r.nil = nil.to_bits();
@@ -3922,6 +3963,7 @@ impl Vm {
             r.literals = r.literals.wrapping_sub(r.arena).wrapping_add(arena);
         }
         r.arena = arena;
+        r.bytes = self.heap.bytes.as_ptr() as usize as u32;
         r.boundary = self.heap.boundary as u32;
     }
 
@@ -3936,16 +3978,55 @@ impl Vm {
         next_ip: usize,
     ) -> i32 {
         use crate::compiler::{RULE_COMMON, RULE_ORDINARY, RULE_SELF, RULE_SUPER};
+        let lookup = match rule {
+            RULE_ORDINARY => Some(Rule::Ordinary),
+            RULE_SELF => Some(Rule::SelfSend),
+            // Super sends are keyed as self sends are: the receiver's class,
+            // the frame's mixin.
+            RULE_SUPER => Some(Rule::Super),
+            RULE_COMMON => None,
+            _ => Some(Rule::ImplicitReceiver),
+        };
+        // A common send's arity is its selector's (the arithmetic's slow
+        // path passes none).
+        let n = if rule == RULE_COMMON {
+            crate::bytecode::COMMON_SELECTORS
+                .get(literal)
+                .map_or(n, |&(_, arity)| usize::from(arity))
+        } else {
+            n
+        };
+        if rule == RULE_COMMON
+            && literal < SMALL_INTEGER_FAST_PATHS
+            && let Some(v) = self.small_integer_fast_path(literal)
+        {
+            let len = self.stack.len();
+            self.stack.truncate(len - 2);
+            self.stack.push(v);
+            self.jit_regs.ic_kind = 0;
+            self.refresh_jit_regs();
+            return crate::compiler::DONE;
+        }
+        let hit = match lookup {
+            Some(r) => self.cache_hit(r, literal, n),
+            // A common send (SmallInteger's fast path did not apply): an
+            // ordinary send of its selector.
+            None if rule == RULE_COMMON => {
+                self.common_selector(literal).and_then(|(selector, arity)| {
+                    self.cache_hit_selector(Rule::Ordinary, selector, arity)
+                })
+            }
+            None => None,
+        };
+        if let Some((e, key, _)) = &hit
+            && let Some(status) = self.direct_call(e, *key, n, next_ip)
+        {
+            return status;
+        }
         let before = self.before_compiled_call();
         self.jit_regs.ic_kind = 0;
         self.frames.last_mut().expect("a frame").ip = next_ip;
-        let cached = match rule {
-            RULE_COMMON => None,
-            RULE_ORDINARY => self.cached_send(Rule::Ordinary, literal, n, host),
-            RULE_SELF => self.cached_send(Rule::SelfSend, literal, n, host),
-            RULE_SUPER => None,
-            _ => self.cached_send(Rule::ImplicitReceiver, literal, n, host),
-        };
+        let cached = hit.and_then(|h| self.cached_send(h, n, host));
         let result = match cached {
             Some(r) => r,
             None if rule == RULE_COMMON => self.common_send(literal, host),
@@ -3962,30 +4043,35 @@ impl Vm {
         self.after_compiled_call(before, result, next_ip, false)
     }
 
-    /// A send of literal `index` by `rule` with `n` arguments from the top
-    /// frame through the lookup cache, as `run_simple` makes it: an accessor
-    /// read or written here, any other cached method activated. `None` on a
-    /// miss, or where the full send must decide.
-    fn cached_send(
-        &mut self,
-        rule: Rule,
-        index: usize,
-        n: usize,
-        host: &mut dyn Host,
-    ) -> Option<Result<Option<Completion>, VmError>> {
+    /// The lookup cache's entry for a send of literal `index` by `rule` with
+    /// `n` arguments from the top frame, with the send's key (the message
+    /// receiver for an ordinary send, else the frame's receiver) and the
+    /// frame's receiver.
+    #[inline]
+    fn cache_hit(&self, rule: Rule, index: usize, n: usize) -> Option<(CacheEntry, Value, Value)> {
         let selector = self.literal(index)?;
+        self.cache_hit_selector(rule, selector, n)
+    }
+
+    /// [`Vm::cache_hit`], given the selector.
+    #[inline]
+    fn cache_hit_selector(
+        &self,
+        rule: Rule,
+        selector: Value,
+        n: usize,
+    ) -> Option<(CacheEntry, Value, Value)> {
         let (receiver, mixin, lp) = {
             let f = self.frames.last()?;
             (f.receiver, f.mixin, f.lp)
         };
-        let nil = self.nil();
         let len = self.stack.len();
         let ordinary = rule == Rule::Ordinary;
         if len < lp + n + usize::from(ordinary) {
             return None;
         }
         let (key, key_mixin) = if ordinary {
-            (self.stack[len - 1 - n], nil)
+            (self.stack[len - 1 - n], self.nil())
         } else {
             (receiver, mixin)
         };
@@ -3994,6 +4080,267 @@ impl Vm {
         if e.class != class || e.selector != selector || e.mixin != key_mixin || e.rule != rule {
             return None;
         }
+        Some((e, key, receiver))
+    }
+
+    /// For compiled code: a send that the lookup cache resolves to an
+    /// ordinary method already compiled, activated here and entered at its
+    /// start ([`CALLEE`](crate::compiler::CALLEE)), without the generic
+    /// activation and the checks after it: pushing a frame allocates
+    /// nothing, so no collection can intervene. The send's inline cache can
+    /// then hold the target ([`crate::compiler::IC_METHOD`]). `None` where
+    /// the general path must decide.
+    fn direct_call(&mut self, e: &CacheEntry, key: Value, n: usize, next_ip: usize) -> Option<i32> {
+        if !self.may_enter_callee() {
+            return None;
+        }
+        let t = e.target;
+        if t.header.kind == MethodKind::Native {
+            return self.direct_closure(t.header.native, n, next_ip);
+        }
+        if t.header.kind != MethodKind::Ordinary {
+            return None;
+        }
+        let receiver_key = match t.receiver {
+            TargetReceiver::Present => 0,
+            TargetReceiver::Frame => 1,
+            TargetReceiver::Fixed(r) => r.to_bits(),
+        };
+        let key_bits = (t.method.to_bits(), receiver_key);
+        let id = match self.jit_target_index.get(&key_bits) {
+            Some(&id) => id as usize,
+            None => {
+                let (function, code) = {
+                    let (f, c) = self.heap.compiled_start(t.method)?;
+                    (f, c.clone())
+                };
+                let (literals, mixin) = {
+                    let m = self.heap.method(t.method)?;
+                    (m.literals(), m.mixin())
+                };
+                let arena = self.heap.words.as_ptr() as usize;
+                let (literal_offset, literal_count) =
+                    self.heap.array_elements(literals).map_or((0, 0), |e| {
+                        ((e.as_ptr() as usize - arena) as u32, e.len() as u32)
+                    });
+                let entry = TargetEntry {
+                    method: t.method,
+                    function,
+                    literals,
+                    literal_offset,
+                    literal_count,
+                    mixin,
+                    locals: t.header.local_count as usize,
+                    args: n,
+                    receiver: t.receiver,
+                };
+                if self.jit_targets.len() >= MAX_JIT_TARGETS {
+                    self.frames.last_mut().expect("a frame").ip = next_ip;
+                    return Some(self.enter_target(entry, code));
+                }
+                self.jit_targets.push(JitTarget { code, entry });
+                let id = self.jit_targets.len() - 1;
+                self.jit_target_index.insert(key_bits, id as u32);
+                id
+            }
+        };
+        let class = self.class_of(key);
+        self.frames.last_mut().expect("a frame").ip = next_ip;
+        let t = &self.jit_targets[id];
+        let (entry, code) = (t.entry, t.code.clone());
+        let status = self.enter_target(entry, code);
+        let r = &mut *self.jit_regs;
+        r.ic_kind = crate::compiler::IC_METHOD;
+        r.ic_slot = id as u32;
+        r.ic_class = class.to_bits();
+        Some(status)
+    }
+
+    /// Common selector `k` and its arity.
+    #[inline]
+    fn common_selector(&self, k: usize) -> Option<(Value, usize)> {
+        let table = self.roles.get(Role::CommonSelectors);
+        let entries = self.heap.array_elements(table)?;
+        let (selector, arity) = (*entries.get(2 * k)?, *entries.get(2 * k + 1)?);
+        Some((selector, usize::try_from(arity.as_small_integer()?).ok()?))
+    }
+
+    /// For compiled code: a send of `n` arguments to a closure whose method
+    /// is compiled, that the lookup cache resolved to `native` (one of
+    /// Closure's `value` natives, of arity `n`): the closure's frame pushed
+    /// here and entered at its body ([`CALLEE`](crate::compiler::CALLEE)),
+    /// as [`Vm::direct_call`] does for methods. `None` where the general
+    /// path must decide (the native fails, or tier-up must count).
+    fn direct_closure(&mut self, native: u32, n: usize, next_ip: usize) -> Option<i32> {
+        let native = Native::from_id(native)?;
+        if !matches!(
+            native,
+            Native::ClosureValue
+                | Native::ClosureValue1
+                | Native::ClosureValue2
+                | Native::ClosureValue3
+        ) || native.arity() != n
+        {
+            return None;
+        }
+        let closure = self.stack[self.stack.len() - 1 - n];
+        let c = self.heap.closure(closure)?;
+        if c.num_args() as usize != n {
+            return None;
+        }
+        let (defining, initial_ip) = (c.defining(), c.initial_ip() as usize);
+        let (method, receiver) = {
+            let a = self.heap.activation(defining)?;
+            (a.method(), a.receiver())
+        };
+        let (code, literals, mixin) = {
+            let m = self.heap.method(method)?;
+            (m.bytecode().clone(), m.literals(), m.mixin())
+        };
+        let (function, block) = self.heap.compiled_entry(method, &code, initial_ip)?;
+        let (literal_address, literal_count) = self
+            .heap
+            .array_elements(literals)
+            .map_or((0, 0), |e| (e.as_ptr() as usize, e.len()));
+        self.frames.last_mut().expect("a frame").ip = next_ip;
+        // As activate_closure: the copied values are the closure's first
+        // locals.
+        let base = self.stack.len() - 1 - n;
+        let lp = self.stack.len();
+        if let Some(c) = self.heap.closure(closure) {
+            self.stack.extend(c.copied().iter().copied());
+        }
+        self.stack.reserve(crate::compiler::HEADROOM);
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        self.frames.push(Frame {
+            serial,
+            method,
+            code,
+            literals,
+            mixin,
+            receiver,
+            bp: base,
+            arg_count: n,
+            lp,
+            ip: initial_ip,
+            activation: None,
+            closure: Some(closure),
+        });
+        let depth = self.frames.len();
+        let base_address = self.stack.as_ptr() as usize as u32;
+        let sp = self.stack.len();
+        let r = &mut *self.jit_regs;
+        r.base = base_address;
+        r.sp = sp as u32;
+        r.bp = base as u32;
+        r.lp = lp as u32;
+        r.argc = n as u32;
+        r.literals = literal_address as u32;
+        r.literal_count = literal_count as u32;
+        r.receiver = receiver.to_bits();
+        r.depth = depth as u32;
+        r.block = block;
+        r.ic_kind = 0;
+        Some(crate::compiler::CALLEE + function as i32)
+    }
+
+    /// Whether a send may push a compiled callee's frame and answer
+    /// [`CALLEE`](crate::compiler::CALLEE): no step limit, room for the
+    /// frame, within the host's nesting, no safepoint due.
+    #[inline]
+    fn may_enter_callee(&self) -> bool {
+        /// As in [`Vm::after_compiled_call`].
+        const MAX_NESTED: usize = 512;
+        let depth = self.frames.len();
+        self.step_limit.is_none()
+            && depth < MAX_FRAMES
+            && (depth + 1).saturating_sub(self.jit_base) < MAX_NESTED
+            && !self.safepoint_due()
+    }
+
+    /// Activates `t` on the receiver and arguments on top of the stack (the
+    /// receiver inserted, if the target's is not the message's) and answers
+    /// [`CALLEE`](crate::compiler::CALLEE) for its function, the registers
+    /// set for its frame. Only what a frame push changes is set: it
+    /// allocates nothing.
+    fn enter_target(&mut self, t: TargetEntry, code: Rc<[u8]>) -> i32 {
+        let n = t.args;
+        match t.receiver {
+            TargetReceiver::Present => {}
+            TargetReceiver::Frame => {
+                let r = self.frames.last().expect("a frame").receiver;
+                self.insert_receiver(r, n);
+            }
+            TargetReceiver::Fixed(r) => self.insert_receiver(r, n),
+        }
+        let base = self.stack.len() - 1 - n;
+        let receiver = self.stack[base];
+        let lp = self.stack.len();
+        let nil = self.nil();
+        self.stack.extend(core::iter::repeat_n(nil, t.locals));
+        self.stack.reserve(crate::compiler::HEADROOM);
+        let serial = self.next_serial;
+        self.next_serial += 1;
+        self.frames.push(Frame {
+            serial,
+            method: t.method,
+            code,
+            literals: t.literals,
+            mixin: t.mixin,
+            receiver,
+            bp: base,
+            arg_count: n,
+            lp,
+            ip: 0,
+            activation: None,
+            closure: None,
+        });
+        let depth = self.frames.len();
+        let base_address = self.stack.as_ptr() as usize as u32;
+        let sp = self.stack.len();
+        let r = &mut *self.jit_regs;
+        r.base = base_address;
+        r.sp = sp as u32;
+        r.bp = base as u32;
+        r.lp = lp as u32;
+        r.argc = n as u32;
+        r.literals = r.arena.wrapping_add(t.literal_offset);
+        r.literal_count = t.literal_count;
+        r.receiver = receiver.to_bits();
+        r.depth = depth as u32;
+        r.block = 0;
+        r.ic_kind = 0;
+        crate::compiler::CALLEE + t.function as i32
+    }
+
+    /// For compiled code: a send whose inline cache holds `target`
+    /// ([`Vm::direct_call`]) from the top frame's instruction at `ip`, which
+    /// continues at `next`. Where the callee cannot be entered now, the
+    /// interpreter runs the send.
+    pub fn compiled_call(&mut self, target: usize, ip: usize, next: usize) -> i32 {
+        if target >= self.jit_targets.len() || !self.may_enter_callee() {
+            self.frames.last_mut().expect("a frame").ip = ip;
+            return crate::compiler::INTERPRET;
+        }
+        self.frames.last_mut().expect("a frame").ip = next;
+        let t = &self.jit_targets[target];
+        let (entry, code) = (t.entry, t.code.clone());
+        self.enter_target(entry, code)
+    }
+
+    /// A send of literal `index` by `rule` with `n` arguments from the top
+    /// frame through the lookup cache, as `run_simple` makes it: an accessor
+    /// read or written here, any other cached method activated. `None` on a
+    /// miss, or where the full send must decide.
+    fn cached_send(
+        &mut self,
+        (e, key, receiver): (CacheEntry, Value, Value),
+        n: usize,
+        host: &mut dyn Host,
+    ) -> Option<Result<Option<Completion>, VmError>> {
+        let ordinary = e.rule == Rule::Ordinary;
+        let len = self.stack.len();
         let object = match e.target.receiver {
             TargetReceiver::Present => key,
             TargetReceiver::Frame => receiver,
@@ -4033,6 +4380,32 @@ impl Vm {
                     self.jit_cache(object, slot);
                 }
                 Some(Ok(None))
+            }
+            (MethodKind::Native, _, _) if own => {
+                use crate::compiler::{IC_AT, IC_AT_PUT, IC_BYTES_AT, IC_SIZE};
+                use crate::object::Format;
+                let format = self.heap.format(object);
+                let bytes = matches!(format, Some(Format::Bytes | Format::String));
+                let array = format == Some(Format::Array);
+                let kind = match (Native::from_id(e.target.header.native), n) {
+                    (Some(Native::IndexedSize), 0) if array || bytes => IC_SIZE,
+                    (Some(Native::IndexedAt), 1) if array => IC_AT,
+                    (Some(Native::IndexedAt), 1) if bytes => IC_BYTES_AT,
+                    (Some(Native::IndexedAtPut), 2) if array => IC_AT_PUT,
+                    _ => 0,
+                };
+                let t = e.target;
+                if let TargetReceiver::Frame = t.receiver {
+                    self.insert_receiver(receiver, n);
+                }
+                let result = self.activate_with(t.method, t.header, n, host, t.slot);
+                if kind != 0 {
+                    let class = self.class_of(object);
+                    let r = &mut *self.jit_regs;
+                    r.ic_kind = kind;
+                    r.ic_class = class.to_bits();
+                }
+                Some(result)
             }
             _ => {
                 let t = e.target;
@@ -4125,7 +4498,7 @@ impl Vm {
         } else if len + 1 == depth {
             self.jit_regs.ic_kind = 0;
             if len > 0 {
-                self.fill_jit_regs();
+                self.refresh_after_return();
             }
             RETURNED
         } else if len == depth + 1
@@ -4142,7 +4515,7 @@ impl Vm {
             // A non-local return to a frame that compiled code holds (every
             // frame from the one the host entered up is a compiled call).
             self.jit_regs.ic_kind = 0;
-            self.fill_jit_regs();
+            self.refresh_after_return();
             UNWOUND
         } else {
             INTERPRET
@@ -4154,7 +4527,7 @@ impl Vm {
     fn jit_cache(&mut self, object: Value, slot: usize) {
         let class = self.class_of(object);
         let r = &mut *self.jit_regs;
-        r.ic_kind = 1;
+        r.ic_kind = crate::compiler::IC_ACCESSOR;
         r.ic_slot = slot as u32;
         r.ic_class = class.to_bits();
     }
@@ -4182,8 +4555,63 @@ impl Vm {
         // may have).
         self.jit_regs.ic_kind = 0;
         if !self.frames.is_empty() {
-            self.fill_jit_regs();
+            self.refresh_after_return();
         }
+        crate::compiler::DONE
+    }
+
+    /// Updates the registers after the top frame returned (or a non-local
+    /// return cut frames) to a frame that compiled code holds, which keeps
+    /// its layout, receiver and literals in its own locals: only the
+    /// stack, the arena, the safepoint and the depth change. A frame the
+    /// interpreter continues needs none; compiled code entered anew is
+    /// given every register ([`Vm::fill_jit_regs`]).
+    fn refresh_after_return(&mut self) {
+        self.refresh_jit_regs();
+        self.jit_regs.depth = self.frames.len() as u32;
+    }
+
+    /// For compiled code: the top frame's closure push at `ip`, as the
+    /// interpreter makes it, without the generic step; compiled code goes
+    /// on past the closure's body. The allocation collects nothing (that
+    /// waits for a safepoint, which compiled code takes after the call).
+    pub fn compiled_closure(&mut self, ip: usize) -> i32 {
+        let (copied_count, num_args, after, ok) = {
+            let f = self.frames.last().expect("a frame");
+            match f.code.get(ip..ip + 4) {
+                Some(&[op::PUSH_CLOSURE, b1, b2, b3]) => {
+                    let copied_count = (b1 >> 4) as usize;
+                    let length = u16::from_le_bytes([b2, b3]) as usize;
+                    let next = ip + 4;
+                    let ok =
+                        self.stack.len() >= f.lp + copied_count && next + length <= f.code.len();
+                    (copied_count, u32::from(b1 & 15), next + length, ok)
+                }
+                _ => (0, 0, 0, false),
+            }
+        };
+        if !ok {
+            // The interpreter's error.
+            self.frames.last_mut().expect("a frame").ip = ip;
+            return crate::compiler::INTERPRET;
+        }
+        let top = self.frames.len() - 1;
+        let defining = self.ensure_activation(top);
+        let class = self.roles.get(Role::ClosureClass);
+        let from = self.stack.len() - copied_count;
+        let closure = self.heap.allocate_closure(
+            class,
+            Space::Actor(self.current as u32),
+            defining,
+            (ip + 4) as u32,
+            num_args,
+            &self.stack[from..],
+        );
+        self.stack.truncate(from);
+        self.stack.push(closure);
+        self.frames.last_mut().expect("a frame").ip = after;
+        self.jit_regs.ic_kind = 0;
+        self.refresh_jit_regs();
         crate::compiler::DONE
     }
 

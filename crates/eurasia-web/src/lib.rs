@@ -94,6 +94,9 @@ struct State {
     /// Collect at the first safepoint after every this many allocations
     /// (the native host's `EURASIA_GC_STRESS`; 0: as usual).
     gc_stress: u32,
+    /// The program's arguments, UTF-8, which the loader fills
+    /// ([`eurasia_add_arg`]) before a fresh start.
+    args: Vec<Vec<u8>>,
 }
 
 thread_local! {
@@ -189,6 +192,16 @@ pub extern "C" fn eurasia_heap_stat(which: u32) -> f64 {
             }
         })
         .unwrap_or(-1.0)
+}
+
+/// Adds a program argument of `length` bytes, before [`eurasia_start`]:
+/// the address for the loader to fill it at (UTF-8).
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_add_arg(length: usize) -> *mut u8 {
+    STATE.with_borrow_mut(|s| {
+        s.args.push(vec![0; length]);
+        s.args.last_mut().expect("pushed").as_mut_ptr()
+    })
 }
 
 /// Compiles methods at their `threshold`th activation (0: never), before
@@ -313,6 +326,22 @@ pub extern "C" fn eurasia_rt_tick(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
     vm.compiled_tick(ip as usize)
 }
 
+/// For compiled code: the closure push at `ip` ([`Vm::compiled_closure`]), the stack at height `sp`.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_closure(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
+    let vm = vm_at(vm);
+    adopt_stack(vm, sp);
+    vm.compiled_closure(ip as usize)
+}
+
+/// For compiled code: a send its inline cache holds the target of ([`Vm::compiled_call`]), the stack at height `sp`.
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_rt_call(vm: *mut Vm, target: i32, ip: i32, next: i32, sp: i32) -> i32 {
+    let vm = vm_at(vm);
+    adopt_stack(vm, sp);
+    vm.compiled_call(target as usize, ip as usize, next as usize)
+}
+
 /// The monotonic time to resume at, after [`WAITING`], in nanoseconds (an
 /// f64, exact below 2^53).
 #[unsafe(no_mangle)]
@@ -347,8 +376,9 @@ pub extern "C" fn eurasia_buffer_address() -> *const u8 {
     STATE.with_borrow(|s| s.buffer.as_ptr())
 }
 
-/// Loads the snapshot in the buffer and runs it, with no arguments, as
-/// psoup's web host does. A checkpoint is restored into this new host and
+/// Loads the snapshot in the buffer and runs it, with the arguments the
+/// loader added (none, as psoup's web host does, unless it added some). A
+/// checkpoint is restored into this new host and
 /// continues instead (M7 design, section 3.4).
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_start() -> i32 {
@@ -373,6 +403,12 @@ pub extern "C" fn eurasia_start() -> i32 {
                 outcome
             }
             None => {
+                let owned: Vec<String> = s
+                    .args
+                    .iter()
+                    .map(|a| String::from_utf8_lossy(a).into_owned())
+                    .collect();
+                let args: Vec<&str> = owned.iter().map(String::as_str).collect();
                 let mut vm = Vm::new(heap, roles);
                 vm.set_snapshot_writer(write_image);
                 vm.set_gc_stress((s.gc_stress > 0).then_some(u64::from(s.gc_stress)));
@@ -386,13 +422,13 @@ pub extern "C" fn eurasia_start() -> i32 {
                             keep_checkpoints: s.record_keep,
                             ..Log::default()
                         };
-                        let outcome = record_run(&mut vm, &mut WebHost, &mut log, &[]);
+                        let outcome = record_run(&mut vm, &mut WebHost, &mut log, &args);
                         s.log = Some(log);
                         outcome
                     }
                     None => {
                         vm.set_jit_threshold(s.jit);
-                        let outcome = vm.run(&mut WebHost, &[]);
+                        let outcome = vm.run(&mut WebHost, &args);
                         trampoline(&mut vm, outcome)
                     }
                 };

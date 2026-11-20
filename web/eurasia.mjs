@@ -114,7 +114,10 @@ function hostObjects(bytesAt, decoder, encoder, link) {
 // When the program saves its image (Actors>>saveImage:), `onSaveImage` is
 // given the name and the image's bytes (a copy), to keep as the page sees
 // fit; without one the image is dropped, with a warning.
-export async function run(wasm, snapshot, { print = console.log, record, keep = 0, jit = 0, gcStress = 0, onStart, onSaveImage } = {}) {
+//
+// `args` are the program's arguments (strings; none by default, as in
+// psoup's web host), for a fresh start.
+export async function run(wasm, snapshot, { print = console.log, record, keep = 0, jit = 0, gcStress = 0, args = [], onStart, onSaveImage } = {}) {
   let memory = null;
   const link = { exports: null, depth: 0, afterIdleCallback: () => {} };
   const decoder = new TextDecoder();
@@ -141,6 +144,8 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
             interpret: vm.eurasia_rt_interpret,
             step: vm.eurasia_rt_step,
             tick: vm.eurasia_rt_tick,
+            call: vm.eurasia_rt_call,
+            closure: vm.eurasia_rt_closure,
           } });
           const table = vm.__indirect_function_table;
           const index = table.grow(1);
@@ -179,6 +184,10 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
   if (record !== undefined) vm.eurasia_record(record, keep);
   else if (jit > 0) vm.eurasia_jit(jit);
   if (gcStress > 0) vm.eurasia_gc_stress(gcStress);
+  for (const a of args) {
+    const bytes = encoder.encode(a);
+    bytesAt(vm.eurasia_add_arg(bytes.length), bytes.length).set(bytes);
+  }
   onStart?.({
     log: () => {
       if (link.depth > 0) throw new Error('eurasia: the log cannot be taken while the VM runs');

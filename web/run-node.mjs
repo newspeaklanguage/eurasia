@@ -9,7 +9,7 @@
 // records the session (with a checkpoint after every EURASIA_RECORD_EVERY
 // allocations, default none; keeping the last EURASIA_RECORD_KEEP of them,
 // default all) and writes the log there when Node exits.
-// Usage: node run-node.mjs <eurasia_web.wasm> <snapshot>.
+// Usage: node run-node.mjs <eurasia_web.wasm> <snapshot> [argument...].
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { run } from './eurasia.mjs';
@@ -32,6 +32,8 @@ try {
     jit: Number(process.env.EURASIA_JIT ?? 0),
     // With EURASIA_GC_STRESS=n, a collection after every n allocations.
     gcStress: Number(process.env.EURASIA_GC_STRESS ?? 0),
+    // Arguments after the snapshot are the program's.
+    args: process.argv.slice(4),
     onStart: (c) => { controls = c; },
   });
 

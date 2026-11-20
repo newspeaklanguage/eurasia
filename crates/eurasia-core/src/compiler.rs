@@ -117,6 +117,9 @@ pub struct Regs {
     pub false_: u64,
     /// See `ic_kind`.
     pub ic_class: u64,
+    /// The byte store's address: a byte object's bytes start at its first
+    /// slot (a SmallInteger offset), its size in its meta word.
+    pub bytes: u32,
 }
 
 // The registers' offsets.
@@ -140,6 +143,7 @@ const R_NIL: u32 = 72;
 const R_TRUE: u32 = 80;
 const R_FALSE: u32 = 88;
 const R_IC_CLASS: u32 = 96;
+const R_BYTES: u32 = 104;
 
 // The object header (newspeak/EURASIA_ARENA_DESIGN): class, sequence number,
 // meta (format 5 bits, flags 5, space 21, remembered 1, size 32); then the
@@ -148,6 +152,28 @@ const META: u32 = 16;
 const SLOTS: u32 = 24;
 const META_FLAGS_FROZEN_OR_VALUE: i64 = (1 | 2) << 5;
 const META_REMEMBERED: i64 = 1 << 31;
+
+/// The globals of an inline-cache site: the receiver's class (i64), the
+/// epoch, the slot (an accessor's) or target (a method's, the VM's index),
+/// the kind ([`IC_ACCESSOR`] or [`IC_METHOD`]; 0 empty).
+const SITE_GLOBALS: u32 = 4;
+/// An inline cache of an accessor, read or written in compiled code.
+pub const IC_ACCESSOR: u32 = 1;
+/// An inline cache of a compiled method, entered through `call`.
+pub const IC_METHOD: u32 = 2;
+/// Inline caches of the indexed natives, run in compiled code: `size` (of
+/// an Array, String or ByteArray), `at:` and `at:put:` (of an Array), and
+/// `at:` of a String or ByteArray ([`IC_BYTES_AT`]), by the site's argument
+/// count.
+pub const IC_SIZE: u32 = 3;
+/// See [`IC_SIZE`].
+pub const IC_AT: u32 = 4;
+/// See [`IC_SIZE`].
+pub const IC_AT_PUT: u32 = 5;
+/// See [`IC_SIZE`].
+pub const IC_BYTES_AT: u32 = 6;
+/// The format code of an Array.
+const CODE_ARRAY: i64 = 3;
 
 /// The send rules `send` takes.
 pub const RULE_ORDINARY: i32 = 0;
@@ -159,6 +185,9 @@ pub const RULE_SUPER: i32 = 2;
 pub const RULE_IMPLICIT: i32 = 3;
 /// A common-selector send.
 pub const RULE_COMMON: i32 = 4;
+/// The common selectors with SmallInteger fast paths (0 to 13): the
+/// arithmetic and comparisons, which the runtime tries before a send.
+pub const COMMON_FAST_PATHS: usize = 14;
 
 // Imported functions, in import order.
 const F_SEND: u32 = 0;
@@ -166,12 +195,15 @@ const F_RET: u32 = 1;
 const F_INTERPRET: u32 = 2;
 const F_STEP: u32 = 3;
 const F_TICK: u32 = 4;
-const IMPORTED: u32 = 5;
+const F_CALL: u32 = 5;
+const F_CLOSURE: u32 = 6;
+const IMPORTED: u32 = 7;
 
 // Types.
 const T_RUN: u32 = 0; // (i32, i32, i32) -> i32: run, interpret, step, tick
 const T_SEND: u32 = 1; // (i32 x 6) -> i32
 const T_RET: u32 = 2; // (i32, i64, i32) -> i32
+const T_CALL: u32 = 3; // (i32 x 5) -> i32
 
 // Locals of `run`: the parameters, then i32s, then i64s.
 const L_VM: u32 = 0;
@@ -201,6 +233,12 @@ const L_FALSE: u32 = 19;
 const L_R64: u32 = 20;
 const L_META: u32 = 21;
 const I64_LOCALS: u8 = 8;
+/// The literals: the first's offset in the arena (in bytes; the arena can
+/// move at allocations, but the literal array only at collections, after
+/// which compiled code leaves its frame), and their count. More i32s.
+const L_LITERALS: u32 = 22;
+const L_LITERAL_COUNT: u32 = 23;
+const MORE_I32_LOCALS: u8 = 2;
 
 /// One decoded instruction.
 #[derive(Clone, Copy, Debug)]
@@ -237,8 +275,11 @@ enum Ins {
         local: u32,
     },
     /// Any other instruction, by the runtime's `step`; compiled code goes on
-    /// at the given index (after a closure push, past the closure's body).
+    /// at the given index.
     Step(usize),
+    /// A closure push, by the runtime's `closure`; compiled code goes on at
+    /// the given index, past the closure's body.
+    Closure(usize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -261,6 +302,7 @@ fn inline_arith(k: u8) -> bool {
 fn decode(code: &[u8]) -> Option<(Vec<(usize, usize, Ins)>, Vec<usize>)> {
     let mut out = Vec::new();
     let mut closures = Vec::new();
+    let mut bodies: Vec<core::ops::Range<usize>> = Vec::new();
     let mut ip = 0;
     while ip < code.len() {
         let o = code[ip];
@@ -310,7 +352,7 @@ fn decode(code: &[u8]) -> Option<(Vec<(usize, usize, Ins)>, Vec<usize>)> {
             176..=207 => Ins::Send {
                 rule: RULE_COMMON,
                 literal: u32::from(o - 176),
-                args: 0,
+                args: u32::from(crate::bytecode::COMMON_SELECTORS[usize::from(o - 176)].1),
             },
             op::PUSH_PARAMETER => Ins::PushParam(u32::from(b1)),
             op::PUSH_LOCAL => Ins::PushLocal(u32::from(b1)),
@@ -357,13 +399,28 @@ fn decode(code: &[u8]) -> Option<(Vec<(usize, usize, Ins)>, Vec<usize>)> {
                     return None;
                 }
                 closures.push(next);
-                Ins::Step(next + length)
+                bodies.push(next..next + length);
+                Ins::Closure(next + length)
             }
             // Everything else, the interpreter's errors included.
             _ => Ins::Step(next),
         };
         out.push((ip, len, ins));
         ip = next;
+    }
+    // A `^` outside every closure body (in an inlined block, say) is in a
+    // method's frame, where it is a local return.
+    for entry in &mut out {
+        let o = code[entry.0];
+        if (171..=175).contains(&o) && !bodies.iter().any(|b| b.contains(&entry.0)) {
+            entry.2 = Ins::Return(match o {
+                171 => Ret::Nil,
+                172 => Ret::False,
+                173 => Ret::True,
+                174 => Ret::Self_,
+                _ => Ret::Top,
+            });
+        }
     }
     Some((out, closures))
 }
@@ -390,7 +447,7 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                 entry.2 = Ins::Send {
                     rule: RULE_COMMON,
                     literal: u32::from(k),
-                    args: 0,
+                    args: 1,
                 }
             }
             // Parameters are numbered from 1; others are the interpreter's
@@ -413,7 +470,7 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
             }
             Ins::Return(_) => leaders.push(next),
             Ins::Send { .. } | Ins::Arith(_) | Ins::Indirect { .. } => leaders.push(next),
-            Ins::Step(after) => {
+            Ins::Step(after) | Ins::Closure(after) => {
                 leaders.push(after);
                 leaders.push(next);
             }
@@ -455,6 +512,8 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
     ] {
         f.reg64(offset).set(local);
     }
+    f.reg32(R_LITERALS).reg32(R_ARENA).sub().set(L_LITERALS);
+    f.reg32(R_LITERAL_COUNT).set(L_LITERAL_COUNT);
     f.get(L_ENTRY).set(L_PC);
     f.i32c(TICK).set(L_COUNT);
     // loop $dispatch; block x n; br_table; then each block's code after
@@ -543,16 +602,21 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                 f.push_addr().i64c(v << 1).store().inc_sp();
             }
             Ins::PushLiteral(i) => {
-                // From the literals' address in the registers (the array
-                // can move at allocations, which are calls); beyond the
-                // count, the interpreter's error.
-                f.reg32(R_LITERAL_COUNT).i32c(i as i32).op(0x4d); // count <= i
+                // At the arena's address plus the literals' offset (the
+                // arena can move at allocations, which are calls); beyond
+                // the count, the interpreter's error.
+                f.get(L_LITERAL_COUNT).i32c(i as i32).op(0x4d); // count <= i
                 f.op(0x04).op(0x40);
                 f.step(ip);
                 f.leave_after_step();
                 f.op(0x0b);
                 f.push_addr();
-                f.reg32(R_LITERALS).i32c(8 * i as i32).add().load();
+                f.reg32(R_ARENA)
+                    .get(L_LITERALS)
+                    .add()
+                    .i32c(8 * i as i32)
+                    .add()
+                    .load();
                 f.store().inc_sp();
             }
             Ins::Pop => {
@@ -697,12 +761,68 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                 literal,
                 args,
             } => {
-                let cacheable =
-                    args <= 1 && matches!(rule, RULE_ORDINARY | RULE_SELF | RULE_IMPLICIT);
+                // A common send is an ordinary send of its selector; those
+                // of SmallInteger's fast paths are not cached.
+                let cacheable = match rule {
+                    RULE_ORDINARY | RULE_SELF | RULE_SUPER | RULE_IMPLICIT => true,
+                    RULE_COMMON => literal as usize >= COMMON_FAST_PATHS,
+                    _ => false,
+                };
                 let site = if cacheable { Some(f.new_site()) } else { None };
                 if let Some(g) = site {
-                    f.inline_accessor(g, rule == RULE_ORDINARY, args == 1);
-                    f.op(0x05); // else: the send
+                    let ordinary = matches!(rule, RULE_ORDINARY | RULE_COMMON);
+                    f.op(0x02).op(0x40); // block: the send's end
+                    f.op(0x02).op(0x40); // block: after the call
+                    f.site_hit(g, ordinary, args).set(L_R);
+                    if args <= 1 {
+                        // An accessor, read or written here.
+                        f.get(L_R)
+                            .gget(g + 3)
+                            .i32c(IC_ACCESSOR as i32)
+                            .op(0x46)
+                            .op(0x71);
+                        f.op(0x04).op(0x7f);
+                        f.accessor_ok(g, args == 1);
+                        f.op(0x05).i32c(0).op(0x0b);
+                        f.op(0x04).op(0x40);
+                        f.accessor(g, ordinary, args == 1);
+                        f.op(0x0c).uleb(2); // br: the send's end
+                        f.op(0x0b);
+                    }
+                    if args <= 2 {
+                        // An indexed native, run here.
+                        let kinds: &[u32] = match args {
+                            0 => &[IC_SIZE],
+                            1 => &[IC_AT, IC_BYTES_AT],
+                            _ => &[IC_AT_PUT],
+                        };
+                        for &kind in kinds {
+                            f.get(L_R).gget(g + 3).i32c(kind as i32).op(0x46).op(0x71);
+                            f.op(0x04).op(0x7f);
+                            f.indexed_ok(kind);
+                            f.op(0x05).i32c(0).op(0x0b);
+                            f.op(0x04).op(0x40);
+                            f.indexed(kind, ordinary);
+                            f.op(0x0c).uleb(2); // br: the send's end
+                            f.op(0x0b);
+                        }
+                    }
+                    // A compiled method: entered through `call`.
+                    f.get(L_R)
+                        .gget(g + 3)
+                        .i32c(IC_METHOD as i32)
+                        .op(0x46)
+                        .op(0x71);
+                    f.op(0x04).op(0x40);
+                    f.get(L_VM)
+                        .gget(g + 2)
+                        .i32c(ip as i32)
+                        .i32c(next as i32)
+                        .get(L_SP)
+                        .call(F_CALL)
+                        .set(L_R);
+                    f.op(0x0c).uleb(1); // br: after the call
+                    f.op(0x0b);
                 }
                 f.get(L_VM)
                     .i32c(rule)
@@ -712,15 +832,20 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                     .get(L_SP)
                     .call(F_SEND)
                     .set(L_R);
-                f.after_call();
                 if let Some(g) = site {
-                    // Fill the cache from what the send found.
+                    // Fill the cache from what the send found, before a
+                    // callee runs (its sends change the registers).
                     f.reg32(R_IC_KIND).op(0x04).op(0x40);
                     f.reg64(R_IC_CLASS).gset(g);
                     f.reg32(R_IC_SLOT).gset(g + 2);
                     f.reg32(R_EPOCH).gset(g + 1);
+                    f.reg32(R_IC_KIND).gset(g + 3);
                     f.op(0x0b);
-                    f.op(0x0b); // end if/else
+                    f.op(0x0b); // end block: after the call
+                }
+                f.after_call();
+                if site.is_some() {
+                    f.op(0x0b); // end block: the send's end
                 }
             }
             Ins::Indirect {
@@ -786,6 +911,20 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                     }
                 }
             }
+            Ins::Closure(after) => {
+                // The closure, by the runtime's `closure`; on after its body.
+                f.get(L_VM)
+                    .i32c(ip as i32)
+                    .get(L_SP)
+                    .call(F_CLOSURE)
+                    .set(L_R);
+                f.after_call();
+                if after < code.len() {
+                    jump(&mut f, after, 0);
+                } else {
+                    f.interpret(after);
+                }
+            }
             Ins::Step(after) => {
                 f.step(ip);
                 f.after_call();
@@ -840,7 +979,8 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
 #[derive(Default)]
 struct Func {
     body: Vec<u8>,
-    /// Inline-cache sites, each three globals: class (i64), epoch, slot.
+    /// Inline-cache sites, each [`SITE_GLOBALS`] globals: class (i64),
+    /// epoch, slot, kind.
     sites: u32,
 }
 
@@ -987,19 +1127,16 @@ impl Func {
     /// A new inline-cache site: its first global.
     fn new_site(&mut self) -> u32 {
         self.sites += 1;
-        3 * (self.sites - 1)
+        SITE_GLOBALS * (self.sites - 1)
     }
-    /// The inline accessor of site `g`, opening an `if` the caller closes
-    /// (with an `else` for the send): the receiver (on the stack for an
-    /// ordinary send, below the argument of a setter; else the frame's) an
-    /// object of the cached class, in the cache's epoch, of the regular
-    /// format with the slot; for a setter, neither frozen nor a value, and
-    /// young or remembered (else the write barrier must remember it).
-    fn inline_accessor(&mut self, g: u32, ordinary: bool, setter: bool) -> &mut Func {
+    /// Whether site `g` holds the send's key (an i32): the message receiver
+    /// below `args` arguments for an ordinary send, else the frame's, an
+    /// object of the cached class, in the cache's epoch. Leaves the key in
+    /// `a`, its index and address in `index` and `addr`.
+    fn site_hit(&mut self, g: u32, ordinary: bool, args: u32) -> &mut Func {
         if ordinary {
-            let below = if setter { 2 } else { 1 };
             self.slot_addr(|f| {
-                f.get(L_SP).i32c(below).sub();
+                f.get(L_SP).i32c(1 + args as i32).sub();
             });
             self.load().set(L_A);
         } else {
@@ -1011,8 +1148,13 @@ impl Func {
         self.op(0x04).op(0x7f); // if (result i32)
         self.get(L_ADDR).load().gget(g).op(0x51); // class == cached
         self.reg32(R_EPOCH).gget(g + 1).op(0x46).op(0x71); // & epoch == cached
-        self.op(0x05).i32c(0).op(0x0b);
-        self.op(0x04).op(0x7f); // if (result i32)
+        self.op(0x05).i32c(0).op(0x0b)
+    }
+    /// Whether the object at `addr`, of site `g`'s class, holds the
+    /// accessor's slot: of the regular format with the slot; for a setter,
+    /// neither frozen nor a value, and young or remembered (else the write
+    /// barrier must remember it).
+    fn accessor_ok(&mut self, g: u32, setter: bool) -> &mut Func {
         // the meta word: regular (code 0) and the slot within the size
         self.get(L_ADDR).i32c(META as i32).add().load().set(L_META);
         self.get(L_META).i64c(31).op(0x83).op(0x50); // code == 0
@@ -1038,8 +1180,159 @@ impl Func {
                 .op(0x45);
             self.op(0x72).op(0x71);
         }
-        self.op(0x05).i32c(0).op(0x0b);
-        self.op(0x04).op(0x40); // if: the hit
+        self
+    }
+    /// Whether the object at `addr` (after [`Func::site_hit`]) is one the
+    /// indexed native of inline-cache kind `kind` runs on here: of its
+    /// format; for `at:` and `at:put:`, the index a SmallInteger within its
+    /// size (left in `b`); for `at:put:`, not frozen, and young or
+    /// remembered.
+    fn indexed_ok(&mut self, kind: u32) -> &mut Func {
+        let args = match kind {
+            IC_SIZE => 0,
+            IC_AT_PUT => 2,
+            _ => 1,
+        };
+        self.get(L_ADDR).i32c(META as i32).add().load().set(L_META);
+        match kind {
+            // Bytes, String or Array: (code - 1) <u 3
+            IC_SIZE => self
+                .get(L_META)
+                .i64c(31)
+                .op(0x83)
+                .i64c(1)
+                .op(0x7d)
+                .i64c(3)
+                .op(0x54),
+            // Bytes or String: (code - 1) <u 2
+            IC_BYTES_AT => self
+                .get(L_META)
+                .i64c(31)
+                .op(0x83)
+                .i64c(1)
+                .op(0x7d)
+                .i64c(2)
+                .op(0x54),
+            _ => self.get(L_META).i64c(31).op(0x83).i64c(CODE_ARRAY).op(0x51),
+        };
+        if args >= 1 {
+            // the index, below the value of at:put:
+            self.slot_addr(|f| {
+                f.get(L_SP).i32c(args).sub();
+            });
+            self.load().set(L_B);
+            self.get(L_B).i64c(1).op(0x83).op(0x50).op(0x71); // a SmallInteger
+            // (index - 1) <u size
+            self.get(L_B)
+                .i64c(1)
+                .op(0x87)
+                .i64c(1)
+                .op(0x7d)
+                .get(L_META)
+                .i64c(32)
+                .op(0x88)
+                .op(0x54)
+                .op(0x71);
+        }
+        if args == 2 {
+            self.get(L_META).i64c(1 << 5).op(0x83).op(0x50).op(0x71); // not frozen
+            self.get(L_INDEX).reg32(R_BOUNDARY).op(0x4f);
+            self.get(L_META)
+                .i64c(META_REMEMBERED)
+                .op(0x83)
+                .op(0x50)
+                .op(0x45);
+            self.op(0x72).op(0x71);
+        }
+        self
+    }
+    /// The indexed native of inline-cache kind `kind` (after
+    /// [`Func::indexed_ok`]): its answer replaces the receiver and the
+    /// arguments (of an ordinary send), or the arguments (else).
+    fn indexed(&mut self, kind: u32, ordinary: bool) -> &mut Func {
+        let args = match kind {
+            IC_SIZE => 0,
+            IC_AT_PUT => 2,
+            _ => 1,
+        };
+        // where the answer goes, below sp
+        let answer = if ordinary { args + 1 } else { args };
+        // the element's address: addr + SLOTS + (index - 1) * 8
+        let element = |f: &mut Func| {
+            f.get(L_ADDR)
+                .i32c(SLOTS as i32)
+                .add()
+                .get(L_B)
+                .i64c(1)
+                .op(0x87)
+                .i64c(1)
+                .op(0x7d)
+                .op(0xa7)
+                .i32c(3)
+                .op(0x74)
+                .add();
+        };
+        let answer_addr = |f: &mut Func| {
+            f.slot_addr(|f| {
+                f.get(L_SP).i32c(answer).sub();
+            });
+        };
+        match kind {
+            IC_SIZE => {
+                answer_addr(self);
+                self.get(L_META).i64c(32).op(0x88).i64c(1).op(0x86).store();
+            }
+            IC_BYTES_AT => {
+                // bytes + (first slot >> 1) + index - 1, a byte, as a
+                // SmallInteger
+                answer_addr(self);
+                self.reg32(R_BYTES)
+                    .get(L_ADDR)
+                    .i32c(SLOTS as i32)
+                    .add()
+                    .load()
+                    .i64c(1)
+                    .op(0x87)
+                    .get(L_B)
+                    .i64c(1)
+                    .op(0x87)
+                    .op(0x7c)
+                    .i64c(1)
+                    .op(0x7d)
+                    .op(0xa7)
+                    .add();
+                self.op(0x31).uleb(0).uleb(0); // i64.load8_u
+                self.i64c(1).op(0x86).store();
+            }
+            IC_AT => {
+                answer_addr(self);
+                element(self);
+                self.load().store();
+            }
+            _ => {
+                element(self);
+                self.slot_addr(|f| {
+                    f.get(L_SP).i32c(1).sub();
+                });
+                self.load().store();
+                answer_addr(self);
+                self.slot_addr(|f| {
+                    f.get(L_SP).i32c(1).sub();
+                });
+                self.load().store();
+            }
+        }
+        // sp: less the arguments (and the receiver); plus the answer
+        let delta = answer - 1;
+        if delta > 0 {
+            self.get(L_SP).i32c(delta).sub().set(L_SP);
+        } else if delta < 0 {
+            self.inc_sp();
+        }
+        self
+    }
+    /// Site `g`'s accessor, read or written (after [`Func::accessor_ok`]).
+    fn accessor(&mut self, g: u32, ordinary: bool, setter: bool) -> &mut Func {
         // the slot's address: addr + SLOTS + slot * 8
         let slot_addr = |f: &mut Func| {
             f.get(L_ADDR)
@@ -1168,10 +1461,11 @@ fn module(body: &[u8], sites: u32) -> Vec<u8> {
     const I64: u8 = 0x7e;
     let mut m = alloc::vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
     // Types, in the order of the T_ constants.
-    let types: [(&[u8], &[u8]); 3] = [
+    let types: [(&[u8], &[u8]); 4] = [
         (&[I32, I32, I32], &[I32]),
         (&[I32, I32, I32, I32, I32, I32], &[I32]),
         (&[I32, I64, I32], &[I32]),
+        (&[I32, I32, I32, I32, I32], &[I32]),
     ];
     let mut t = Vec::new();
     uleb(&mut t, types.len() as u32);
@@ -1191,6 +1485,8 @@ fn module(body: &[u8], sites: u32) -> Vec<u8> {
         ("interpret", T_RUN),
         ("step", T_RUN),
         ("tick", T_RUN),
+        ("call", T_CALL),
+        ("closure", T_RUN),
     ];
     let mut im = Vec::new();
     uleb(&mut im, functions.len() as u32 + 2);
@@ -1209,14 +1505,16 @@ fn module(body: &[u8], sites: u32) -> Vec<u8> {
     section(&mut m, 2, &im);
     // The one function, `run`.
     section(&mut m, 3, &[0x01, T_RUN as u8]);
-    // Globals: each site's class (i64), epoch and slot (i32), mutable, 0.
+    // Globals: each site's class (i64), epoch, slot and kind (i32),
+    // mutable, 0.
     if sites > 0 {
         let mut g = Vec::new();
-        uleb(&mut g, 3 * sites);
+        uleb(&mut g, SITE_GLOBALS * sites);
         for _ in 0..sites {
             g.extend_from_slice(&[I64, 0x01, 0x42, 0x00, 0x0b]);
-            g.extend_from_slice(&[I32, 0x01, 0x41, 0x00, 0x0b]);
-            g.extend_from_slice(&[I32, 0x01, 0x41, 0x00, 0x0b]);
+            for _ in 1..SITE_GLOBALS {
+                g.extend_from_slice(&[I32, 0x01, 0x41, 0x00, 0x0b]);
+            }
         }
         section(&mut m, 6, &g);
     }
@@ -1228,7 +1526,7 @@ fn module(body: &[u8], sites: u32) -> Vec<u8> {
     section(&mut m, 7, &ex);
     // Code: the locals after the parameters, i32s then i64s.
     let mut code = Vec::new();
-    code.extend_from_slice(&[0x02, I32_LOCALS, I32, I64_LOCALS, I64]);
+    code.extend_from_slice(&[0x03, I32_LOCALS, I32, I64_LOCALS, I64, MORE_I32_LOCALS, I32]);
     code.extend_from_slice(body);
     code.push(0x0b); // end of function
     let mut c = Vec::new();

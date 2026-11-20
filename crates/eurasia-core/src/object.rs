@@ -1383,6 +1383,18 @@ impl Heap {
         Some(((-2 - e.jit) as u32, k as u32))
     }
 
+    /// The compiled function of `method` and the bytecode it was compiled
+    /// from, if it is compiled (its start is block 0).
+    #[inline]
+    pub fn compiled_start(&self, method: Value) -> Option<(u32, &Rc<[u8]>)> {
+        let c = self.contents_of(method, Code::Method)?;
+        let e = &self.codes[small_of(c[M_CODE]) as usize];
+        if e.jit > -2 {
+            return None;
+        }
+        Some(((-2 - e.jit) as u32, &e.bytes))
+    }
+
     /// Sets a Method's bytecode.
     pub fn set_method_bytecode(&mut self, v: Value, bytecode: Rc<[u8]>) -> bool {
         let Some(c) = self.contents_of(v, Code::Method) else {
