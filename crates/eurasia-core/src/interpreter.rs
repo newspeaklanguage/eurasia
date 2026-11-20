@@ -137,30 +137,103 @@ pub enum Completion {
     Compiled(u32, u32),
 }
 
-#[derive(Clone, Debug)]
-struct Frame {
+/// A frame: a plain record of integers (every bit pattern is one), which
+/// compiled code can also push and pop: its layout is fixed (`#[repr(C)]`;
+/// on wasm32, `crate::compiler`'s `FRAME_` offsets, checked below).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
     /// A number unique to this frame for the life of the VM.
     serial: u64,
     method: Value,
-    /// The method's bytecode, so that an instruction fetch does not look
-    /// the method up. A method's bytecode can change only while it is
-    /// unfrozen (`Method>>bytecode:`); a frame keeps the code it began with.
-    code: Rc<[u8]>,
-    /// The method's literal array and mixin, for the same reason; reloaded
-    /// whenever the lookup cache is cleared.
+    /// The method's literal array and mixin, so that a send does not look
+    /// the method up; reloaded whenever the lookup cache is cleared.
     literals: Value,
     mixin: Value,
     receiver: Value,
+    /// The frame's activation handle, once something has asked for it.
+    activation: OptValue,
+    /// For a closure frame, the closure.
+    closure: OptValue,
+    /// The frame's bytecode: 0, its method's; else `k`, the VM's pinned
+    /// code `k - 1`. A method's bytecode can change only while it is
+    /// unfrozen (`Method>>bytecode:`); a frame keeps the code it began
+    /// with, pinned when its method's is replaced.
+    code: u32,
     /// Index of the message receiver; the arguments follow it.
     bp: usize,
     arg_count: usize,
     /// Index of the first local.
     lp: usize,
     ip: usize,
-    /// The frame's activation handle, once something has asked for it.
-    activation: Option<Value>,
-    /// For a closure frame, the closure.
-    closure: Option<Value>,
+}
+
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+    use crate::compiler as c;
+    use core::mem::{offset_of, size_of};
+    assert!(size_of::<Frame>() == c::FRAME_SIZE as usize);
+    assert!(offset_of!(Frame, serial) == c::FRAME_SERIAL as usize);
+    assert!(offset_of!(Frame, method) == c::FRAME_METHOD as usize);
+    assert!(offset_of!(Frame, literals) == c::FRAME_LITERALS as usize);
+    assert!(offset_of!(Frame, mixin) == c::FRAME_MIXIN as usize);
+    assert!(offset_of!(Frame, receiver) == c::FRAME_RECEIVER as usize);
+    assert!(offset_of!(Frame, activation) == c::FRAME_ACTIVATION as usize);
+    assert!(offset_of!(Frame, closure) == c::FRAME_CLOSURE as usize);
+    assert!(offset_of!(Frame, code) == c::FRAME_CODE as usize);
+    assert!(offset_of!(Frame, bp) == c::FRAME_BP as usize);
+    assert!(offset_of!(Frame, arg_count) == c::FRAME_ARG_COUNT as usize);
+    assert!(offset_of!(Frame, lp) == c::FRAME_LP as usize);
+    assert!(offset_of!(Frame, ip) == c::FRAME_IP as usize);
+    assert!(size_of::<TargetEntry>() == c::TARGET_SIZE as usize);
+    assert!(offset_of!(TargetEntry, method) == c::TARGET_METHOD as usize);
+    assert!(offset_of!(TargetEntry, literals) == c::TARGET_LITERALS as usize);
+    assert!(offset_of!(TargetEntry, mixin) == c::TARGET_MIXIN as usize);
+    assert!(offset_of!(TargetEntry, fixed) == c::TARGET_FIXED as usize);
+    assert!(offset_of!(TargetEntry, function) == c::TARGET_FUNCTION as usize);
+    assert!(offset_of!(TargetEntry, literal_offset) == c::TARGET_LITERAL_OFFSET as usize);
+    assert!(offset_of!(TargetEntry, literal_count) == c::TARGET_LITERAL_COUNT as usize);
+    assert!(offset_of!(TargetEntry, locals) == c::TARGET_LOCALS as usize);
+    assert!(offset_of!(TargetEntry, receiver_kind) == c::TARGET_RECEIVER_KIND as usize);
+};
+
+/// An optional Value in one word: 0 (SmallInteger 0, never an activation
+/// or a closure) is none.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OptValue(u64);
+
+impl OptValue {
+    const NONE: OptValue = OptValue(0);
+    fn get(self) -> Option<Value> {
+        (self.0 != 0).then(|| Value::from_bits(self.0))
+    }
+    fn is_some(self) -> bool {
+        self.0 != 0
+    }
+    fn map(self, f: impl FnOnce(Value) -> Value) -> OptValue {
+        self.get().map(f).into()
+    }
+    fn unwrap_or(self, v: Value) -> Value {
+        self.get().unwrap_or(v)
+    }
+    fn expect(self, why: &str) -> Value {
+        self.get().expect(why)
+    }
+}
+
+impl From<Option<Value>> for OptValue {
+    fn from(v: Option<Value>) -> OptValue {
+        v.map_or(OptValue::NONE, |v| OptValue(v.to_bits()))
+    }
+}
+
+impl IntoIterator for OptValue {
+    type Item = Value;
+    type IntoIter = core::option::IntoIter<Value>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.get().into_iter()
+    }
 }
 
 enum Step {
@@ -231,25 +304,36 @@ struct CacheEntry {
 /// A compiled method that compiled code's inline caches enter directly
 /// ([`Vm::compiled_call`]): what activating it needs, looked up once per
 /// lookup-cache epoch.
-struct JitTarget {
-    code: Rc<[u8]>,
-    entry: TargetEntry,
-}
-
-/// What [`Vm::enter_target`] needs of a [`JitTarget`] besides its code.
+///
+/// Compiled code reads the table too, to push a target's frame itself: its
+/// layout is fixed (`#[repr(C)]`; `crate::compiler`'s `TARGET_` offsets).
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct TargetEntry {
     method: Value,
-    function: u32,
     literals: Value,
+    mixin: Value,
+    /// A [`TargetReceiver::Fixed`] receiver (else 0).
+    fixed: Value,
+    function: u32,
     /// The literals' first element, in bytes from the arena's start, and
     /// how many there are.
     literal_offset: u32,
     literal_count: u32,
-    mixin: Value,
-    locals: usize,
-    args: usize,
-    receiver: TargetReceiver,
+    locals: u32,
+    args: u32,
+    /// The [`TargetReceiver`]: 0 present, 1 the frame's, 2 fixed.
+    receiver_kind: u32,
+}
+
+impl TargetEntry {
+    fn receiver(&self) -> TargetReceiver {
+        match self.receiver_kind {
+            0 => TargetReceiver::Present,
+            1 => TargetReceiver::Frame,
+            _ => TargetReceiver::Fixed(self.fixed),
+        }
+    }
 }
 
 /// Inline-cache targets per lookup-cache epoch, at most.
@@ -288,9 +372,13 @@ pub struct Vm {
     pub roles: Roles,
     stack: Vec<Value>,
     frames: Vec<Frame>,
+    /// Code a frame keeps after its method's bytecode was replaced
+    /// ([`Frame::code`] `k` is `pinned_codes[k - 1]`).
+    pinned_codes: Vec<Rc<[u8]>>,
+    /// The code of a frame whose method is not a method (none).
+    no_code: Rc<[u8]>,
     symbols: BTreeMap<&'static str, Value>,
     step_limit: Option<u64>,
-    next_serial: u64,
     snapshot_writer: Option<SnapshotWriter>,
     /// The allocation counter after the last collection.
     gc_counter: u64,
@@ -355,7 +443,7 @@ pub struct Vm {
     jit_regs: alloc::boxed::Box<crate::compiler::Regs>,
     /// The targets of compiled code's method inline caches, by index;
     /// cleared with the lookup cache, whose epoch the caches check.
-    jit_targets: Vec<JitTarget>,
+    jit_targets: Vec<TargetEntry>,
     /// Each target's index, by its method and receiver.
     jit_target_index: alloc::collections::BTreeMap<(u64, u64), u32>,
     /// For each arithmetic or comparison common selector (0 to 13), whether
@@ -413,9 +501,10 @@ impl Vm {
             roles,
             stack: Vec::new(),
             frames: Vec::new(),
+            pinned_codes: Vec::new(),
+            no_code: Rc::from([]),
             symbols: BTreeMap::new(),
             step_limit: None,
-            next_serial: 0,
             snapshot_writer: None,
             gc_counter: 0,
             gc_budget: MIN_GC_BUDGET,
@@ -661,6 +750,10 @@ impl Vm {
         for v in self.symbols.values_mut() {
             *v = fwd.forward(*v);
         }
+        // Pinned code goes once no frame runs any of it.
+        if !self.pinned_codes.is_empty() && self.frames.iter().all(|f| f.code == 0) {
+            self.pinned_codes.clear();
+        }
         self.flush_lookup_cache();
         self.gc_counter = self.heap.allocation_counter();
         self.gc_budget = MIN_GC_BUDGET.max(statistics.after as u64);
@@ -730,8 +823,8 @@ impl Vm {
                     arg_count: fr.arg_count as u64,
                     lp: fr.lp as u64,
                     ip: fr.ip as u64,
-                    activation: fr.activation.map(f),
-                    closure: fr.closure.map(f),
+                    activation: fr.activation.get().map(f),
+                    closure: fr.closure.get().map(f),
                 })
                 .collect(),
             actors: self
@@ -751,7 +844,7 @@ impl Vm {
                 .iter()
                 .map(|(&k, &v)| (String::from(k), f(v)))
                 .collect(),
-            next_serial: self.next_serial,
+            next_serial: self.jit_regs.serial,
             gc_counter: self.gc_counter,
             gc_budget: self.gc_budget,
             collections: self.collections,
@@ -776,10 +869,7 @@ impl Vm {
             .map(|fr| Frame {
                 serial: fr.serial,
                 method: fr.method,
-                code: vm
-                    .heap
-                    .method(fr.method)
-                    .map_or_else(|| Rc::from([]), |m| m.bytecode().clone()),
+                code: 0,
                 literals: vm.heap.method(fr.method).map_or(nil, |m| m.literals()),
                 mixin: vm.heap.method(fr.method).map_or(nil, |m| m.mixin()),
                 receiver: fr.receiver,
@@ -787,8 +877,8 @@ impl Vm {
                 arg_count: fr.arg_count as usize,
                 lp: fr.lp as usize,
                 ip: fr.ip as usize,
-                activation: fr.activation,
-                closure: fr.closure,
+                activation: fr.activation.into(),
+                closure: fr.closure.into(),
             })
             .collect();
         vm.actors = state
@@ -810,7 +900,7 @@ impl Vm {
             .into_iter()
             .map(|(k, v)| (&*alloc::boxed::Box::leak(k.into_boxed_str()), v))
             .collect();
-        vm.next_serial = state.next_serial;
+        vm.jit_regs.serial = state.next_serial;
         vm.gc_counter = state.gc_counter;
         vm.gc_budget = state.gc_budget;
         vm.collections = state.collections;
@@ -1857,16 +1947,15 @@ impl Vm {
                 let nil = self.nil();
                 self.stack
                     .extend(core::iter::repeat_n(nil, header.local_count as usize));
-                let serial = self.next_serial;
-                self.next_serial += 1;
-                let (code, literals, mixin) = {
+                let serial = self.take_serial();
+                let (literals, mixin) = {
                     let m = self.heap.method(method).expect("method");
-                    (m.bytecode().clone(), m.literals(), m.mixin())
+                    (m.literals(), m.mixin())
                 };
                 self.frames.push(Frame {
                     serial,
                     method,
-                    code,
+                    code: 0,
                     literals,
                     mixin,
                     receiver,
@@ -1874,8 +1963,8 @@ impl Vm {
                     arg_count: n,
                     lp,
                     ip: 0,
-                    activation: None,
-                    closure: None,
+                    activation: OptValue::NONE,
+                    closure: OptValue::NONE,
                 });
                 if self.jit_threshold > 0 {
                     self.tier_up(method, host);
@@ -1893,6 +1982,9 @@ impl Vm {
         host: &mut dyn Host,
     ) -> Result<Option<Completion>, VmError> {
         let receiver = self.stack[base];
+        if native == Native::MethodBytecodePut {
+            self.pin_code_of(receiver);
+        }
         let outcome = {
             let mut ctx = NativeContext {
                 heap: &mut self.heap,
@@ -2382,36 +2474,36 @@ impl Vm {
                 .heap
                 .method(method)
                 .ok_or_else(|| VmError::Malformed("method expected"))?;
-            (m.bytecode().clone(), m.literals(), m.mixin())
+            (m.bytecode().len(), m.literals(), m.mixin())
         };
-        if c.initial_ip() as usize >= code.len() {
+        if c.initial_ip() as usize >= code {
             return Err(VmError::Malformed("closure body outside its method"));
         }
         let base = self.stack.len() - 1 - n;
         let lp = self.stack.len();
         self.stack.extend(c.copied().iter().copied());
-        let serial = self.next_serial;
-        self.next_serial += 1;
+        let ip = c.initial_ip() as usize;
+        let serial = self.take_serial();
         self.frames.push(Frame {
             serial,
             method,
-            code,
+            code: 0,
             literals,
             mixin,
             receiver,
             bp: base,
             arg_count: n,
             lp,
-            ip: c.initial_ip() as usize,
-            activation: None,
-            closure: Some(closure),
+            ip,
+            activation: OptValue::NONE,
+            closure: Some(closure).into(),
         });
         Ok(())
     }
 
     /// The activation handle of frame `index`, created on first request.
     fn ensure_activation(&mut self, index: usize) -> Value {
-        if let Some(a) = self.frames[index].activation {
+        if let Some(a) = self.frames[index].activation.get() {
             return a;
         }
         let f = &self.frames[index];
@@ -2429,7 +2521,7 @@ impl Vm {
             Space::Actor(self.current as u32),
             Body::Activation(record),
         );
-        self.frames[index].activation = Some(a);
+        self.frames[index].activation = Some(a).into();
         a
     }
 
@@ -2720,7 +2812,7 @@ impl Vm {
         let current = self
             .frames
             .last()
-            .and_then(|f| f.activation)
+            .and_then(|f| f.activation.get())
             .ok_or(Reason::WrongKind(1))?;
         let mut chain = Vec::new();
         let mut a = top;
@@ -2757,8 +2849,7 @@ impl Vm {
             return Err(Reason::Exhausted(natives::Resource::Stack));
         }
         for &handle in chain.iter().rev() {
-            let serial = self.next_serial;
-            self.next_serial += 1;
+            let serial = self.take_serial();
             let (_, bci, temps) = self
                 .heap
                 .attach_activation(handle, serial)
@@ -2781,14 +2872,14 @@ impl Vm {
             let bp = self.stack.len();
             self.stack.push(closure.unwrap_or(receiver));
             self.stack.extend(temps.iter().copied());
-            let (code, literals, mixin) = {
+            let (literals, mixin) = {
                 let m = self.heap.method(method).expect("checked");
-                (m.bytecode().clone(), m.literals(), m.mixin())
+                (m.literals(), m.mixin())
             };
             self.frames.push(Frame {
                 serial,
                 method,
-                code,
+                code: 0,
                 literals,
                 mixin,
                 receiver,
@@ -2796,8 +2887,8 @@ impl Vm {
                 arg_count: arity,
                 lp: bp + 1 + arity,
                 ip: bci.as_small_integer().expect("checked") as usize - 1,
-                activation: Some(handle),
-                closure,
+                activation: Some(handle).into(),
+                closure: closure.into(),
             });
         }
         Ok(())
@@ -2866,6 +2957,9 @@ impl Vm {
             }
             MethodKind::Native => {
                 let native = Native::from_id(header.native).ok_or(Reason::WrongKind(1))?;
+                if native == Native::MethodBytecodePut {
+                    self.pin_code_of(receiver);
+                }
                 let outcome = {
                     let mut ctx = NativeContext {
                         heap: &mut self.heap,
@@ -2960,9 +3054,49 @@ impl Vm {
         }
     }
 
+    /// The bytecode `f` runs: its method's, or the code pinned for it.
+    #[inline]
+    fn frame_code(&self, f: &Frame) -> &Rc<[u8]> {
+        if f.code == 0 {
+            self.heap
+                .method(f.method)
+                .map_or(&self.no_code, |m| m.bytecode())
+        } else {
+            &self.pinned_codes[f.code as usize - 1]
+        }
+    }
+
+    /// The top frame's bytecode.
+    #[inline]
+    fn top_code(&self) -> &Rc<[u8]> {
+        self.frame_code(self.frames.last().expect("a frame"))
+    }
+
+    /// Before `Method>>bytecode:` replaces `method`'s bytecode: every frame
+    /// that runs it keeps the code it began with.
+    fn pin_code_of(&mut self, method: Value) {
+        let Some(code) = self.heap.method(method).map(|m| m.bytecode().clone()) else {
+            return;
+        };
+        if !self
+            .frames
+            .iter()
+            .any(|f| f.code == 0 && f.method == method)
+        {
+            return;
+        }
+        self.pinned_codes.push(code);
+        let k = self.pinned_codes.len() as u32;
+        for f in &mut self.frames {
+            if f.code == 0 && f.method == method {
+                f.code = k;
+            }
+        }
+    }
+
     /// Marks the handle of a frame that has returned or been unwound as dead.
     fn retire(&mut self, frame: &Frame) {
-        if let Some(a) = frame.activation {
+        if let Some(a) = frame.activation.get() {
             self.heap.set_activation_frame(a, None);
         }
     }
@@ -3567,7 +3701,7 @@ impl Vm {
         host: &mut dyn Host,
     ) -> Result<Option<Completion>, VmError> {
         let closure = self.frames.last().expect("a frame").closure;
-        let Some(closure) = closure else {
+        let Some(closure) = closure.get() else {
             // In a method frame, ^ is a local return.
             self.local_return(result);
             return Ok(None);
@@ -3588,7 +3722,7 @@ impl Vm {
             if self.frames[i].serial == home_serial {
                 // In place: no new vector for the frames cut.
                 for k in i..self.frames.len() {
-                    if let Some(a) = self.frames[k].activation {
+                    if let Some(a) = self.frames[k].activation.get() {
                         self.heap.set_activation_frame(a, None);
                     }
                 }
@@ -3884,7 +4018,10 @@ impl Vm {
             return None;
         }
         let f = self.frames.last()?;
-        self.heap.compiled_entry(f.method, &f.code, f.ip)
+        if f.code != 0 {
+            return None;
+        }
+        self.heap.compiled_entry(f.method, f.ip)
     }
 
     /// Continues the run after compiled code answered `status`.
@@ -3906,6 +4043,46 @@ impl Vm {
     /// For the host: the registers' address, to pass to compiled code.
     pub fn jit_regs(&mut self) -> *mut crate::compiler::Regs {
         &mut *self.jit_regs
+    }
+
+    /// The next frame serial (compiled code takes them from the same
+    /// register).
+    #[inline]
+    fn take_serial(&mut self) -> u64 {
+        let serial = self.jit_regs.serial;
+        self.jit_regs.serial += 1;
+        serial
+    }
+
+    /// For the host, before compiled code runs (entered, or continuing after
+    /// a runtime call): what it needs to push and pop frames itself, the
+    /// frames' and inline-cache targets' addresses, the frame count and the
+    /// room for frames and Values.
+    pub fn jit_publish(&mut self) {
+        /// Room for frames that compiled code pushes before it needs the VM.
+        const FRAME_ROOM: usize = 64;
+        self.frames.reserve(FRAME_ROOM);
+        let r = &mut *self.jit_regs;
+        r.frames = self.frames.as_ptr() as usize as u32;
+        r.frames_len = self.frames.len() as u32;
+        r.frames_cap = self.frames.capacity() as u32;
+        r.targets = self.jit_targets.as_ptr() as usize as u32;
+        r.stack_cap = self.stack.capacity() as u32;
+        r.jit_base = self.jit_base as u32;
+        r.stepping = u32::from(self.step_limit.is_some());
+    }
+
+    /// For the host: the frame count compiled code left (see
+    /// [`Vm::frames_for_host`]).
+    pub fn jit_frames_len(&self) -> usize {
+        self.jit_regs.frames_len as usize
+    }
+
+    /// For the host: the frames, to set their count to what compiled code
+    /// left (`Regs::frames_len`; it writes frames past the count, within the
+    /// room [`Vm::jit_publish`] reserved). Frames are plain integers.
+    pub fn frames_for_host(&mut self) -> &mut Vec<Frame> {
+        &mut self.frames
     }
 
     /// For the host: the operand stack, to set the height compiled code left
@@ -4122,10 +4299,7 @@ impl Vm {
         let id = match self.jit_target_index.get(&key_bits) {
             Some(&id) => id as usize,
             None => {
-                let (function, code) = {
-                    let (f, c) = self.heap.compiled_start(t.method)?;
-                    (f, c.clone())
-                };
+                let (function, _) = self.heap.compiled_start(t.method)?;
                 let (literals, mixin) = {
                     let m = self.heap.method(t.method)?;
                     (m.literals(), m.mixin())
@@ -4135,22 +4309,28 @@ impl Vm {
                     self.heap.array_elements(literals).map_or((0, 0), |e| {
                         ((e.as_ptr() as usize - arena) as u32, e.len() as u32)
                     });
+                let (receiver_kind, fixed) = match t.receiver {
+                    TargetReceiver::Present => (0, Value::from_bits(0)),
+                    TargetReceiver::Frame => (1, Value::from_bits(0)),
+                    TargetReceiver::Fixed(r) => (2, r),
+                };
                 let entry = TargetEntry {
                     method: t.method,
-                    function,
                     literals,
+                    mixin,
+                    fixed,
+                    function,
                     literal_offset,
                     literal_count,
-                    mixin,
-                    locals: t.header.local_count as usize,
-                    args: n,
-                    receiver: t.receiver,
+                    locals: t.header.local_count,
+                    args: n as u32,
+                    receiver_kind,
                 };
                 if self.jit_targets.len() >= MAX_JIT_TARGETS {
                     self.frames.last_mut().expect("a frame").ip = next_ip;
-                    return Some(self.enter_target(entry, code));
+                    return Some(self.enter_target(entry));
                 }
-                self.jit_targets.push(JitTarget { code, entry });
+                self.jit_targets.push(entry);
                 let id = self.jit_targets.len() - 1;
                 self.jit_target_index.insert(key_bits, id as u32);
                 id
@@ -4158,9 +4338,7 @@ impl Vm {
         };
         let class = self.class_of(key);
         self.frames.last_mut().expect("a frame").ip = next_ip;
-        let t = &self.jit_targets[id];
-        let (entry, code) = (t.entry, t.code.clone());
-        let status = self.enter_target(entry, code);
+        let status = self.enter_target(self.jit_targets[id]);
         let r = &mut *self.jit_regs;
         r.ic_kind = crate::compiler::IC_METHOD;
         r.ic_slot = id as u32;
@@ -4205,11 +4383,11 @@ impl Vm {
             let a = self.heap.activation(defining)?;
             (a.method(), a.receiver())
         };
-        let (code, literals, mixin) = {
+        let (literals, mixin) = {
             let m = self.heap.method(method)?;
-            (m.bytecode().clone(), m.literals(), m.mixin())
+            (m.literals(), m.mixin())
         };
-        let (function, block) = self.heap.compiled_entry(method, &code, initial_ip)?;
+        let (function, block) = self.heap.compiled_entry(method, initial_ip)?;
         let (literal_address, literal_count) = self
             .heap
             .array_elements(literals)
@@ -4223,12 +4401,11 @@ impl Vm {
             self.stack.extend(c.copied().iter().copied());
         }
         self.stack.reserve(crate::compiler::HEADROOM);
-        let serial = self.next_serial;
-        self.next_serial += 1;
+        let serial = self.take_serial();
         self.frames.push(Frame {
             serial,
             method,
-            code,
+            code: 0,
             literals,
             mixin,
             receiver,
@@ -4236,8 +4413,8 @@ impl Vm {
             arg_count: n,
             lp,
             ip: initial_ip,
-            activation: None,
-            closure: Some(closure),
+            activation: OptValue::NONE,
+            closure: Some(closure).into(),
         });
         let depth = self.frames.len();
         let base_address = self.stack.as_ptr() as usize as u32;
@@ -4276,9 +4453,9 @@ impl Vm {
     /// [`CALLEE`](crate::compiler::CALLEE) for its function, the registers
     /// set for its frame. Only what a frame push changes is set: it
     /// allocates nothing.
-    fn enter_target(&mut self, t: TargetEntry, code: Rc<[u8]>) -> i32 {
-        let n = t.args;
-        match t.receiver {
+    fn enter_target(&mut self, t: TargetEntry) -> i32 {
+        let n = t.args as usize;
+        match t.receiver() {
             TargetReceiver::Present => {}
             TargetReceiver::Frame => {
                 let r = self.frames.last().expect("a frame").receiver;
@@ -4290,14 +4467,14 @@ impl Vm {
         let receiver = self.stack[base];
         let lp = self.stack.len();
         let nil = self.nil();
-        self.stack.extend(core::iter::repeat_n(nil, t.locals));
+        self.stack
+            .extend(core::iter::repeat_n(nil, t.locals as usize));
         self.stack.reserve(crate::compiler::HEADROOM);
-        let serial = self.next_serial;
-        self.next_serial += 1;
+        let serial = self.take_serial();
         self.frames.push(Frame {
             serial,
             method: t.method,
-            code,
+            code: 0,
             literals: t.literals,
             mixin: t.mixin,
             receiver,
@@ -4305,8 +4482,8 @@ impl Vm {
             arg_count: n,
             lp,
             ip: 0,
-            activation: None,
-            closure: None,
+            activation: OptValue::NONE,
+            closure: OptValue::NONE,
         });
         let depth = self.frames.len();
         let base_address = self.stack.as_ptr() as usize as u32;
@@ -4348,9 +4525,7 @@ impl Vm {
             return crate::compiler::MISS;
         }
         self.frames.last_mut().expect("a frame").ip = next;
-        let t = &self.jit_targets[target];
-        let (entry, code) = (t.entry, t.code.clone());
-        self.enter_target(entry, code)
+        self.enter_target(self.jit_targets[target])
     }
 
     /// A send of literal `index` by `rule` with `n` arguments from the top
@@ -4476,13 +4651,13 @@ impl Vm {
     /// interpreter runs it; see [`crate::compiler`] for the answer.
     pub fn compiled_step(&mut self, host: &mut dyn Host, ip: usize) -> i32 {
         let before = self.before_compiled_call();
+        self.frames.last_mut().expect("a frame").ip = ip;
         let (expected, returns) = {
-            let f = self.frames.last_mut().expect("a frame");
-            f.ip = ip;
-            let o = f.code.get(ip).copied().unwrap_or(0);
+            let code = self.top_code();
+            let o = code.get(ip).copied().unwrap_or(0);
             let len = instruction_length(o);
-            let expected = if o == op::PUSH_CLOSURE && ip + 4 <= f.code.len() {
-                ip + len + u16::from_le_bytes([f.code[ip + 2], f.code[ip + 3]]) as usize
+            let expected = if o == op::PUSH_CLOSURE && ip + 4 <= code.len() {
+                ip + len + u16::from_le_bytes([code[ip + 2], code[ip + 3]]) as usize
             } else {
                 ip + len
             };
@@ -4631,13 +4806,13 @@ impl Vm {
     pub fn compiled_closure(&mut self, ip: usize) -> i32 {
         let (copied_count, num_args, after, ok) = {
             let f = self.frames.last().expect("a frame");
-            match f.code.get(ip..ip + 4) {
+            let code = self.frame_code(f);
+            match code.get(ip..ip + 4) {
                 Some(&[op::PUSH_CLOSURE, b1, b2, b3]) => {
                     let copied_count = (b1 >> 4) as usize;
                     let length = u16::from_le_bytes([b2, b3]) as usize;
                     let next = ip + 4;
-                    let ok =
-                        self.stack.len() >= f.lp + copied_count && next + length <= f.code.len();
+                    let ok = self.stack.len() >= f.lp + copied_count && next + length <= code.len();
                     (copied_count, u32::from(b1 & 15), next + length, ok)
                 }
                 _ => (0, 0, 0, false),
@@ -4700,7 +4875,7 @@ impl Vm {
             let (code, mut ip, bp, lp, arg_count, receiver, mixin) = {
                 let f = self.frames.last().expect("a frame");
                 (
-                    f.code.clone(),
+                    self.frame_code(f).clone(),
                     f.ip,
                     f.bp,
                     f.lp,
@@ -5064,7 +5239,7 @@ impl Vm {
     fn step(&mut self, host: &mut dyn Host) -> Result<Step, VmError> {
         let (ip, bytes) = {
             let f = self.frames.last().expect("a frame");
-            let (code, ip) = (&f.code, f.ip);
+            let (code, ip) = (self.frame_code(f), f.ip);
             let Some(&first) = code.get(ip) else {
                 return Err(self.invalid());
             };
@@ -5351,7 +5526,7 @@ impl Vm {
                 let copied_count = (bytes[1] >> 4) as usize;
                 let num_args = u32::from(bytes[1] & 15);
                 let length = u16::from_le_bytes([bytes[2], bytes[3]]) as usize;
-                let code_len = self.frames.last().expect("a frame").code.len();
+                let code_len = self.top_code().len();
                 if self.stack.len() - self.frames.last().expect("a frame").lp < copied_count
                     || next + length > code_len
                 {

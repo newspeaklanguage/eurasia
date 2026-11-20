@@ -135,6 +135,10 @@ body { margin: 0; background: #fff; }
     ]);
     const record = params.has('record') ? Number(params.get('record') || 0) : undefined;
     const keep = params.has('keep') ? Number(params.get('keep') || 0) : 2;
+    // ?jit=n compiles each method at its nth activation (?jit alone: the
+    // first); off by default, and while recording (replay is interpreted).
+    const jit = params.has('jit') ? Number(params.get('jit') || 1) : 0;
+    if (jit > 0) console.log(record !== undefined ? 'eurasia: recording, so not compiling' : `eurasia: compiling methods at activation ${jit}`);
     let controls = null;
     if (record !== undefined) {
       window.eurasiaSaveLog = () => {
@@ -168,6 +172,7 @@ body { margin: 0; background: #fff; }
       print: (line) => console.log(line),
       record,
       keep,
+      jit,
       onStart: (c) => { controls = c; },
       onSaveImage: (name, bytes) => {
         storeImage(name, bytes).catch((e) => {

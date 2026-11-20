@@ -129,7 +129,93 @@ pub struct Regs {
     /// See `ic_kind`: for [`IC_OUTER_GETTER`], the object whose slot the
     /// send reads.
     pub ic_object: u64,
+    /// The next frame serial: the VM and compiled code take them here.
+    pub serial: u64,
+    /// The frames' address (each [`FRAME_SIZE`] bytes), their count and
+    /// the room for them: compiled code pushes and pops frames itself
+    /// within it; the host adopts the count at every call into the VM.
+    pub frames: u32,
+    /// See `frames`.
+    pub frames_len: u32,
+    /// See `frames`.
+    pub frames_cap: u32,
+    /// The inline-cache targets' address (each [`TARGET_SIZE`] bytes).
+    pub targets: u32,
+    /// The operand stack's room, in Values.
+    pub stack_cap: u32,
+    /// The frame count when the host last entered compiled code.
+    pub jit_base: u32,
+    /// Whether a step limit is set (1): compiled code then pushes no frame.
+    pub stepping: u32,
 }
+
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(Regs, bytes) == R_BYTES as usize);
+    assert!(offset_of!(Regs, small_integer) == R_SMALL_INTEGER as usize);
+    assert!(offset_of!(Regs, ic_object) == R_IC_OBJECT as usize);
+    assert!(offset_of!(Regs, serial) == R_SERIAL as usize);
+    assert!(offset_of!(Regs, frames) == R_FRAMES as usize);
+    assert!(offset_of!(Regs, frames_len) == R_FRAMES_LEN as usize);
+    assert!(offset_of!(Regs, frames_cap) == R_FRAMES_CAP as usize);
+    assert!(offset_of!(Regs, targets) == R_TARGETS as usize);
+    assert!(offset_of!(Regs, stack_cap) == R_STACK_CAP as usize);
+    assert!(offset_of!(Regs, jit_base) == R_JIT_BASE as usize);
+    assert!(offset_of!(Regs, stepping) == R_STEPPING as usize);
+};
+
+/// A frame's layout on wasm32 (the interpreter's `Frame`, checked there):
+/// its size and its fields' offsets.
+pub const FRAME_SIZE: u32 = 80;
+/// See [`FRAME_SIZE`].
+pub const FRAME_SERIAL: u32 = 0;
+/// See [`FRAME_SIZE`].
+pub const FRAME_METHOD: u32 = 8;
+/// See [`FRAME_SIZE`].
+pub const FRAME_LITERALS: u32 = 16;
+/// See [`FRAME_SIZE`].
+pub const FRAME_MIXIN: u32 = 24;
+/// See [`FRAME_SIZE`].
+pub const FRAME_RECEIVER: u32 = 32;
+/// See [`FRAME_SIZE`].
+pub const FRAME_ACTIVATION: u32 = 40;
+/// See [`FRAME_SIZE`].
+pub const FRAME_CLOSURE: u32 = 48;
+/// See [`FRAME_SIZE`].
+pub const FRAME_CODE: u32 = 56;
+/// See [`FRAME_SIZE`].
+pub const FRAME_BP: u32 = 60;
+/// See [`FRAME_SIZE`].
+pub const FRAME_ARG_COUNT: u32 = 64;
+/// See [`FRAME_SIZE`].
+pub const FRAME_LP: u32 = 68;
+/// See [`FRAME_SIZE`].
+pub const FRAME_IP: u32 = 72;
+/// An inline-cache target's layout (the interpreter's `TargetEntry`,
+/// checked there): its size and its fields' offsets.
+pub const TARGET_SIZE: u32 = 56;
+/// See [`TARGET_SIZE`].
+pub const TARGET_METHOD: u32 = 0;
+/// See [`TARGET_SIZE`].
+pub const TARGET_LITERALS: u32 = 8;
+/// See [`TARGET_SIZE`].
+pub const TARGET_MIXIN: u32 = 16;
+/// See [`TARGET_SIZE`].
+pub const TARGET_FIXED: u32 = 24;
+/// See [`TARGET_SIZE`].
+pub const TARGET_FUNCTION: u32 = 32;
+/// See [`TARGET_SIZE`].
+pub const TARGET_LITERAL_OFFSET: u32 = 36;
+/// See [`TARGET_SIZE`].
+pub const TARGET_LITERAL_COUNT: u32 = 40;
+/// See [`TARGET_SIZE`].
+pub const TARGET_LOCALS: u32 = 44;
+/// See [`TARGET_SIZE`].
+pub const TARGET_RECEIVER_KIND: u32 = 52;
+/// Frames at most (the interpreter's limit).
+const MAX_FRAMES: u32 = crate::interpreter::MAX_FRAMES as u32;
+/// Compiled callees nested in the host's stack, at most (the VM's limit).
+const MAX_NESTED: u32 = 512;
 
 // The registers' offsets.
 const R_BASE: u32 = 0;
@@ -155,6 +241,14 @@ const R_IC_CLASS: u32 = 96;
 const R_BYTES: u32 = 104;
 const R_SMALL_INTEGER: u32 = 112;
 const R_IC_OBJECT: u32 = 120;
+const R_SERIAL: u32 = 128;
+const R_FRAMES: u32 = 136;
+const R_FRAMES_LEN: u32 = 140;
+const R_FRAMES_CAP: u32 = 144;
+const R_TARGETS: u32 = 148;
+const R_STACK_CAP: u32 = 152;
+const R_JIT_BASE: u32 = 156;
+const R_STEPPING: u32 = 160;
 
 // The object header (newspeak/EURASIA_ARENA_DESIGN): class, sequence number,
 // meta (format 5 bits, flags 5, space 21, remembered 1, size 32); then the
@@ -887,7 +981,6 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                 }
             }
             Ins::Return(r) => {
-                f.get(L_VM);
                 match r {
                     Ret::Top => {
                         f.dec_sp();
@@ -906,6 +999,9 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                         f.get(L_FALSE);
                     }
                 }
+                f.set(L_R64);
+                f.pop_frame();
+                f.get(L_VM).get(L_R64);
                 f.get(L_SP).call(F_RET).op(0x0f);
             }
         }
@@ -1003,6 +1099,39 @@ impl Func {
     }
     fn load(&mut self) -> &mut Func {
         self.op(0x29).uleb(3).uleb(0) // i64.load align 8
+    }
+    /// i32.load at the address on the stack plus `offset`.
+    fn ld32(&mut self, offset: u32) -> &mut Func {
+        self.op(0x28).uleb(2).uleb(offset)
+    }
+    /// i64.load at the address on the stack plus `offset`.
+    fn ld64(&mut self, offset: u32) -> &mut Func {
+        self.op(0x29).uleb(3).uleb(offset)
+    }
+    /// i32.store at the address below the value plus `offset`.
+    fn st32(&mut self, offset: u32) -> &mut Func {
+        self.op(0x36).uleb(2).uleb(offset)
+    }
+    /// i64.store at the address below the value plus `offset`.
+    fn st64(&mut self, offset: u32) -> &mut Func {
+        self.op(0x37).uleb(3).uleb(offset)
+    }
+    /// Sets the i32 register at `offset` to what `value` pushes.
+    fn set_reg32(&mut self, offset: u32, value: impl FnOnce(&mut Func)) -> &mut Func {
+        self.get(L_REGS);
+        value(self);
+        self.st32(offset)
+    }
+    /// Sets the i64 register at `offset` to what `value` pushes.
+    fn set_reg64(&mut self, offset: u32, value: impl FnOnce(&mut Func)) -> &mut Func {
+        self.get(L_REGS);
+        value(self);
+        self.st64(offset)
+    }
+    /// The address of frame `k` (an i32 on the stack): frames + k * size.
+    fn frame_addr(&mut self) -> &mut Func {
+        self.i32c(FRAME_SIZE as i32).op(0x6c); // i32.mul
+        self.reg32(R_FRAMES).add()
     }
     fn store(&mut self) -> &mut Func {
         self.op(0x37).uleb(3).uleb(0) // i64.store align 8
@@ -1408,6 +1537,200 @@ impl Func {
             .add()
             .set(L_ADDR)
     }
+    /// Whether the method target of the hit entry (its index in `slot`) can
+    /// have its frame pushed here: no step limit and no safepoint due, room
+    /// for a frame (within the VM's limits) and for its locals and the
+    /// headroom on the operand stack. Leaves the target's address in
+    /// `index`.
+    fn push_frame_ok(&mut self) -> &mut Func {
+        self.reg32(R_TARGETS)
+            .get(L_SLOT)
+            .i32c(TARGET_SIZE as i32)
+            .op(0x6c)
+            .add()
+            .set(L_INDEX);
+        self.reg32(R_STEPPING).reg32(R_DUE).op(0x72).op(0x45);
+        self.reg32(R_FRAMES_LEN)
+            .reg32(R_FRAMES_CAP)
+            .op(0x49)
+            .op(0x71); // len <u cap
+        self.reg32(R_FRAMES_LEN)
+            .i32c(MAX_FRAMES as i32 - 1)
+            .op(0x49)
+            .op(0x71);
+        self.reg32(R_FRAMES_LEN)
+            .i32c(1)
+            .add()
+            .reg32(R_JIT_BASE)
+            .sub()
+            .i32c(MAX_NESTED as i32)
+            .op(0x48) // lt_s
+            .op(0x71);
+        // sp + 1 (a receiver inserted) + locals + headroom <= the room
+        self.get(L_SP)
+            .i32c(1 + HEADROOM as i32)
+            .add()
+            .get(L_INDEX)
+            .ld32(TARGET_LOCALS)
+            .add()
+            .reg32(R_STACK_CAP)
+            .op(0x4d) // le_u
+            .op(0x71)
+    }
+    /// Pushes the frame of the method target at `index` (after
+    /// [`Func::push_frame_ok`]) for a send of `args` arguments that continues
+    /// at `next`, as the VM's `enter_target` does: the receiver inserted if
+    /// the target's is not the message's, the locals nil, the caller's `ip`
+    /// at `next`, the registers set for the callee; `r` is then
+    /// [`CALLEE`] plus its function.
+    fn push_frame(&mut self, args: u32, ordinary: bool, next: usize) -> &mut Func {
+        if !ordinary {
+            // The receiver, inserted below the arguments: the frame's (1)
+            // or a fixed one (2).
+            self.get(L_INDEX)
+                .ld32(TARGET_RECEIVER_KIND)
+                .op(0x04)
+                .op(0x40);
+            for i in (0..args).rev() {
+                self.slot_addr(|f| {
+                    f.get(L_SP).i32c(args as i32 - i as i32 - 1).sub();
+                });
+                self.slot_addr(|f| {
+                    f.get(L_SP).i32c(args as i32 - i as i32).sub();
+                });
+                self.load().store();
+            }
+            self.slot_addr(|f| {
+                f.get(L_SP).i32c(args as i32).sub();
+            });
+            self.get(L_INDEX)
+                .ld32(TARGET_RECEIVER_KIND)
+                .i32c(1)
+                .op(0x46);
+            self.op(0x04).op(0x7e).get(L_SELF).op(0x05);
+            self.get(L_INDEX).ld64(TARGET_FIXED).op(0x0b);
+            self.store();
+            self.inc_sp();
+            self.op(0x0b);
+        }
+        // bp, in `kind`; the receiver, in `b`
+        self.get(L_SP).i32c(1 + args as i32).sub().set(L_KIND);
+        self.slot_addr(|f| {
+            f.get(L_KIND);
+        })
+        .load()
+        .set(L_B);
+        // the caller's ip
+        self.reg32(R_FRAMES_LEN).i32c(1).sub().frame_addr();
+        self.i32c(next as i32).st32(FRAME_IP);
+        // the new frame, at `addr`
+        self.reg32(R_FRAMES_LEN).frame_addr().set(L_ADDR);
+        self.get(L_ADDR).get(L_SP).st32(FRAME_LP);
+        self.get(L_ADDR).get(L_KIND).st32(FRAME_BP);
+        self.get(L_ADDR).i32c(args as i32).st32(FRAME_ARG_COUNT);
+        self.get(L_ADDR).i32c(0).st32(FRAME_CODE);
+        self.get(L_ADDR).i32c(0).st32(FRAME_IP);
+        self.get(L_ADDR).reg64(R_SERIAL).st64(FRAME_SERIAL);
+        self.set_reg64(R_SERIAL, |f| {
+            f.reg64(R_SERIAL).i64c(1).op(0x7c);
+        });
+        for (from, to) in [
+            (TARGET_METHOD, FRAME_METHOD),
+            (TARGET_LITERALS, FRAME_LITERALS),
+            (TARGET_MIXIN, FRAME_MIXIN),
+        ] {
+            self.get(L_ADDR).get(L_INDEX).ld64(from).st64(to);
+        }
+        self.get(L_ADDR).get(L_B).st64(FRAME_RECEIVER);
+        self.get(L_ADDR).i64c(0).st64(FRAME_ACTIVATION);
+        self.get(L_ADDR).i64c(0).st64(FRAME_CLOSURE);
+        // the locals, nil
+        self.get(L_INDEX).ld32(TARGET_LOCALS).set(L_SLOT);
+        self.op(0x02).op(0x40).op(0x03).op(0x40); // block, loop
+        self.get(L_SLOT).op(0x45).op(0x0d).uleb(1); // br_if out when none left
+        self.push_addr().get(L_NIL).store();
+        self.inc_sp();
+        self.get(L_SLOT).i32c(1).sub().set(L_SLOT);
+        self.op(0x0c).uleb(0).op(0x0b).op(0x0b); // br loop; end loop; end block
+        // the count and the registers
+        self.set_reg32(R_FRAMES_LEN, |f| {
+            f.reg32(R_FRAMES_LEN).i32c(1).add();
+        });
+        self.set_reg32(R_DEPTH, |f| {
+            f.reg32(R_FRAMES_LEN);
+        });
+        self.set_reg32(R_SP, |f| {
+            f.get(L_SP);
+        });
+        self.set_reg32(R_BP, |f| {
+            f.get(L_KIND);
+        });
+        self.set_reg32(R_LP, |f| {
+            f.get(L_ADDR).ld32(FRAME_LP);
+        });
+        self.set_reg32(R_ARGC, |f| {
+            f.i32c(args as i32);
+        });
+        self.set_reg32(R_LITERALS, |f| {
+            f.reg32(R_ARENA)
+                .get(L_INDEX)
+                .ld32(TARGET_LITERAL_OFFSET)
+                .add();
+        });
+        self.set_reg32(R_LITERAL_COUNT, |f| {
+            f.get(L_INDEX).ld32(TARGET_LITERAL_COUNT);
+        });
+        self.set_reg64(R_RECEIVER, |f| {
+            f.get(L_B);
+        });
+        self.set_reg32(R_BLOCK, |f| {
+            f.i32c(0);
+        });
+        self.set_reg32(R_IC_KIND, |f| {
+            f.i32c(0);
+        });
+        self.get(L_INDEX)
+            .ld32(TARGET_FUNCTION)
+            .i32c(CALLEE)
+            .add()
+            .set(L_R)
+    }
+    /// The local return of the value in `r64`, when a compiled caller in
+    /// this wasm stack takes it (the frame is deeper than the one the host
+    /// entered, which returns to the host, which must adopt the stack) and
+    /// this frame has no activation handle: the frame popped here, as the
+    /// VM's `local_return` does, and [`DONE`] returned; else on to the
+    /// runtime's `ret`.
+    fn pop_frame(&mut self) -> &mut Func {
+        self.reg32(R_FRAMES_LEN)
+            .i32c(1)
+            .sub()
+            .frame_addr()
+            .set(L_ADDR);
+        // deeper than the frame the host entered: a compiled caller below,
+        // in this wasm stack, takes the answer
+        self.reg32(R_FRAMES_LEN).reg32(R_JIT_BASE).op(0x4b); // gt_u
+        self.get(L_ADDR).ld64(FRAME_ACTIVATION).op(0x50).op(0x71); // eqz
+        self.op(0x04).op(0x40);
+        self.slot_addr(|f| {
+            f.get(L_BP);
+        });
+        self.get(L_R64).store();
+        self.set_reg32(R_SP, |f| {
+            f.get(L_BP).i32c(1).add();
+        });
+        self.set_reg32(R_FRAMES_LEN, |f| {
+            f.reg32(R_FRAMES_LEN).i32c(1).sub();
+        });
+        self.set_reg32(R_DEPTH, |f| {
+            f.reg32(R_FRAMES_LEN);
+        });
+        self.set_reg32(R_IC_KIND, |f| {
+            f.i32c(0);
+        });
+        self.i32c(DONE).op(0x0f);
+        self.op(0x0b)
+    }
     /// A send of literal `literal` by `rule` with `args` arguments, the
     /// instruction continuing at `next`: through its inline cache
     /// where it has one, else the runtime's `send`; then `after_call`.
@@ -1492,9 +1815,21 @@ impl Func {
                     self.op(0x0b);
                 }
             }
-            // A compiled method: entered through `call`.
+            // A compiled method: its frame pushed here when there is room
+            // and nothing else to do, else by `call`.
             self.get(L_KIND).i32c(IC_METHOD as i32).op(0x46);
             self.op(0x04).op(0x40);
+            self.get(L_SLOT)
+                .i32c(CLOSURE_TARGET as i32)
+                .op(0x71)
+                .op(0x45); // a method
+            self.op(0x04).op(0x40);
+            self.push_frame_ok();
+            self.op(0x04).op(0x40);
+            self.push_frame(args, ordinary, next);
+            self.op(0x0c).uleb(3); // br: after the call
+            self.op(0x0b);
+            self.op(0x0b);
             self.get(L_VM)
                 .get(L_SLOT)
                 .i32c(next as i32)

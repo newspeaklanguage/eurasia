@@ -228,8 +228,10 @@ fn trampoline(
     mut outcome: Result<Completion, VmError>,
 ) -> Result<Completion, VmError> {
     while let Ok(Completion::Compiled(code, block)) = outcome {
+        vm.jit_publish();
         let regs = vm.jit_regs();
         let status = call_compiled(code, regs, block, vm);
+        adopt_frames(vm);
         outcome = vm.continue_after_compiled(status, &mut WebHost);
     }
     outcome
@@ -273,6 +275,31 @@ fn adopt_stack(vm: &mut Vm, sp: i32) {
     unsafe { stack.set_len(sp as usize) };
 }
 
+/// Sets the frame count to what compiled code left (`Regs::frames_len`):
+/// it pushed and popped frames itself, within the room
+/// [`Vm::jit_publish`] reserved.
+fn adopt_frames(vm: &mut Vm) {
+    let n = vm.jit_frames_len();
+    let frames = vm.frames_for_host();
+    assert!(n <= frames.capacity());
+    // SAFETY: within the capacity; every frame below `n` was written (by
+    // the VM, or by compiled code, whole), and a frame is plain integers,
+    // every bit pattern valid.
+    unsafe { frames.set_len(n) };
+}
+
+/// For a call from compiled code: the VM adopts the stack's height `sp` and
+/// the frame count, runs `f`, and publishes what compiled code needs before
+/// it goes on.
+fn from_compiled(vm: *mut Vm, sp: i32, f: impl FnOnce(&mut Vm) -> i32) -> i32 {
+    let vm = vm_at(vm);
+    adopt_stack(vm, sp);
+    adopt_frames(vm);
+    let status = f(vm);
+    vm.jit_publish();
+    status
+}
+
 /// For compiled code: a send ([`Vm::compiled_send`]), the stack at height `sp`.
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_rt_send(
@@ -283,63 +310,55 @@ pub extern "C" fn eurasia_rt_send(
     next: i32,
     sp: i32,
 ) -> i32 {
-    let vm = vm_at(vm);
-    adopt_stack(vm, sp);
-    vm.compiled_send(
-        &mut WebHost,
-        rule,
-        literal as usize,
-        n as usize,
-        next as usize,
-    )
+    from_compiled(vm, sp, |vm| {
+        vm.compiled_send(
+            &mut WebHost,
+            rule,
+            literal as usize,
+            n as usize,
+            next as usize,
+        )
+    })
 }
 
 /// For compiled code: a local return, the stack at height `sp`.
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_rt_ret(vm: *mut Vm, value: i64, sp: i32) -> i32 {
-    let vm = vm_at(vm);
-    adopt_stack(vm, sp);
-    vm.compiled_return(eurasia_core::Value::from_bits(value as u64))
+    from_compiled(vm, sp, |vm| {
+        vm.compiled_return(eurasia_core::Value::from_bits(value as u64))
+    })
 }
 
 /// For compiled code: the interpreter continues at `ip`, the stack at height `sp`.
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_rt_interpret(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
-    let vm = vm_at(vm);
-    adopt_stack(vm, sp);
-    vm.compiled_interpret(ip as usize)
+    from_compiled(vm, sp, |vm| vm.compiled_interpret(ip as usize))
 }
 
 /// For compiled code: the instruction at `ip` by the interpreter ([`Vm::compiled_step`]), the stack at height `sp`.
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_rt_step(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
-    let vm = vm_at(vm);
-    adopt_stack(vm, sp);
-    vm.compiled_step(&mut WebHost, ip as usize)
+    from_compiled(vm, sp, |vm| vm.compiled_step(&mut WebHost, ip as usize))
 }
 
 /// For compiled code: backward jumps against the interrupt poll ([`Vm::compiled_tick`]), the stack at height `sp`.
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_rt_tick(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
-    let vm = vm_at(vm);
-    adopt_stack(vm, sp);
-    vm.compiled_tick(ip as usize)
+    from_compiled(vm, sp, |vm| vm.compiled_tick(ip as usize))
 }
 
 /// For compiled code: the closure push at `ip` ([`Vm::compiled_closure`]), the stack at height `sp`.
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_rt_closure(vm: *mut Vm, ip: i32, sp: i32) -> i32 {
-    let vm = vm_at(vm);
-    adopt_stack(vm, sp);
-    vm.compiled_closure(ip as usize)
+    from_compiled(vm, sp, |vm| vm.compiled_closure(ip as usize))
 }
 
 /// For compiled code: a send its inline cache holds the target of ([`Vm::compiled_call`]), the stack at height `sp`.
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_rt_call(vm: *mut Vm, target: i32, next: i32, sp: i32) -> i32 {
-    let vm = vm_at(vm);
-    adopt_stack(vm, sp);
-    vm.compiled_call(target as u32 as usize, next as usize)
+    from_compiled(vm, sp, |vm| {
+        vm.compiled_call(target as u32 as usize, next as usize)
+    })
 }
 
 /// The monotonic time to resume at, after [`WAITING`], in nanoseconds (an

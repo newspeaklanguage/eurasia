@@ -1369,13 +1369,13 @@ impl Heap {
     }
 
     /// The compiled function of `method` and its block for instruction `ip`,
-    /// if the method is compiled from `code` (a frame keeps the code it began
-    /// with) and `ip` is one of its entries.
+    /// if the method is compiled and `ip` is one of its entries (for a frame
+    /// that runs the method's current code).
     #[inline]
-    pub fn compiled_entry(&self, method: Value, code: &Rc<[u8]>, ip: usize) -> Option<(u32, u32)> {
+    pub fn compiled_entry(&self, method: Value, ip: usize) -> Option<(u32, u32)> {
         let c = self.contents_of(method, Code::Method)?;
         let e = &self.codes[small_of(c[M_CODE]) as usize];
-        if e.jit > -2 || !Rc::ptr_eq(&e.bytes, code) {
+        if e.jit > -2 {
             return None;
         }
         let entries = e.entries.as_ref()?;
