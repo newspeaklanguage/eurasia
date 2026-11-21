@@ -232,6 +232,7 @@ fn trampoline(
         let regs = vm.jit_regs();
         let status = call_compiled(code, regs, block, vm);
         adopt_frames(vm);
+        adopt_arena(vm);
         outcome = vm.continue_after_compiled(status, &mut WebHost);
     }
     outcome
@@ -288,6 +289,18 @@ fn adopt_frames(vm: &mut Vm) {
     unsafe { frames.set_len(n) };
 }
 
+/// Sets the arena's length to what compiled code left (`Regs::words_len`):
+/// it allocated objects itself, within the room [`Vm::jit_publish`]
+/// published; then the VM takes their sequence numbers and count.
+fn adopt_arena(vm: &mut Vm) {
+    let (words, n) = vm.arena_for_host();
+    assert!(n <= words.capacity());
+    // SAFETY: within the capacity; compiled code wrote every word below
+    // `n` (whole objects), and every Value bit pattern is valid.
+    unsafe { words.set_len(n) };
+    vm.adopt_jit_allocation();
+}
+
 /// For a call from compiled code: the VM adopts the stack's height `sp` and
 /// the frame count, runs `f`, and publishes what compiled code needs before
 /// it goes on.
@@ -295,6 +308,7 @@ fn from_compiled(vm: *mut Vm, sp: i32, f: impl FnOnce(&mut Vm) -> i32) -> i32 {
     let vm = vm_at(vm);
     adopt_stack(vm, sp);
     adopt_frames(vm);
+    adopt_arena(vm);
     let status = f(vm);
     vm.jit_publish();
     status

@@ -149,6 +149,28 @@ pub struct Regs {
     pub stepping: u32,
     /// The closure targets' address (each [`CTARGET_SIZE`] bytes).
     pub closure_targets: u32,
+    /// The arena's length and room, in words: compiled code allocates
+    /// within it; the host adopts the length at every call into the VM.
+    pub words_len: u32,
+    /// See `words_len`.
+    pub words_cap: u32,
+    /// The next object sequence number (the allocation counter), and the
+    /// count at which a safepoint is due: compiled code allocates only
+    /// below it, and takes the numbers here.
+    pub seq: u64,
+    /// See `seq`.
+    pub safepoint_at: u64,
+    /// The Closure and Activation classes, and the meta words of a closure
+    /// of no fields and an activation, in the current actor's space.
+    pub closure_class: u64,
+    /// See `closure_class`.
+    pub activation_class: u64,
+    /// See `closure_class`.
+    pub closure_meta: u64,
+    /// See `closure_class`.
+    pub activation_meta: u64,
+    /// The objects compiled code allocated since the VM last published.
+    pub allocated: u32,
 }
 
 const _: () = {
@@ -165,6 +187,15 @@ const _: () = {
     assert!(offset_of!(Regs, jit_base) == R_JIT_BASE as usize);
     assert!(offset_of!(Regs, stepping) == R_STEPPING as usize);
     assert!(offset_of!(Regs, closure_targets) == R_CLOSURE_TARGETS as usize);
+    assert!(offset_of!(Regs, words_len) == R_WORDS_LEN as usize);
+    assert!(offset_of!(Regs, words_cap) == R_WORDS_CAP as usize);
+    assert!(offset_of!(Regs, seq) == R_SEQ as usize);
+    assert!(offset_of!(Regs, safepoint_at) == R_SAFEPOINT_AT as usize);
+    assert!(offset_of!(Regs, closure_class) == R_CLOSURE_CLASS as usize);
+    assert!(offset_of!(Regs, activation_class) == R_ACTIVATION_CLASS as usize);
+    assert!(offset_of!(Regs, closure_meta) == R_CLOSURE_META as usize);
+    assert!(offset_of!(Regs, activation_meta) == R_ACTIVATION_META as usize);
+    assert!(offset_of!(Regs, allocated) == R_ALLOCATED as usize);
 };
 
 /// A frame's layout on wasm32 (the interpreter's `Frame`, checked there):
@@ -243,6 +274,7 @@ const CLOSURE_DEFINING: u32 = SLOTS;
 const CLOSURE_INITIAL_IP: u32 = SLOTS + 8;
 const CLOSURE_NUM_ARGS: u32 = SLOTS + 16;
 const CLOSURE_COPIED: u32 = SLOTS + 24;
+const ACTIVATION_FRAME: u32 = SLOTS;
 const ACTIVATION_METHOD: u32 = SLOTS + 8;
 const ACTIVATION_RECEIVER: u32 = SLOTS + 16;
 /// Frames at most (the interpreter's limit).
@@ -283,6 +315,15 @@ const R_STACK_CAP: u32 = 152;
 const R_JIT_BASE: u32 = 156;
 const R_STEPPING: u32 = 160;
 const R_CLOSURE_TARGETS: u32 = 164;
+const R_WORDS_LEN: u32 = 168;
+const R_WORDS_CAP: u32 = 172;
+const R_SEQ: u32 = 176;
+const R_SAFEPOINT_AT: u32 = 184;
+const R_CLOSURE_CLASS: u32 = 192;
+const R_ACTIVATION_CLASS: u32 = 200;
+const R_CLOSURE_META: u32 = 208;
+const R_ACTIVATION_META: u32 = 216;
+const R_ALLOCATED: u32 = 224;
 
 // The object header (newspeak/EURASIA_ARENA_DESIGN): class, sequence number,
 // meta (format 5 bits, flags 5, space 21, remembered 1, size 32); then the
@@ -1014,7 +1055,18 @@ pub fn compile(code: &[u8], arith_ok: &dyn Fn(usize) -> bool) -> Option<Compiled
                 }
             }
             Ins::Closure(after) => {
-                // The closure, by the runtime's `closure`; on after its body.
+                // The closure, made here when there is room (with the
+                // frame's activation handle, if it has none yet), else by
+                // the runtime's `closure`; on after its body.
+                let b1 = code[ip + 1];
+                f.make_closure((b1 >> 4).into(), (b1 & 15).into(), ip + 4);
+                f.op(0x04).op(0x40);
+                if after < code.len() {
+                    jump(&mut f, after, 1);
+                } else {
+                    f.interpret(after);
+                }
+                f.op(0x0b);
                 f.get(L_VM)
                     .i32c(ip as i32)
                     .get(L_SP)
@@ -1934,11 +1986,164 @@ impl Func {
             .add()
             .set(L_R)
     }
+    /// Allocates `words` words (an i32 on the stack) in the arena: their
+    /// first word's offset into `index` and address into `addr`, the length
+    /// and the sequence number and count advanced (one object).
+    fn bump(&mut self) -> &mut Func {
+        self.reg32(R_WORDS_LEN).set(L_INDEX);
+        self.reg32(R_ARENA)
+            .get(L_INDEX)
+            .i32c(3)
+            .op(0x74)
+            .add()
+            .set(L_ADDR);
+        // the words count was on the stack: add it to the length
+        self.set(L_R);
+        self.set_reg32(R_WORDS_LEN, |f| {
+            f.get(L_INDEX).get(L_R).add();
+        });
+        self.get(L_ADDR).reg64(R_SEQ).st64(8);
+        self.set_reg64(R_SEQ, |f| {
+            f.reg64(R_SEQ).i64c(1).op(0x7c);
+        });
+        self.set_reg32(R_ALLOCATED, |f| {
+            f.reg32(R_ALLOCATED).i32c(1).add();
+        })
+    }
+    /// Makes the closure of the `PUSH_CLOSURE` here (`copied` values from
+    /// the stack, `num_args` arguments, its body at `initial_ip`) in the
+    /// arena, as the VM's `compiled_closure` does, when there is room in the
+    /// arena and below the safepoint, the frame's activation handle made
+    /// first if it has none: the copied values replaced by the closure,
+    /// leaving 1; else 0, nothing done.
+    fn make_closure(&mut self, copied: u32, num_args: u32, initial_ip: usize) -> &mut Func {
+        // the top frame, in `slot`; its handle, in `meta`
+        self.reg32(R_FRAMES_LEN)
+            .i32c(1)
+            .sub()
+            .frame_addr()
+            .set(L_SLOT);
+        self.get(L_SLOT).ld64(FRAME_ACTIVATION).set(L_META);
+        // words: the closure's, and a handle's if need be
+        self.get(L_META)
+            .op(0x50)
+            .op(0x04)
+            .op(0x7f)
+            .i32c(11)
+            .op(0x05)
+            .i32c(0)
+            .op(0x0b)
+            .i32c(6 + copied as i32)
+            .add()
+            .set(L_KIND);
+        self.reg32(R_WORDS_LEN)
+            .get(L_KIND)
+            .add()
+            .reg32(R_WORDS_CAP)
+            .op(0x4d); // le_u
+        // sequence numbers: 2 with a handle, else 1, below the safepoint
+        self.reg64(R_SEQ)
+            .i64c(2)
+            .op(0x7c)
+            .reg64(R_SAFEPOINT_AT)
+            .op(0x54) // i64.lt_u: seq + 2 <u safepoint_at
+            .op(0x71);
+        // the copied values on the frame's stack
+        self.get(L_SP)
+            .i32c(copied as i32)
+            .sub()
+            .get(L_LP)
+            .op(0x4e) // ge_s
+            .op(0x71);
+        self.op(0x04).op(0x7f); // if (result i32)
+        // the frame's activation handle: frame (serial), method, receiver,
+        // closure (or nil), not detached
+        self.get(L_META).op(0x50).op(0x04).op(0x40);
+        self.i32c(11).bump();
+        self.get(L_ADDR).reg64(R_ACTIVATION_CLASS).st64(0);
+        self.get(L_ADDR).reg64(R_ACTIVATION_META).st64(META);
+        self.get(L_ADDR)
+            .get(L_SLOT)
+            .ld64(FRAME_SERIAL)
+            .i64c(1)
+            .op(0x86)
+            .st64(SLOTS);
+        self.get(L_ADDR)
+            .get(L_SLOT)
+            .ld64(FRAME_METHOD)
+            .st64(SLOTS + 8);
+        self.get(L_ADDR)
+            .get(L_SLOT)
+            .ld64(FRAME_RECEIVER)
+            .st64(SLOTS + 16);
+        self.get(L_ADDR);
+        self.get(L_SLOT).ld64(FRAME_CLOSURE).set(L_R64);
+        self.get(L_R64)
+            .op(0x50)
+            .op(0x04)
+            .op(0x7e)
+            .get(L_NIL)
+            .op(0x05)
+            .get(L_R64)
+            .op(0x0b);
+        self.st64(SLOTS + 24);
+        for k in 4..8 {
+            self.get(L_ADDR).i64c(0).st64(SLOTS + 8 * k);
+        }
+        // its reference, into the frame
+        self.get(L_INDEX)
+            .op(0xad)
+            .i64c(1)
+            .op(0x86)
+            .i64c(1)
+            .op(0x84)
+            .set(L_META);
+        self.get(L_SLOT).get(L_META).st64(FRAME_ACTIVATION);
+        self.op(0x0b);
+        // the closure: defining handle, first instruction, argument count,
+        // the copied values
+        self.i32c(6 + copied as i32).bump();
+        self.get(L_ADDR).reg64(R_CLOSURE_CLASS).st64(0);
+        self.get(L_ADDR)
+            .reg64(R_CLOSURE_META)
+            .i64c(i64::from(3 + copied) << 32)
+            .op(0x7c)
+            .st64(META);
+        self.get(L_ADDR).get(L_META).st64(SLOTS);
+        self.get(L_ADDR)
+            .i64c((initial_ip as i64) << 1)
+            .st64(SLOTS + 8);
+        self.get(L_ADDR)
+            .i64c(i64::from(num_args) << 1)
+            .st64(SLOTS + 16);
+        for k in 0..copied {
+            self.get(L_ADDR);
+            self.slot_addr(|f| {
+                f.get(L_SP).i32c((copied - k) as i32).sub();
+            });
+            self.load().st64(SLOTS + 24 + 8 * k);
+        }
+        // the copied values replaced by the closure
+        if copied > 0 {
+            self.get(L_SP).i32c(copied as i32).sub().set(L_SP);
+        }
+        self.push_addr()
+            .get(L_INDEX)
+            .op(0xad)
+            .i64c(1)
+            .op(0x86)
+            .i64c(1)
+            .op(0x84)
+            .store();
+        self.inc_sp();
+        self.i32c(1);
+        self.op(0x05).i32c(0).op(0x0b)
+    }
     /// The local return of the value in `r64`, when a compiled caller in
     /// this wasm stack takes it (the frame is deeper than the one the host
-    /// entered, which returns to the host, which must adopt the stack) and
-    /// this frame has no activation handle: the frame popped here, as the
-    /// VM's `local_return` does, and [`DONE`] returned; else on to the
+    /// entered, which returns to the host, which must adopt the stack): the
+    /// frame popped here, its activation handle (if any) marked dead, as
+    /// the VM's `local_return` does, and [`DONE`] returned; else on to the
     /// runtime's `ret`.
     fn pop_frame(&mut self) -> &mut Func {
         self.reg32(R_FRAMES_LEN)
@@ -1949,8 +2154,23 @@ impl Func {
         // deeper than the frame the host entered: a compiled caller below,
         // in this wasm stack, takes the answer
         self.reg32(R_FRAMES_LEN).reg32(R_JIT_BASE).op(0x4b); // gt_u
-        self.get(L_ADDR).ld64(FRAME_ACTIVATION).op(0x50).op(0x71); // eqz
         self.op(0x04).op(0x40);
+        // An activation handle, if any, is dead: its frame field
+        // SmallInteger -1 (no barrier: not a reference).
+        self.get(L_ADDR).ld64(FRAME_ACTIVATION).set(L_META);
+        self.get(L_META).op(0x50).op(0x45); // a handle
+        self.op(0x04).op(0x40);
+        self.reg32(R_ARENA)
+            .get(L_META)
+            .i64c(1)
+            .op(0x88)
+            .op(0xa7)
+            .i32c(3)
+            .op(0x74)
+            .add()
+            .i64c(-2)
+            .st64(ACTIVATION_FRAME);
+        self.op(0x0b);
         self.slot_addr(|f| {
             f.get(L_BP);
         });

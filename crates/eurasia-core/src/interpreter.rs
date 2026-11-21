@@ -2544,20 +2544,16 @@ impl Vm {
         if let Some(a) = self.frames[index].activation.get() {
             return a;
         }
-        let f = &self.frames[index];
+        let f = self.frames[index];
         let nil = self.nil();
-        let record = crate::object::Activation {
-            frame: Some(f.serial),
-            method: f.method,
-            receiver: f.receiver,
-            closure: f.closure.unwrap_or(nil),
-            detached: None,
-        };
         let class = self.roles.get(Role::ActivationClass);
-        let a = self.heap.allocate(
+        let a = self.heap.allocate_live_activation(
             class,
             Space::Actor(self.current as u32),
-            Body::Activation(record),
+            f.serial,
+            f.method,
+            f.receiver,
+            f.closure.unwrap_or(nil),
         );
         self.frames[index].activation = Some(a).into();
         a
@@ -4099,7 +4095,9 @@ impl Vm {
     pub fn jit_publish(&mut self) {
         /// Room for frames that compiled code pushes before it needs the VM.
         const FRAME_ROOM: usize = 64;
-        self.frames.reserve(FRAME_ROOM);
+        if self.frames.capacity() - self.frames.len() < FRAME_ROOM {
+            self.frames.reserve(FRAME_ROOM);
+        }
         let r = &mut *self.jit_regs;
         r.frames = self.frames.as_ptr() as usize as u32;
         r.frames_len = self.frames.len() as u32;
@@ -4109,6 +4107,34 @@ impl Vm {
         r.stack_cap = self.stack.capacity() as u32;
         r.jit_base = self.jit_base as u32;
         r.stepping = u32::from(self.step_limit.is_some());
+        r.words_len = self.heap.words.len() as u32;
+        r.words_cap = self.heap.words.capacity() as u32;
+        r.seq = self.heap.allocation_counter();
+        r.safepoint_at = self.safepoint_at;
+        r.allocated = 0;
+        let space = Space::Actor(self.current as u32);
+        r.closure_class = self.roles.get(Role::ClosureClass).to_bits();
+        r.activation_class = self.roles.get(Role::ActivationClass).to_bits();
+        r.closure_meta = crate::object::meta(crate::object::Code::Closure, 0, space, 0).to_bits();
+        r.activation_meta =
+            crate::object::meta(crate::object::Code::Activation, 0, space, 8).to_bits();
+    }
+
+    /// For the host: the arena, to set its length to what compiled code
+    /// left (`Regs::words_len`; it allocates past the length, within the
+    /// room the VM published), and then [`Vm::adopt_jit_allocation`].
+    pub fn arena_for_host(&mut self) -> (&mut Vec<Value>, usize) {
+        let n = self.jit_regs.words_len as usize;
+        (&mut self.heap.words, n)
+    }
+
+    /// For the host, after it set the arena's length: the sequence numbers
+    /// and objects compiled code allocated.
+    pub fn adopt_jit_allocation(&mut self) {
+        let r = &mut *self.jit_regs;
+        let (seq, allocated) = (r.seq, r.allocated as usize);
+        r.allocated = 0;
+        self.heap.adopt_allocation(seq, allocated);
     }
 
     /// For the host: the frame count compiled code left (see

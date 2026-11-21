@@ -622,6 +622,14 @@ impl Heap {
         self.next_seq
     }
 
+    /// After compiled code allocated `allocated` objects itself (in the
+    /// arena, whose length the host adopted), taking sequence numbers up to
+    /// `next_seq`.
+    pub(crate) fn adopt_allocation(&mut self, next_seq: u64, allocated: usize) {
+        self.next_seq = next_seq;
+        self.count += allocated;
+    }
+
     /// The arena's size in words (for statistics).
     pub fn words(&self) -> usize {
         self.words.len()
@@ -856,6 +864,23 @@ impl Heap {
     pub fn allocate_array(&mut self, class: Value, space: Space, elements: &[Value]) -> Value {
         self.allocate_filled(class, space, Code::Array, elements.len(), |w| {
             w.extend_from_slice(elements)
+        })
+    }
+
+    /// Allocates the activation handle of a live frame (serial `frame`),
+    /// not detached, without building its description first.
+    pub fn allocate_live_activation(
+        &mut self,
+        class: Value,
+        space: Space,
+        frame: u64,
+        method: Value,
+        receiver: Value,
+        closure: Value,
+    ) -> Value {
+        let z = small(0);
+        self.allocate_filled(class, space, Code::Activation, 8, |w| {
+            w.extend_from_slice(&[small(frame as i64), method, receiver, closure, z, z, z, z])
         })
     }
 
