@@ -37,6 +37,7 @@
     const result = await run(wasm, snapshot, {
       print: (line) => output.append(line + '\n'),
       jit: Number(params.get('jit') ?? 0),
+      names: params.has('names'),
     });
     status.textContent = result.status === 'exited' ? `exited ${result.code}` : 'idle (callbacks from the page still run)';
   } catch (e) {

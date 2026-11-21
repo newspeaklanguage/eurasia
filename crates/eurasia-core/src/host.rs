@@ -108,6 +108,17 @@ pub trait Host {
         let _ = nanos;
     }
 
+    /// Runs compiled function `code` from entry block `block` for `vm` (the
+    /// top frame at that entry, its registers set), as the host does for
+    /// [`crate::Completion::Compiled`], and answers its status for
+    /// [`crate::Vm::continue_after_compiled`]'s handling; `None` where the
+    /// host runs no compiled code (the default), and the VM interprets.
+    /// The VM uses it to run compiled code inside a callback.
+    fn run_compiled(&mut self, vm: &mut crate::Vm, code: u32, block: u32) -> Option<i32> {
+        let _ = (vm, code, block);
+        None
+    }
+
     /// Whether [`Host::wait_until`] may block. A host that cannot (the
     /// browser's, whose event loop must keep running) answers false: the VM
     /// then returns [`crate::Completion::Waiting`] instead of waiting.

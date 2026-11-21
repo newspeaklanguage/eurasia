@@ -117,7 +117,7 @@ function hostObjects(bytesAt, decoder, encoder, link) {
 //
 // `args` are the program's arguments (strings; none by default, as in
 // psoup's web host), for a fresh start.
-export async function run(wasm, snapshot, { print = console.log, record, keep = 0, jit = 0, gcStress = 0, args = [], onStart, onSaveImage } = {}) {
+export async function run(wasm, snapshot, { print = console.log, record, keep = 0, jit = 0, names = false, gcStress = 0, args = [], onStart, onSaveImage } = {}) {
   let memory = null;
   const link = { exports: null, depth: 0, afterIdleCallback: () => {} };
   const decoder = new TextDecoder();
@@ -184,6 +184,8 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
   bytesAt(buffer, snapshot.length).set(snapshot);
   if (record !== undefined) vm.eurasia_record(record, keep);
   else if (jit > 0) vm.eurasia_jit(jit);
+  // Compiled methods named in profiles (Mixin>>selector).
+  if (names) vm.eurasia_jit_names(1);
   if (gcStress > 0) vm.eurasia_gc_stress(gcStress);
   for (const a of args) {
     const bytes = encoder.encode(a);

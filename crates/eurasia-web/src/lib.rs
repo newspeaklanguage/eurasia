@@ -91,6 +91,8 @@ struct State {
     record_keep: u32,
     /// Activations of a method before it is compiled (0: never).
     jit: u32,
+    /// Whether compiled modules name their functions (for profiles).
+    jit_names: bool,
     /// Collect at the first safepoint after every this many allocations
     /// (the native host's `EURASIA_GC_STRESS`; 0: as usual).
     gc_stress: u32,
@@ -212,6 +214,13 @@ pub extern "C" fn eurasia_jit(threshold: u32) {
     STATE.with_borrow_mut(|s| s.jit = threshold);
 }
 
+/// Names compiled methods' functions in their modules (for profiles),
+/// before [`eurasia_start`].
+#[unsafe(no_mangle)]
+pub extern "C" fn eurasia_jit_names(on: u32) {
+    STATE.with_borrow_mut(|s| s.jit_names = on != 0);
+}
+
 /// Collects at the first safepoint after every `interval` allocations (0:
 /// as usual), before [`eurasia_start`]: the stress test, with compiled code
 /// too.
@@ -228,6 +237,7 @@ fn trampoline(
     mut outcome: Result<Completion, VmError>,
 ) -> Result<Completion, VmError> {
     while let Ok(Completion::Compiled(code, block)) = outcome {
+        vm.jit_publish_constants();
         vm.jit_publish();
         let regs = vm.jit_regs();
         let status = call_compiled(code, regs, block, vm);
@@ -440,6 +450,7 @@ pub extern "C" fn eurasia_start() -> i32 {
                 let mut vm = Vm::restore(heap, roles, state);
                 vm.set_snapshot_writer(write_image);
                 vm.set_jit_threshold(s.jit);
+                vm.set_jit_names(s.jit_names);
                 vm.set_gc_stress((s.gc_stress > 0).then_some(u64::from(s.gc_stress)));
                 vm.restored_into_new_host();
                 let outcome = vm.continue_run(&mut WebHost);
@@ -473,6 +484,7 @@ pub extern "C" fn eurasia_start() -> i32 {
                     }
                     None => {
                         vm.set_jit_threshold(s.jit);
+                        vm.set_jit_names(s.jit_names);
                         let outcome = vm.run(&mut WebHost, &args);
                         trampoline(&mut vm, outcome)
                     }
@@ -530,6 +542,17 @@ fn fail(s: &mut State, message: &str) -> i32 {
 struct WebHost;
 
 impl Host for WebHost {
+    fn run_compiled(&mut self, vm: &mut Vm, code: u32, block: u32) -> Option<i32> {
+        // As the trampoline does.
+        vm.jit_publish_constants();
+        vm.jit_publish();
+        let regs = vm.jit_regs();
+        let status = call_compiled(code, regs, block, vm);
+        adopt_frames(vm);
+        adopt_arena(vm);
+        Some(status)
+    }
+
     fn print(&mut self, text: &str) {
         imports::print(text.as_bytes());
     }

@@ -173,6 +173,7 @@ body { margin: 0; background: #fff; }
       record,
       keep,
       jit,
+      names: params.has('names'),
       onStart: (c) => { controls = c; },
       onSaveImage: (name, bytes) => {
         storeImage(name, bytes).catch((e) => {

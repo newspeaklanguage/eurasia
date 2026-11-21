@@ -299,9 +299,12 @@ struct Target {
     slot: Option<usize>,
 }
 
-/// An entry of the lookup cache: a send's key and what it runs. Only sends
-/// that find a method are cached; a #doesNotUnderstand: takes the full
-/// lookup every time.
+/// An entry of the lookup cache: a send's key and what it runs. An
+/// ordinary send that finds no method is cached too (`dnu`): its target is
+/// the #doesNotUnderstand: method the receiver's class answers, which the
+/// send runs with the message, unless `alien` says what that method would
+/// do. (Every change to the program flushes the cache, so a method added
+/// later is found.)
 #[derive(Clone, Copy, Debug)]
 struct CacheEntry {
     class: Value,
@@ -309,6 +312,21 @@ struct CacheEntry {
     mixin: Value,
     rule: Rule,
     target: Target,
+    dnu: bool,
+    alien: AlienSend,
+}
+
+/// What `Alien>>doesNotUnderstand:` (the kernel's) does with a message,
+/// decided once per selector for a send the lookup cache holds: the host
+/// call `perform: name withArguments: arguments` (`Call`: the name, the
+/// selector's first keyword; the target, the `perform:withArguments:`
+/// method), or `false` (`isKindOf…`, no arguments). `None`: the method
+/// itself runs (`isDead`, `new`, any other class).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AlienSend {
+    None,
+    Call(Value),
+    False,
 }
 
 /// A compiled method that compiled code's inline caches enter directly
@@ -433,6 +451,9 @@ pub struct Vm {
     expats: Vec<(Value, u32)>,
     /// Callbacks now running, nested.
     callback_depth: usize,
+    /// Whether the innermost callback runs with no turn under it (see
+    /// [`Vm::run_callback_frames`]).
+    callback_idle: bool,
     /// Commits so far (`vm programVersion`).
     program_version: u64,
     /// The checkpoint policy (`vm checkpointPolicy:`): a checkpoint at the
@@ -462,6 +483,8 @@ pub struct Vm {
     lookup_cache: Vec<Option<CacheEntry>>,
     /// Activations of a method before it is compiled; 0: never.
     jit_threshold: i64,
+    /// See [`Vm::set_jit_names`].
+    jit_names: bool,
     /// What compiled code stopped the run with ([`crate::compiler::STOP`]).
     jit_stop: Option<Result<Option<Completion>, VmError>>,
     /// The frame count when the host last entered compiled code: compiled
@@ -550,6 +573,7 @@ impl Vm {
             current: 0,
             expats: Vec::new(),
             callback_depth: 0,
+            callback_idle: false,
             program_version: 0,
             checkpoint_every: 0,
             last_checkpoint: 0,
@@ -560,6 +584,7 @@ impl Vm {
             incarnation_pending: false,
             lookup_cache: alloc::vec![None; LOOKUP_CACHE_SIZE],
             jit_threshold: 0,
+            jit_names: false,
             jit_stop: None,
             jit_base: 0,
             jit_regs: alloc::boxed::Box::new(crate::compiler::Regs {
@@ -1290,8 +1315,7 @@ impl Vm {
                 }
             }
             // The top frame at an entry of a compiled method: the host runs
-            // it. (Only at the top level: a callback's loop runs
-            // interpreted.)
+            // it. (A callback's loop runs it itself: run_callback_frames.)
             if self.jit_threshold > 0
                 && self.callback_depth == 0
                 && let Some((code, block)) = self.compiled_entry()
@@ -1480,6 +1504,26 @@ impl Vm {
                     && e.mixin == mixin
                     && e.rule == rule =>
             {
+                if e.dnu {
+                    return match e.alien {
+                        AlienSend::None => self.send_does_not_understand(
+                            e.target.method,
+                            selector,
+                            n,
+                            receiver,
+                            true,
+                            host,
+                        ),
+                        AlienSend::False => {
+                            let len = self.stack.len();
+                            self.stack[len - 1] = self.roles.get(Role::False);
+                            Ok(None)
+                        }
+                        AlienSend::Call(name) => {
+                            self.alien_call(e.target.method, e.target.header, name, n, host)
+                        }
+                    };
+                }
                 e.target
             }
             _ => match self.resolve(rule, selector, receiver, class, mixin)? {
@@ -1490,10 +1534,36 @@ impl Vm {
                         mixin,
                         rule,
                         target,
+                        dnu: false,
+                        alien: AlienSend::None,
                     });
                     target
                 }
-                // Not found: the full lookup, which sends #doesNotUnderstand:.
+                // Not found: an ordinary send's #doesNotUnderstand:, cached;
+                // the others' by the full lookup.
+                None if rule == Rule::Ordinary => {
+                    let (alien, method) = match self.alien_send(class, selector, n)? {
+                        Some(found) => found,
+                        None => (AlienSend::None, self.does_not_understand_method(class)?),
+                    };
+                    let header = self.method_header(method)?;
+                    self.lookup_cache[i] = Some(CacheEntry {
+                        class,
+                        selector,
+                        mixin,
+                        rule,
+                        target: Target {
+                            method,
+                            header,
+                            receiver: TargetReceiver::Present,
+                            slot: None,
+                        },
+                        dnu: true,
+                        alien,
+                    });
+                    // Now a hit.
+                    return self.send(rule, selector, n, receiver, mixin, host);
+                }
                 None => return self.uncached_send(rule, selector, n, receiver, mixin, host),
             },
         };
@@ -1847,18 +1917,101 @@ impl Vm {
         present_receiver: bool,
         host: &mut dyn Host,
     ) -> Result<Option<Completion>, VmError> {
+        let method = self.does_not_understand_method(lookup_class)?;
+        self.send_does_not_understand(method, selector, n, receiver, present_receiver, host)
+    }
+
+    /// For a not-understood ordinary send of `selector` with `n` arguments to
+    /// an instance of `class`: when `class` is the Alien class, what its
+    /// #doesNotUnderstand: would do (see [`AlienSend`]), with the
+    /// `perform:withArguments:` method it would send (a call's target);
+    /// `None` where the method itself must run.
+    fn alien_send(
+        &mut self,
+        class: Value,
+        selector: Value,
+        n: usize,
+    ) -> Result<Option<(AlienSend, Value)>, VmError> {
+        let alien_class = self.roles.get(Role::AlienClass);
+        if class != alien_class || alien_class == self.nil() {
+            return Ok(None);
+        }
+        let Some(perform) = self.lookup_ordinary(class, b"perform:withArguments:")? else {
+            return Ok(None);
+        };
+        let sel = self.selector_bytes(selector)?;
+        if n == 0 && sel.starts_with(b"isKindOf") {
+            return Ok(Some((AlienSend::False, perform)));
+        }
+        if n == 0 && sel == b"isDead" {
+            return Ok(None);
+        }
+        let first = match sel.iter().position(|&b| b == b':') {
+            None => &sel[..],
+            Some(k) => &sel[..k],
+        };
+        if first == b"new" {
+            return Ok(None);
+        }
+        let name = if first.len() == sel.len() {
+            selector
+        } else {
+            let first = String::from(
+                core::str::from_utf8(first)
+                    .map_err(|_| VmError::Malformed("a selector must be UTF-8"))?,
+            );
+            self.new_string(&first)
+        };
+        Ok(Some((AlienSend::Call(name), perform)))
+    }
+
+    /// An alien send as `Alien>>doesNotUnderstand:` makes it: `perform:
+    /// name withArguments:` (the method `perform`, its header `header`) the
+    /// `n` arguments on the stack, in an Array, to the receiver below them.
+    fn alien_call(
+        &mut self,
+        perform: Value,
+        header: MethodHeader,
+        name: Value,
+        n: usize,
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
+        let args = self.stack.split_off(self.stack.len() - n);
+        let array_class = self.roles.get(Role::ArrayClass);
+        let arguments =
+            self.heap
+                .allocate_array(array_class, Space::Actor(self.current as u32), &args);
+        self.stack.push(name);
+        self.stack.push(arguments);
+        self.activate_with(perform, header, 2, host, None)
+    }
+
+    /// The #doesNotUnderstand: method found from `lookup_class` up.
+    fn does_not_understand_method(&self, lookup_class: Value) -> Result<Value, VmError> {
         let dnu_selector = self.roles.get(Role::DoesNotUnderstandSelector);
         let dnu = self.selector_bytes(dnu_selector)?;
         let mut class = Some(lookup_class);
-        let mut method = None;
         while let Some(c) = class {
             if let Some(m) = self.method_at(c, &dnu)? {
-                method = Some(m);
-                break;
+                return Ok(m);
             }
             class = self.superclass(c)?;
         }
-        let method = method.ok_or_else(|| VmError::RecursiveDoesNotUnderstand)?;
+        Err(VmError::RecursiveDoesNotUnderstand)
+    }
+
+    /// Sends #doesNotUnderstand: (`method`) with a message of `selector` and
+    /// the `n` arguments on the stack to `receiver` (on the stack below them
+    /// if `present_receiver`).
+    fn send_does_not_understand(
+        &mut self,
+        method: Value,
+        selector: Value,
+        n: usize,
+        receiver: Value,
+        present_receiver: bool,
+        host: &mut dyn Host,
+    ) -> Result<Option<Completion>, VmError> {
         let args = self.stack.split_off(self.stack.len() - n);
         let array_class = self.roles.get(Role::ArrayClass);
         let arguments = self.heap.allocate(
@@ -3650,14 +3803,15 @@ impl Vm {
         if self.activate(method, 1, host)?.is_some() {
             return Err(VmError::Malformed("a callback exited"));
         }
-        while self.frames.len() > base {
-            if self.gc_due() {
-                self.scheduled_collection();
-            }
-            if let Step::Done(_) = self.step(host)? {
-                return Err(VmError::Malformed("a callback exited"));
-            }
-        }
+        // A callback with no turn under it (an event from the page while
+        // the VM is idle) runs as a turn does: the fast loop, compiled code
+        // where the host runs it. One inside a turn steps, so as never to
+        // run past its own frames.
+        let idle = base == 0 && self.step_limit.is_none();
+        let was_idle = core::mem::replace(&mut self.callback_idle, idle);
+        let ran = self.run_callback_frames(base, idle, host);
+        self.callback_idle = was_idle;
+        ran?;
         let answer = self
             .stack
             .pop()
@@ -3669,6 +3823,71 @@ impl Vm {
             .map(<[Value]>::to_vec)
             .ok_or_else(|| VmError::Malformed("the callback boundary answered no pair"))?;
         Ok((pair[0] == self.roles.get(Role::True), pair[1]))
+    }
+
+    /// Runs the frames above `base` (a callback's) to their end: by `step`,
+    /// or (`idle`: no frame under them) as the event loop runs a turn.
+    fn run_callback_frames(
+        &mut self,
+        base: usize,
+        idle: bool,
+        host: &mut dyn Host,
+    ) -> Result<(), VmError> {
+        while self.frames.len() > base {
+            if !idle {
+                if self.gc_due() {
+                    self.scheduled_collection();
+                }
+                if let Step::Done(_) = self.step(host)? {
+                    return Err(VmError::Malformed("a callback exited"));
+                }
+                continue;
+            }
+            // The event loop's checks (no checkpoint inside a callback).
+            if self.heap.allocation_counter() >= self.safepoint_at {
+                if self.gc_due() {
+                    self.scheduled_collection();
+                }
+                self.safepoint_at = self.next_safepoint();
+            }
+            self.interrupt_countdown -= 1;
+            if self.interrupt_countdown == 0 {
+                self.interrupt_countdown = INTERRUPT_INTERVAL;
+                if host.interrupted() {
+                    return Err(VmError::Interrupted);
+                }
+            }
+            if self.may_enter_compiled()
+                && let Some((code, block)) = self.compiled_entry()
+            {
+                self.jit_base = self.frames.len();
+                self.fill_jit_regs();
+                if let Some(status) = host.run_compiled(self, code, block) {
+                    if status == crate::compiler::STOP {
+                        match self.jit_stop.take() {
+                            Some(Err(e)) => return Err(e),
+                            Some(Ok(Some(_))) => {
+                                return Err(VmError::Malformed("a callback exited"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+            }
+            if let Step::Done(_) = self.run_simple(host)? {
+                return Err(VmError::Malformed("a callback exited"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the loop running now may enter compiled code: compilation on,
+    /// and the event loop's turn or an idle callback (see
+    /// [`Vm::run_callback_frames`]).
+    #[inline]
+    fn may_enter_compiled(&self) -> bool {
+        self.jit_threshold > 0 && (self.callback_depth == 0 || self.callback_idle)
     }
 
     /// Sends `selector` (a role) to the current frame's activation with
@@ -4008,6 +4227,12 @@ impl Vm {
         self.jit_threshold = i64::from(threshold);
     }
 
+    /// Whether compiled modules name their function after their method
+    /// (`Mixin>>selector`), for profiles; off by default.
+    pub fn set_jit_names(&mut self, names: bool) {
+        self.jit_names = names;
+    }
+
     /// Counts an activation of `method`, and compiles it at the threshold.
     fn tier_up(&mut self, method: Value, host: &mut dyn Host) {
         let Some(word) = self.heap.method_jit(method) else {
@@ -4030,10 +4255,34 @@ impl Vm {
             .map(|k| self.small_integer_native_is(k))
             .collect();
         let compiled = crate::compiler::compile(&code, &|k| ok.get(k) == Some(&true));
+        let compiled = compiled.map(|mut c| {
+            if self.jit_names {
+                let name = self.method_name(method);
+                crate::compiler::add_name(&mut c.module, &name);
+            }
+            c
+        });
         match compiled.and_then(|c| host.install_code(&c.module).map(|i| (i, c.entries))) {
             Some((i, entries)) => self.heap.set_method_compiled(method, i, entries.into()),
             None => self.heap.set_method_jit(method, crate::object::JIT_NEVER),
         }
+    }
+
+    /// `Mixin>>selector`, for a compiled method's name in profiles.
+    fn method_name(&self, method: Value) -> String {
+        let text = |v: Value| {
+            self.heap.string_bytes(v).map_or(String::from("?"), |b| {
+                String::from_utf8_lossy(b).into_owned()
+            })
+        };
+        let Some(m) = self.heap.method(method) else {
+            return String::from("?");
+        };
+        let mixin = self
+            .heap
+            .mixin(m.mixin())
+            .map_or(String::from("?"), |x| text(x.name()));
+        alloc::format!("{mixin}>>{}", text(m.selector()))
     }
 
     /// Counts a closure activation (the top frame) against its method.
@@ -4112,11 +4361,24 @@ impl Vm {
         r.seq = self.heap.allocation_counter();
         r.safepoint_at = self.safepoint_at;
         r.allocated = 0;
-        r.space = (self.current as u64) << 10;
-        r.float_class = self.roles.get(Role::FloatClass).to_bits();
+    }
+
+    /// For the host, before it enters compiled code (not after each call
+    /// from it): what changes only at a collection, after which compiled
+    /// code does not go on, or between turns (the actor): the classes and
+    /// meta words compiled code allocates with, and the actor's space.
+    pub fn jit_publish_constants(&mut self) {
         let space = Space::Actor(self.current as u32);
-        r.closure_class = self.roles.get(Role::ClosureClass).to_bits();
-        r.activation_class = self.roles.get(Role::ActivationClass).to_bits();
+        let (float, closure, activation) = (
+            self.roles.get(Role::FloatClass),
+            self.roles.get(Role::ClosureClass),
+            self.roles.get(Role::ActivationClass),
+        );
+        let r = &mut *self.jit_regs;
+        r.space = (self.current as u64) << 10;
+        r.float_class = float.to_bits();
+        r.closure_class = closure.to_bits();
+        r.activation_class = activation.to_bits();
         r.closure_meta = crate::object::meta(crate::object::Code::Closure, 0, space, 0).to_bits();
         r.activation_meta =
             crate::object::meta(crate::object::Code::Activation, 0, space, 8).to_bits();
@@ -4327,7 +4589,12 @@ impl Vm {
         };
         let class = self.class_of(key);
         let e = self.lookup_cache[cache_index(class, selector, key_mixin, rule)]?;
-        if e.class != class || e.selector != selector || e.mixin != key_mixin || e.rule != rule {
+        if e.class != class
+            || e.selector != selector
+            || e.mixin != key_mixin
+            || e.rule != rule
+            || e.dnu
+        {
             return None;
         }
         Some((e, key, receiver))
@@ -4658,32 +4925,11 @@ impl Vm {
     }
 
     /// For compiled code: a send whose inline cache holds `target`
-    /// ([`Vm::direct_call`]; with [`CLOSURE_TARGET`](crate::compiler::CLOSURE_TARGET),
-    /// a closure target; a native's, [`Vm::native_target`]) from the top
+    /// ([`Vm::direct_call`]; a native's, [`Vm::native_target`]) from the top
     /// frame's instruction, which continues at `next`. Where the callee
     /// cannot be entered now, [`MISS`](crate::compiler::MISS): the site
     /// makes the general send.
     pub fn compiled_call(&mut self, host: &mut dyn Host, target: usize, next: usize) -> i32 {
-        let closure = crate::compiler::CLOSURE_TARGET as usize;
-        if target & closure != 0 {
-            // A closure target: the closure's frame pushed, if it can be.
-            let Some(t) = self.jit_closure_targets.get(target & !closure) else {
-                return crate::compiler::MISS;
-            };
-            let native = match t.args {
-                0 => Native::ClosureValue,
-                1 => Native::ClosureValue1,
-                2 => Native::ClosureValue2,
-                _ => Native::ClosureValue3,
-            } as u32;
-            let n = t.args as usize;
-            if self.may_enter_callee()
-                && let Some(status) = self.direct_closure(native, n, next)
-            {
-                return status;
-            }
-            return crate::compiler::MISS;
-        }
         let Some(&t) = self.jit_targets.get(target) else {
             return crate::compiler::MISS;
         };
@@ -5381,6 +5627,7 @@ impl Vm {
                             || e.selector != selector
                             || e.mixin != key_mixin
                             || e.rule != rule
+                            || e.dnu
                         {
                             break Exit::Step;
                         }
@@ -5467,9 +5714,7 @@ impl Vm {
             if self.frames.is_empty()
                 || self.heap.allocation_counter() >= self.safepoint_at
                 || self.interrupt_countdown == 1
-                || (self.jit_threshold > 0
-                    && self.callback_depth == 0
-                    && self.compiled_entry().is_some())
+                || (self.may_enter_compiled() && self.compiled_entry().is_some())
             {
                 return Ok(Step::Continue);
             }

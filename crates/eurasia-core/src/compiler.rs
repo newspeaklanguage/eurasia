@@ -404,9 +404,6 @@ pub const IC_LE: u32 = 18;
 pub const IC_GE: u32 = 19;
 /// The largest Array `new:` makes in compiled code.
 const MAX_INLINE_ARRAY: i64 = 1 << 16;
-/// The bit of a `call` target that makes it a closure target (of the
-/// index in the low bits) rather than a method's.
-pub const CLOSURE_TARGET: u32 = 1 << 31;
 /// The format code of an Array.
 const CODE_ARRAY: i64 = 3;
 
@@ -2394,7 +2391,9 @@ impl Func {
             }
             if ordinary && args <= 3 {
                 // A closure's `value`: its frame pushed here when the closure
-                // has the cached body and there is room, else by `call`.
+                // has the body of either entry's target and there is room,
+                // else the general send (which fills the cache with this
+                // body's target).
                 self.get(L_KIND).i32c(IC_CLOSURE as i32).op(0x46);
                 self.op(0x04).op(0x40);
                 self.push_closure_ok(args);
@@ -2402,31 +2401,29 @@ impl Func {
                 self.push_closure_frame(args, next);
                 self.op(0x0c).uleb(2); // br: after the call
                 self.op(0x0b);
-                self.get(L_VM)
-                    .get(L_SLOT)
-                    .i32c(CLOSURE_TARGET as i32)
-                    .op(0x72)
-                    .i32c(next as i32)
-                    .get(L_SP)
-                    .call(F_CALL)
-                    .set(L_R);
-                self.get(L_R).i32c(MISS).op(0x47).op(0x0d).uleb(1);
+                // the second entry's target, if it is one
+                let e = g + ENTRY_GLOBALS;
+                self.gget(e + 3).i32c(IC_CLOSURE as i32).op(0x46);
+                self.reg32(R_EPOCH).gget(e + 1).op(0x46).op(0x71);
+                self.op(0x04).op(0x40);
+                self.gget(e + 2).set(L_SLOT);
+                self.push_closure_ok(args);
+                self.op(0x04).op(0x40);
+                self.push_closure_frame(args, next);
+                self.op(0x0c).uleb(3); // br: after the call
+                self.op(0x0b);
+                self.op(0x0b);
+                self.i32c(0).set(L_KIND);
                 self.op(0x0b);
             }
             // A compiled method: its frame pushed here when there is room
             // and nothing else to do, else by `call`.
             self.get(L_KIND).i32c(IC_METHOD as i32).op(0x46);
             self.op(0x04).op(0x40);
-            self.get(L_SLOT)
-                .i32c(CLOSURE_TARGET as i32)
-                .op(0x71)
-                .op(0x45); // a method
-            self.op(0x04).op(0x40);
             self.push_frame_ok();
             self.op(0x04).op(0x40);
             self.push_frame(args, ordinary, next);
-            self.op(0x0c).uleb(3); // br: after the call
-            self.op(0x0b);
+            self.op(0x0c).uleb(2); // br: after the call
             self.op(0x0b);
             self.get(L_VM)
                 .get(L_SLOT)
@@ -2532,11 +2529,14 @@ impl Func {
             // Fill the cache from what the send found, before a
             // callee runs (its sends change the registers).
             // The first entry if it is empty, stale or of this
-            // class, else the second.
+            // class and slot, else the second (a closure send's second
+            // body, of the same class, goes there).
             self.reg32(R_IC_KIND).op(0x04).op(0x40);
             self.gget(g + 3).op(0x45); // kind == 0
             self.gget(g + 1).reg32(R_EPOCH).op(0x47).op(0x72); // | epoch != cached
-            self.gget(g).reg64(R_IC_CLASS).op(0x51).op(0x72); // | class == cached
+            self.gget(g).reg64(R_IC_CLASS).op(0x51); // | class == cached
+            self.gget(g + 2).reg32(R_IC_SLOT).op(0x46).op(0x71); // & slot == cached
+            self.op(0x72);
             self.op(0x04).op(0x40);
             self.fill_entry(g);
             self.op(0x05);
@@ -2618,6 +2618,21 @@ fn uleb(out: &mut Vec<u8>, mut v: u32) {
 fn name(out: &mut Vec<u8>, s: &str) {
     uleb(out, s.len() as u32);
     out.extend_from_slice(s.as_bytes());
+}
+
+/// Names a compiled module's function `name` (a custom `name` section),
+/// for profilers and debuggers; the code does not change.
+pub fn add_name(module: &mut Vec<u8>, function_name: &str) {
+    let mut names = Vec::new();
+    uleb(&mut names, 1);
+    uleb(&mut names, IMPORTED);
+    name(&mut names, function_name);
+    let mut content = Vec::new();
+    name(&mut content, "name");
+    content.push(1); // function names
+    uleb(&mut content, names.len() as u32);
+    content.extend_from_slice(&names);
+    section(module, 0, &content);
 }
 
 fn section(out: &mut Vec<u8>, id: u8, content: &[u8]) {
