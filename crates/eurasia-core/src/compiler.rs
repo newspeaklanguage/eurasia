@@ -171,6 +171,10 @@ pub struct Regs {
     pub activation_meta: u64,
     /// The objects compiled code allocated since the VM last published.
     pub allocated: u32,
+    /// The current actor's space, in a meta word's bits.
+    pub space: u64,
+    /// The Float class.
+    pub float_class: u64,
 }
 
 const _: () = {
@@ -196,6 +200,8 @@ const _: () = {
     assert!(offset_of!(Regs, closure_meta) == R_CLOSURE_META as usize);
     assert!(offset_of!(Regs, activation_meta) == R_ACTIVATION_META as usize);
     assert!(offset_of!(Regs, allocated) == R_ALLOCATED as usize);
+    assert!(offset_of!(Regs, space) == R_SPACE as usize);
+    assert!(offset_of!(Regs, float_class) == R_FLOAT_CLASS as usize);
 };
 
 /// A frame's layout on wasm32 (the interpreter's `Frame`, checked there):
@@ -324,6 +330,8 @@ const R_ACTIVATION_CLASS: u32 = 200;
 const R_CLOSURE_META: u32 = 208;
 const R_ACTIVATION_META: u32 = 216;
 const R_ALLOCATED: u32 = 224;
+const R_SPACE: u32 = 232;
+const R_FLOAT_CLASS: u32 = 240;
 
 // The object header (newspeak/EURASIA_ARENA_DESIGN): class, sequence number,
 // meta (format 5 bits, flags 5, space 21, remembered 1, size 32); then the
@@ -377,6 +385,25 @@ pub const IC_CLOSURE: u32 = 13;
 /// The function of a method target that is a native's: `call` runs it;
 /// compiled code pushes no frame for it.
 pub const NATIVE_FUNCTION: u32 = u32::MAX;
+/// An inline cache of `basicNew` making a Regular object: the slot is its
+/// slot count, the object its meta word but for the space; made in
+/// compiled code.
+pub const IC_BASIC_NEW: u32 = 14;
+/// An inline cache of `new:` sent to the Array class: the object is an
+/// Array's meta word but for the space and size; made in compiled code.
+pub const IC_NEW_ARRAY: u32 = 15;
+/// Inline caches of the comparisons `<`, `>`, `<=` and `>=` of numbers
+/// (`Number`'s natives), run in compiled code when receiver and argument
+/// are SmallIntegers or Floats.
+pub const IC_LT: u32 = 16;
+/// See [`IC_LT`].
+pub const IC_GT: u32 = 17;
+/// See [`IC_LT`].
+pub const IC_LE: u32 = 18;
+/// See [`IC_LT`].
+pub const IC_GE: u32 = 19;
+/// The largest Array `new:` makes in compiled code.
+const MAX_INLINE_ARRAY: i64 = 1 << 16;
 /// The bit of a `call` target that makes it a closure target (of the
 /// index in the low bits) rather than a method's.
 pub const CLOSURE_TARGET: u32 = 1 << 31;
@@ -1550,7 +1577,36 @@ impl Func {
             f.get(L_SP).i32c(1).sub();
         });
         self.load().set(L_B);
-        if kind == IC_IDENTICAL {
+        if (IC_LT..=IC_GE).contains(&kind) {
+            // Both numbers this native compares here: else out.
+            self.is_number(L_A).is_number(L_B).op(0x71).op(0x45);
+            self.op(0x04).op(0x40).op(0x0c).uleb(1).op(0x0b);
+            // Two SmallIntegers exactly (tagged, the order kept); else as
+            // f64s, as the native does.
+            self.get(L_A).get(L_B).op(0x84).i64c(1).op(0x83).op(0x50);
+            self.op(0x04).op(0x7f);
+            self.get(L_A).get(L_B).op(match kind {
+                IC_LT => 0x53,
+                IC_GT => 0x55,
+                IC_LE => 0x57,
+                _ => 0x59,
+            });
+            self.op(0x05);
+            self.as_f64(L_A).as_f64(L_B);
+            self.op(match kind {
+                IC_LT => 0x63,
+                IC_GT => 0x64,
+                IC_LE => 0x65,
+                _ => 0x66,
+            });
+            self.op(0x0b);
+            self.op(0x04)
+                .op(0x7e)
+                .get(L_TRUE)
+                .op(0x05)
+                .get(L_FALSE)
+                .op(0x0b);
+        } else if kind == IC_IDENTICAL {
             self.get(L_A).get(L_B).op(0x51); // i64.eq
             self.op(0x04)
                 .op(0x7e)
@@ -1577,6 +1633,41 @@ impl Func {
             f.get(L_SP).i32c(1).sub();
         });
         self.get(L_R64).store()
+    }
+    /// Whether the Value in local `x` is a SmallInteger or a Float (an i32).
+    fn is_number(&mut self, x: u32) -> &mut Func {
+        self.get(x).i64c(1).op(0x83).op(0x50); // i64.eqz: a SmallInteger
+        self.op(0x04).op(0x7f).i32c(1).op(0x05);
+        self.reg32(R_ARENA)
+            .get(x)
+            .i64c(1)
+            .op(0x88)
+            .op(0xa7)
+            .i32c(3)
+            .op(0x74)
+            .add()
+            .ld64(0)
+            .reg64(R_FLOAT_CLASS)
+            .op(0x51);
+        self.op(0x0b)
+    }
+    /// The number in local `x` (after [`Func::is_number`]) as an f64.
+    fn as_f64(&mut self, x: u32) -> &mut Func {
+        self.get(x).i64c(1).op(0x83).op(0x50);
+        self.op(0x04).op(0x7c); // if (result f64)
+        self.get(x).i64c(1).op(0x87).op(0xb9); // shr_s, f64.convert_i64_s
+        self.op(0x05);
+        self.reg32(R_ARENA)
+            .get(x)
+            .i64c(1)
+            .op(0x88)
+            .op(0xa7)
+            .i32c(3)
+            .op(0x74)
+            .add()
+            .ld64(SLOTS)
+            .op(0xbf); // f64.reinterpret_i64
+        self.op(0x0b)
     }
     /// The hit entry's accessor, read or written (after [`Func::accessor_ok`]).
     fn accessor(&mut self, ordinary: bool, setter: bool) -> &mut Func {
@@ -2010,6 +2101,88 @@ impl Func {
             f.reg32(R_ALLOCATED).i32c(1).add();
         })
     }
+    /// The `basicNew` (no arguments) or Array `new:` (one) of the hit entry
+    /// (after [`Func::site_hit`]: the class in `a`, the slot count in
+    /// `slot`, the meta word but for the space and size in `object`), made
+    /// here as the native makes it, when there is room in the arena and
+    /// below the safepoint (and for `new:`, a SmallInteger size from 0 to
+    /// [`MAX_INLINE_ARRAY`]): the object replaces the receiver and the
+    /// argument (ordinary) or the argument (else), or is pushed; then `br`
+    /// to the send's end. Otherwise nothing.
+    fn make_new(&mut self, args: u32, ordinary: bool) -> &mut Func {
+        if args == 1 {
+            // the size, in `slot`
+            self.slot_addr(|f| {
+                f.get(L_SP).i32c(1).sub();
+            });
+            self.load().set(L_B);
+            self.get(L_B).i64c(1).op(0x83).op(0x50); // a SmallInteger
+            self.get(L_B).i64c(0).op(0x59).op(0x71); // ge_s 0
+            self.get(L_B).i64c(MAX_INLINE_ARRAY << 1).op(0x57).op(0x71); // le_s
+            self.get(L_B).i64c(1).op(0x87).op(0xa7).set(L_SLOT);
+        } else {
+            self.i32c(1);
+        }
+        self.reg32(R_WORDS_LEN)
+            .get(L_SLOT)
+            .add()
+            .i32c(3)
+            .add()
+            .reg32(R_WORDS_CAP)
+            .op(0x4d)
+            .op(0x71);
+        self.reg64(R_SEQ)
+            .i64c(1)
+            .op(0x7c)
+            .reg64(R_SAFEPOINT_AT)
+            .op(0x54)
+            .op(0x71);
+        self.op(0x04).op(0x40);
+        self.get(L_SLOT).i32c(3).add().bump();
+        self.get(L_ADDR).get(L_A).st64(0);
+        self.get(L_ADDR).get(L_OBJECT).reg64(R_SPACE).op(0x84);
+        if args == 1 {
+            self.get(L_SLOT).op(0xad).i64c(32).op(0x86).op(0x84);
+        }
+        self.st64(META);
+        // the slots, nil
+        self.get(L_ADDR).i32c(SLOTS as i32).add().set(L_ADDR);
+        self.op(0x02).op(0x40).op(0x03).op(0x40);
+        self.get(L_SLOT).op(0x45).op(0x0d).uleb(1);
+        self.get(L_ADDR).get(L_NIL).st64(0);
+        self.get(L_ADDR).i32c(8).add().set(L_ADDR);
+        self.get(L_SLOT).i32c(1).sub().set(L_SLOT);
+        self.op(0x0c).uleb(0).op(0x0b).op(0x0b);
+        // the reference, in `r64`, where the answer goes
+        self.get(L_INDEX)
+            .op(0xad)
+            .i64c(1)
+            .op(0x86)
+            .i64c(1)
+            .op(0x84)
+            .set(L_R64);
+        match (args, ordinary) {
+            (0, false) => {
+                self.push_addr().get(L_R64).store();
+                self.inc_sp();
+            }
+            (1, true) => {
+                self.dec_sp();
+                self.slot_addr(|f| {
+                    f.get(L_SP).i32c(1).sub();
+                });
+                self.get(L_R64).store();
+            }
+            _ => {
+                self.slot_addr(|f| {
+                    f.get(L_SP).i32c(1).sub();
+                });
+                self.get(L_R64).store();
+            }
+        }
+        self.op(0x0c).uleb(3); // br: the send's end
+        self.op(0x0b)
+    }
     /// Makes the closure of the `PUSH_CLOSURE` here (`copied` values from
     /// the stack, `num_args` arguments, its body at `initial_ip`) in the
     /// arena, as the VM's `compiled_closure` does, when there is room in the
@@ -2219,59 +2392,6 @@ impl Func {
                 self.op(0x0c).uleb(2); // br: the send's end
                 self.op(0x0b);
             }
-            if args == 0 && (rule == RULE_IMPLICIT || rule >= RULE_OUTER) {
-                // An enclosing object's slot, read here.
-                self.get(L_KIND).i32c(IC_OUTER_GETTER as i32).op(0x46);
-                self.op(0x04).op(0x7f);
-                self.get(L_OBJECT).set(L_A);
-                self.object_at_a();
-                self.accessor_ok(false);
-                self.op(0x05).i32c(0).op(0x0b);
-                self.op(0x04).op(0x40);
-                self.accessor(false, false);
-                self.op(0x0c).uleb(2); // br: the send's end
-                self.op(0x0b);
-            }
-            if args == 1 {
-                // `==` and SmallInteger's bit operations, here.
-                for kind in [IC_IDENTICAL, IC_BIT_AND, IC_BIT_OR, IC_BIT_XOR] {
-                    self.get(L_KIND).i32c(kind as i32).op(0x46);
-                    self.op(0x04).op(0x40);
-                    self.binary(kind, ordinary);
-                    self.op(0x0c).uleb(2); // br: the send's end
-                    self.op(0x0b);
-                }
-            }
-            // A method answering its receiver, answered here.
-            self.get(L_KIND).i32c(IC_RETURN_SELF as i32).op(0x46);
-            self.op(0x04).op(0x40);
-            if args > 0 {
-                self.get(L_SP).i32c(args as i32).sub().set(L_SP);
-            }
-            if !ordinary {
-                self.push_addr().get(L_A).store();
-                self.inc_sp();
-            }
-            self.op(0x0c).uleb(2); // br: the send's end
-            self.op(0x0b);
-            if args <= 2 {
-                // An indexed native, run here.
-                let kinds: &[u32] = match args {
-                    0 => &[IC_SIZE],
-                    1 => &[IC_AT, IC_BYTES_AT],
-                    _ => &[IC_AT_PUT],
-                };
-                for &kind in kinds {
-                    self.get(L_KIND).i32c(kind as i32).op(0x46);
-                    self.op(0x04).op(0x7f);
-                    self.indexed_ok(kind);
-                    self.op(0x05).i32c(0).op(0x0b);
-                    self.op(0x04).op(0x40);
-                    self.indexed(kind, ordinary);
-                    self.op(0x0c).uleb(2); // br: the send's end
-                    self.op(0x0b);
-                }
-            }
             if ordinary && args <= 3 {
                 // A closure's `value`: its frame pushed here when the closure
                 // has the cached body and there is room, else by `call`.
@@ -2317,6 +2437,88 @@ impl Func {
             // br_if: after the call, unless a miss (then the general send)
             self.get(L_R).i32c(MISS).op(0x47).op(0x0d).uleb(1);
             self.op(0x0b);
+            if args == 0 && (rule == RULE_IMPLICIT || rule >= RULE_OUTER) {
+                // An enclosing object's slot, read here.
+                self.get(L_KIND).i32c(IC_OUTER_GETTER as i32).op(0x46);
+                self.op(0x04).op(0x7f);
+                self.get(L_OBJECT).set(L_A);
+                self.object_at_a();
+                self.accessor_ok(false);
+                self.op(0x05).i32c(0).op(0x0b);
+                self.op(0x04).op(0x40);
+                self.accessor(false, false);
+                self.op(0x0c).uleb(2); // br: the send's end
+                self.op(0x0b);
+            }
+            if args == 1 {
+                // `==`, SmallInteger's bit operations and the comparisons of
+                // numbers, here (the kinds 7 to 19 behind one test).
+                self.get(L_KIND)
+                    .i32c(IC_IDENTICAL as i32)
+                    .sub()
+                    .i32c((IC_GE - IC_IDENTICAL + 1) as i32)
+                    .op(0x49); // lt_u
+                self.op(0x04).op(0x40);
+                for kind in [
+                    IC_IDENTICAL,
+                    IC_BIT_AND,
+                    IC_BIT_OR,
+                    IC_BIT_XOR,
+                    IC_LT,
+                    IC_GT,
+                    IC_LE,
+                    IC_GE,
+                ] {
+                    self.get(L_KIND).i32c(kind as i32).op(0x46);
+                    self.op(0x04).op(0x40);
+                    self.binary(kind, ordinary);
+                    self.op(0x0c).uleb(3); // br: the send's end
+                    self.op(0x0b);
+                }
+                self.op(0x0b);
+            }
+            // A method answering its receiver, answered here.
+            self.get(L_KIND).i32c(IC_RETURN_SELF as i32).op(0x46);
+            self.op(0x04).op(0x40);
+            if args > 0 {
+                self.get(L_SP).i32c(args as i32).sub().set(L_SP);
+            }
+            if !ordinary {
+                self.push_addr().get(L_A).store();
+                self.inc_sp();
+            }
+            self.op(0x0c).uleb(2); // br: the send's end
+            self.op(0x0b);
+            if args <= 1 {
+                // `basicNew` or `new:` of an Array, made here.
+                let kind = if args == 0 {
+                    IC_BASIC_NEW
+                } else {
+                    IC_NEW_ARRAY
+                };
+                self.get(L_KIND).i32c(kind as i32).op(0x46);
+                self.op(0x04).op(0x40);
+                self.make_new(args, ordinary);
+                self.op(0x0b);
+            }
+            if args <= 2 {
+                // An indexed native, run here.
+                let kinds: &[u32] = match args {
+                    0 => &[IC_SIZE],
+                    1 => &[IC_AT, IC_BYTES_AT],
+                    _ => &[IC_AT_PUT],
+                };
+                for &kind in kinds {
+                    self.get(L_KIND).i32c(kind as i32).op(0x46);
+                    self.op(0x04).op(0x7f);
+                    self.indexed_ok(kind);
+                    self.op(0x05).i32c(0).op(0x0b);
+                    self.op(0x04).op(0x40);
+                    self.indexed(kind, ordinary);
+                    self.op(0x0c).uleb(2); // br: the send's end
+                    self.op(0x0b);
+                }
+            }
         }
         self.get(L_VM)
             .i32c(rule)

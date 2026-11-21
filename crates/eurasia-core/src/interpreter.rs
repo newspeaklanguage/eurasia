@@ -4112,6 +4112,8 @@ impl Vm {
         r.seq = self.heap.allocation_counter();
         r.safepoint_at = self.safepoint_at;
         r.allocated = 0;
+        r.space = (self.current as u64) << 10;
+        r.float_class = self.roles.get(Role::FloatClass).to_bits();
         let space = Space::Actor(self.current as u32);
         r.closure_class = self.roles.get(Role::ClosureClass).to_bits();
         r.activation_class = self.roles.get(Role::ActivationClass).to_bits();
@@ -4795,7 +4797,33 @@ impl Vm {
                 let bytes = matches!(format, Some(Format::Bytes | Format::String));
                 let array = format == Some(Format::Array);
                 let small = object.is_small_integer();
+                let float = format == Some(Format::Float);
+                // For the allocating kinds: the slot count and the meta word
+                // (for the first actor's space: compiled code adds the
+                // current one's).
+                let mut new_shape = (0, 0);
                 let kind = match (Native::from_id(e.target.header.native), n) {
+                    (Some(Native::ClassBasicNew), 0) => {
+                        match natives::basic_new_regular(&self.heap, &self.roles, object) {
+                            Some((slots, flags)) if slots <= 1 << 16 => {
+                                let m = crate::object::meta(
+                                    crate::object::Code::Regular,
+                                    flags,
+                                    Space::Actor(0),
+                                    slots,
+                                );
+                                new_shape = (slots as u32, m.to_bits());
+                                crate::compiler::IC_BASIC_NEW
+                            }
+                            _ => 0,
+                        }
+                    }
+                    (Some(Native::IndexedNew), 1) if object == self.roles.get(Role::ArrayClass) => {
+                        let m =
+                            crate::object::meta(crate::object::Code::Array, 0, Space::Actor(0), 0);
+                        new_shape = (0, m.to_bits());
+                        crate::compiler::IC_NEW_ARRAY
+                    }
                     (Some(Native::IndexedSize), 0) if array || bytes => IC_SIZE,
                     (Some(Native::IndexedAt), 1) if array => IC_AT,
                     (Some(Native::IndexedAt), 1) if bytes => IC_BYTES_AT,
@@ -4804,6 +4832,12 @@ impl Vm {
                     (Some(Native::IntegerBitAnd), 1) if small => IC_BIT_AND,
                     (Some(Native::IntegerBitOr), 1) if small => IC_BIT_OR,
                     (Some(Native::IntegerBitXor), 1) if small => IC_BIT_XOR,
+                    (Some(Native::IntegerLess), 1) if small || float => crate::compiler::IC_LT,
+                    (Some(Native::IntegerGreater), 1) if small || float => crate::compiler::IC_GT,
+                    (Some(Native::IntegerLessEqual), 1) if small || float => crate::compiler::IC_LE,
+                    (Some(Native::IntegerGreaterEqual), 1) if small || float => {
+                        crate::compiler::IC_GE
+                    }
                     _ => 0,
                 };
                 let t = e.target;
@@ -4823,6 +4857,8 @@ impl Vm {
                 if kind != 0 {
                     r.ic_kind = kind;
                     r.ic_class = class.to_bits();
+                    r.ic_slot = new_shape.0;
+                    r.ic_object = new_shape.1;
                 } else if let Some(id) = native {
                     r.ic_kind = crate::compiler::IC_METHOD;
                     r.ic_slot = id;

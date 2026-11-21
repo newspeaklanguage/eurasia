@@ -1263,6 +1263,42 @@ pub(crate) fn readable_fields(heap: &Heap, v: Value) -> Option<Vec<Value>> {
 
 /// The number of instance slots of `class`: every mixin's slot declarations
 /// along the superclass chain.
+/// What `basicNew` sent to `class` makes when it makes a Regular object
+/// (not one of the special classes, nor a program object): its slot count,
+/// and its flags ([`VALUE`] for an instance of a value class). Compiled
+/// code's inline caches make the same.
+pub(crate) fn basic_new_regular(heap: &Heap, roles: &Roles, class: Value) -> Option<(usize, u8)> {
+    let nil = roles.get(Role::Nil);
+    if class == nil {
+        return None;
+    }
+    let special = [
+        Role::ArrayClass,
+        Role::WeakArrayClass,
+        Role::ByteArrayClass,
+        Role::StringClass,
+        Role::FloatClass,
+        Role::LargeIntegerClass,
+        Role::SmallIntegerClass,
+        Role::ClosureClass,
+        Role::ActivationClass,
+        Role::EphemeronClass,
+        Role::MethodClass,
+        Role::InstanceMixinClass,
+        Role::ClassMixinClass,
+    ];
+    if special.iter().any(|&r| roles.get(r) == class) {
+        return None;
+    }
+    let n = instance_slots(heap, roles, class)?;
+    let flags = if heap.flags(class) & VALUE_CLASS != 0 {
+        VALUE
+    } else {
+        0
+    };
+    Some((n, flags))
+}
+
 fn instance_slots(heap: &Heap, roles: &Roles, class: Value) -> Option<usize> {
     let nil = roles.get(Role::Nil);
     let mut total = 0usize;
