@@ -4,8 +4,10 @@
 //! Versions that a snapshot must match (design doc section 7).
 
 /// The kernel version: the native catalog and the kernel operations.
-/// A snapshot built for another kernel version is refused.
-pub const KERNEL_VERSION: u16 = 1;
+/// A snapshot built for another kernel version is refused. Version 2
+/// scrambles identity hashes (`natives::identity_hash`): an image saved with
+/// version 1 holds identity-keyed tables laid out by the old hash.
+pub const KERNEL_VERSION: u16 = 2;
 
 /// The bytecode version: Eurasia's refinement of upstream V5.
 /// Version 1 is upstream V5 with the refinements of the implementation plan

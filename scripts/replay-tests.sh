@@ -109,7 +109,7 @@ echo "the kernel tests (with checkpoints) and the JS tests replay"
 
 echo "== a checkpoint restored into a new host"
 mkdir -p "$OUT/restore"
-"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel \
+"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel --entry-in-kernel \
   "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv "$NEWSPEAK/EurasiaRestoreProbe.ns" \
   "$P/Kernel.ns" "$P/platform/PrimordialSoup/Collections.ns" "$NEWSPEAK/platform/Eurasia/Actors.ns" "$NEWSPEAK/platform/Eurasia/Runtime.ns" \
   "$OUT/restore/genesis.eus" > "$OUT/restore/package.log"
@@ -126,7 +126,7 @@ cat "$OUT/restore/restored.txt"
 echo "== a saved image"
 rm -rf "$OUT/save"
 mkdir -p "$OUT/save"
-"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel \
+"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel --entry-in-kernel \
   "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv "$NEWSPEAK/EurasiaSaveImageProbe.ns" \
   "$P/Kernel.ns" "$P/platform/PrimordialSoup/Collections.ns" "$NEWSPEAK/platform/Eurasia/Actors.ns" "$NEWSPEAK/platform/Eurasia/Runtime.ns" \
   "$OUT/save/genesis.eus" > "$OUT/save/package.log"

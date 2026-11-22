@@ -1,7 +1,7 @@
 // Copyright (c) 2026-2027, Gilad Bracha. All rights reserved. Use of this source
 // code is governed by a BSD-style license that can be found in the LICENSE file.
 
-//! The native catalog of kernel version 1 (operation list, section 3; rules
+//! The native catalog of kernel version 2 (operation list, section 3; rules
 //! Native-Answer, Native-Tail and Native-Fail of `kernel-semantics.tex`).
 //!
 //! Every native is total: it answers, makes a defined tail send, or fails
@@ -215,6 +215,8 @@ natives! {
     VmLogPosition = 176 / 0: "`vm logPosition`: the position in the host's input log (recording or replaying), or nil when there is none.",
     VmIncarnation = 177 / 0: "`vm incarnation`: a copy of the running incarnation's id, 16 bytes minted from host entropy at every start (contract design, section 6).",
     VmLineage = 178 / 0: "`vm lineage`: a copy of the id of the incarnation that saved the image this one started from, or nil (an image from genesis).",
+    VmGenesisImage = 180 / 3: "`genesisImageFrom: root replacing: pairs keepingSources: keep`: a genesis image of what `root` reaches, as a ByteArray: `root` is its entry (role 32); a reference to the first object of each pair in the flat Array `pairs` is written as the second; no message loop, platform template, restore handler or incarnation; without `keep` (true), no method or class-header sources. The running program is not disturbed (EURASIA_BUILD_AND_DEPLOY_DESIGN_2026-11-21.md, section 4.3).",
+    VmDeliverImage = 181 / 2: "`deliverImage: bytes named: name`: hands a genesis image (a ByteArray) to the host to keep as `name` (a String); the web page runs genesis on it and keeps the base image with its saved images; a host without that keeps nothing. Answers the receiver (build and deploy design, section 2.5).",
     VmSaveImage = 179 / 1: "`saveImage: name`: a checkpoint at the next safepoint with no host operation under way, handed to the host to save under `name` (a String); the restore handler (role 40) is then sent `imageSaved`, in a turn of its own. Answers the receiver.",
     ClosureIn = 173 / 4: "`newClosureIn: activation initialBCI: bci numArgs: n numCopied: c`, for the Simulator (psoup's primitive 69): a closure defined by the activation, its body at bytecode position `bci` (from 1), with `c` copied values, nil until set.",
     VmSpawn = 139 / 1: "`vm spawn: mixin`: a new actor running a clone of the platform template, with the mixin applied to Object (role 37) in its heap, enclosing object nil; answers a far reference to the new class (`actor-semantics.tex`, eq. `create-actor`).",
@@ -642,6 +644,17 @@ pub enum Outcome {
     ActivateReceiver,
     /// `vm snapshot`: the interpreter serializes the heap and answers it.
     Snapshot,
+    /// `genesisImageFrom:replacing:keepingSources:`: the interpreter writes
+    /// a genesis image of what the root reaches and answers it.
+    GenesisImage {
+        /// The image's entry.
+        root: Value,
+        /// Old and new objects: references to each old one are written as
+        /// the new one.
+        pairs: Vec<(Value, Value)>,
+        /// Whether methods and class headers keep their sources.
+        keep_sources: bool,
+    },
     /// Collect garbage now (`vm garbageCollect`), then answer the receiver.
     Collect,
     /// `vm newActor`: the interpreter, which owns the actors, creates one.
@@ -1314,6 +1327,23 @@ fn instance_slots(heap: &Heap, roles: &Roles, class: Value) -> Option<usize> {
     None
 }
 
+/// The identity hash of the object with sequence number `seq` (the
+/// function h of kernel-semantics.tex's eq:kernel-identity-hash): a
+/// bijection on 62-bit numbers that spreads the sequence number's high bits
+/// into the low ones (splitmix64's finalizer, modulo 2^62), so that hash
+/// tables masking the low bits do not cluster objects allocated in a
+/// regular rhythm. Distinct objects keep distinct hashes.
+pub fn identity_hash(seq: u64) -> i64 {
+    const MASK: u64 = (1 << 62) - 1;
+    let mut x = seq & MASK;
+    x ^= x >> 31;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9) & MASK;
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB) & MASK;
+    x ^= x >> 31;
+    x as i64
+}
+
 /// A one-based index into a sequence of `len` elements.
 fn index(v: Value, len: usize) -> Result<usize, Reason> {
     match small_index(v) {
@@ -1451,8 +1481,9 @@ pub fn invoke(
                 .unwrap_or_else(|| ctx.roles.get(Role::SmallIntegerClass)),
         ),
         Native::ObjectIdentityHash => match ctx.heap.seq(receiver) {
-            // eq:kernel-identity-hash with h the identity on SmallIntegers.
-            Some(seq) => Outcome::Answer(small((seq & ((1 << 62) - 1)) as i64)),
+            // eq:kernel-identity-hash, h being identity_hash; SmallIntegers
+            // are their own.
+            Some(seq) => Outcome::Answer(small(identity_hash(seq))),
             None => Outcome::Answer(receiver),
         },
         Native::StringConcatenate => {
@@ -1920,6 +1951,14 @@ pub fn invoke(
             Outcome::Answer(small(i as i64))
         }
         Native::VmSnapshot => Outcome::Snapshot,
+        Native::VmGenesisImage => match ctx.heap.array_elements(arg(1)) {
+            Some(flat) if flat.len() % 2 == 0 => Outcome::GenesisImage {
+                root: arg(0),
+                pairs: flat.chunks(2).map(|p| (p[0], p[1])).collect(),
+                keep_sources: arg(2) == ctx.roles.get(Role::True),
+            },
+            _ => Outcome::Fail(Reason::WrongKind(2)),
+        },
         Native::CurrentActivation
         | Native::ActivationSender
         | Native::ActivationSetSender
@@ -2009,6 +2048,21 @@ pub fn invoke(
         Native::VmCommit => Outcome::Commit(arg(0)),
         Native::VmProgramVersion => Outcome::ProgramVersion,
         Native::VmCheckpointNow => Outcome::CheckpointNow,
+        Native::VmDeliverImage => {
+            let Some(name) = ctx
+                .heap
+                .string_bytes(arg(1))
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+            else {
+                return Outcome::Fail(Reason::WrongKind(2));
+            };
+            let Some(bytes) = ctx.heap.bytes(arg(0)) else {
+                return Outcome::Fail(Reason::WrongKind(1));
+            };
+            let bytes = bytes.to_vec();
+            ctx.host.deliver_image(&name, &bytes);
+            Outcome::Answer(receiver)
+        }
         Native::VmSaveImage => match ctx.heap.string_bytes(arg(0)) {
             Some(name) => Outcome::SaveImage(String::from_utf8_lossy(name).into_owned()),
             None => Outcome::Fail(Reason::WrongKind(1)),
@@ -2171,7 +2225,7 @@ pub fn invoke(
         ),
         Native::VmIsIdenticalTo => Outcome::Answer(ctx.boolean(arg(0) == arg(1))),
         Native::VmIdentityHashOf => match ctx.heap.seq(arg(0)) {
-            Some(seq) => Outcome::Answer(small((seq & ((1 << 62) - 1)) as i64)),
+            Some(seq) => Outcome::Answer(small(identity_hash(seq))),
             None => Outcome::Answer(arg(0)),
         },
         Native::VmInstantiate => invoke(Native::ClassBasicNew, arg(0), &[], ctx),
@@ -2431,4 +2485,33 @@ pub fn catalog() -> Vec<(u32, &'static str, usize)> {
 /// diagnostics).
 pub fn integer_to_string(heap: &Heap, v: Value) -> Option<String> {
     integer_of(heap, v).map(|n| n.to_decimal())
+}
+
+#[cfg(test)]
+mod identity_hash_tests {
+    use super::identity_hash;
+
+    #[test]
+    fn identity_hashes_are_distinct_small_integers() {
+        let mut seen = alloc::collections::BTreeSet::new();
+        for seq in 0..200_000u64 {
+            let h = identity_hash(seq);
+            assert!((0..1 << 62).contains(&h));
+            assert!(seen.insert(h), "a repeated hash at {seq}");
+        }
+    }
+
+    #[test]
+    fn objects_allocated_at_a_stride_spread_over_a_masked_table() {
+        // Keys allocated every 256 objects: the sequence numbers' low byte is
+        // constant, their hashes' must not be.
+        let buckets: alloc::collections::BTreeSet<i64> = (0..256u64)
+            .map(|k| identity_hash(1000 + 256 * k) & 255)
+            .collect();
+        assert!(
+            buckets.len() > 128,
+            "only {} of 256 buckets used",
+            buckets.len()
+        );
+    }
 }

@@ -30,6 +30,7 @@ Every edit is checked: the script fails if psoup's source has changed under
 it. Usage: fork-actors.py <psoup Actors.ns> <output>.
 """
 
+import re
 import sys
 
 
@@ -374,6 +375,13 @@ def main():
 	)
 """ + anchor)
 
+    # Last: psoup's primitive pragmas go. Eurasia's natives come from its
+    # natives table (by class and selector), and no module Eurasia runs carries
+    # a primitive (EURASIA_BUILD_AND_DEPLOY_DESIGN_2026-11-21.md, section 6):
+    # each becomes a plain comment saying what it was.
+    t, count = re.subn(r"\(\* :literalmessage: primitive: (\d+) \*\)",
+                       lambda m: f"(* psoup's primitive {m.group(1)}; Eurasia's natives come from its natives table. *)", t)
+    print(f"fork-actors: replaced {count} primitive pragmas")
     open(output, "w").write(t)
     print(f"fork-actors: wrote {output}")
 

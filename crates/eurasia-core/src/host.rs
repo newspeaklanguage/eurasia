@@ -155,6 +155,16 @@ pub trait Host {
         let _ = (name, bytes);
     }
 
+    /// Output (`deliverImage:named:`): the program made a genesis image
+    /// (`genesisImageFrom:replacing:keepingSources:`) and hands it over to be
+    /// kept as `name`. The web host hands it to the page, which runs genesis
+    /// on it and keeps the base image with the saved images (build and deploy
+    /// design, section 2.5). As with `save_image`, the program is told only
+    /// that the image was handed over; the default keeps nothing.
+    fn deliver_image(&mut self, name: &str, bytes: &[u8]) {
+        let _ = (name, bytes);
+    }
+
     /// Whether this host keeps checkpoints (a recording or replaying host).
     fn wants_checkpoints(&self) -> bool {
         false

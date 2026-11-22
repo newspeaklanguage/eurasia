@@ -1204,6 +1204,18 @@ impl Heap {
         Some(self.words[self.start(v)? + 1].to_bits())
     }
 
+    /// Exchanges the sequence numbers, and so the identity hashes, of
+    /// objects `a` and `b` (`vm commit:`: a new program object takes the
+    /// identity of the old one it replaces). Sequence numbers stay unique;
+    /// arena order need not follow them (a reshaped object that moves keeps
+    /// its own), and a snapshot sorts by them.
+    pub(crate) fn exchange_seqs(&mut self, a: Value, b: Value) {
+        let (Some(i), Some(j)) = (self.start(a), self.start(b)) else {
+            return;
+        };
+        self.words.swap(i + 1, j + 1);
+    }
+
     /// The slots of a Regular object or the elements of an Array or
     /// WeakArray.
     pub fn fields(&self, v: Value) -> Option<&[Value]> {

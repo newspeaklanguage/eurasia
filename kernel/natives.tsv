@@ -210,5 +210,26 @@ Mirrors	instance	currentMessageLoop	VmCurrentMessageLoop	131
 Mirrors	instance	isSimulationRoot:	VmIsSimulationRoot	169
 Mirrors	instance	markSimulationRoot:	VmMarkSimulationRoot	168
 Mirrors	instance	runNative:receiver:arguments:	VmRunNative	172
+Mirrors	instance	clone:	VmClone	126
+Mirrors	instance	genesisImageFrom:replacing:keepingSources:	VmGenesisImage	180
+Mirrors	instance	deliverImage:named:	VmDeliverImage	181
 Thread	instance	jumpTo:	VmResumeActivation	171
 Simulator	instance	newClosureIn:initialBCI:numArgs:numCopied:	ClosureIn	173
+# The command-line applications Eurasia runs (their Eurasia forks, kernel/fork-apps.py, and the
+# Eurasia-only EurasiaBuild and EurasiaDeployProbe): their file reading and writing.
+EurasiaPackager	instance	readFileAsBytes:	VmReadFile	92
+EurasiaPackager	instance	writeBytes:toFileNamed:	VmWriteFile	91
+EurasiaBuild	instance	readFileAsBytes:	VmReadFile	92
+EurasiaBuild	instance	writeBytes:toFileNamed:	VmWriteFile	91
+EurasiaDeployProbe	instance	readFileAsBytes:	VmReadFile	92
+EurasiaDeployProbe	instance	writeBytes:toFileNamed:	VmWriteFile	91
+NewspeakParser	instance	readFileAsBytes:	VmReadFile	92
+NewspeakParser	instance	writeBytes:toFileNamed:	VmWriteFile	91
+NewspeakTestRunner	instance	readFileAsBytes:	VmReadFile	92
+NewspeakTestRunner	instance	writeBytes:toFileNamed:	VmWriteFile	91
+NewspeakPrettyPrintApp	instance	readFileAsBytes:	VmReadFile	92
+NewspeakPrettyPrintApp	instance	writeBytes:toFileNamed:	VmWriteFile	91
+NewspeakRoundTripCheckApp	instance	readFileAsBytes:	VmReadFile	92
+NewspeakRoundTripCheckApp	instance	writeBytes:toFileNamed:	VmWriteFile	91
+NewspeakAttachmentDiffApp	instance	readFileAsBytes:	VmReadFile	92
+NewspeakAttachmentDiffApp	instance	writeBytes:toFileNamed:	VmWriteFile	91

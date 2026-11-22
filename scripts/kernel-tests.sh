@@ -39,7 +39,7 @@ grep '>>' "$OUT/psoup-raw.txt" | sort > "$OUT/psoup.txt" || true
 
 echo "== Eurasia: packaging, genesis, then the tests"
 # shellcheck disable=SC2086
-"$PSOUP" "$OUT/EurasiaPackager.vfuel" "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" "$EURASIA/kernel/natives.tsv" \
+"$PSOUP" "$OUT/EurasiaPackager.vfuel" --entry-in-kernel "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" "$EURASIA/kernel/natives.tsv" \
   "$NEWSPEAK/EurasiaKernelTestRunner.ns" $MODULES "$OUT/genesis.eus"
 cargo build -q --release -p eurasia-native
 EURASIA_BIN=$EURASIA/target/release/eurasia

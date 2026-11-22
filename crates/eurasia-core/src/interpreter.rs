@@ -22,7 +22,7 @@
 // (EURASIA_PERFORMANCE_2026-11-19.md).
 #![allow(clippy::unnecessary_lazy_evaluations)]
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -837,6 +837,85 @@ impl Vm {
         let pairs: Vec<(Role, Value)> = self.roles.pairs().collect();
         for (role, v) in pairs {
             roles.set(role, fwd.forward(v));
+        }
+        (heap, roles)
+    }
+
+    /// The heap and roles of a genesis image of what `root` reaches
+    /// (`genesisImageFrom:replacing:keepingSources:`; build and deploy design,
+    /// section 4.3), collected into a copy; the running program is not
+    /// disturbed. In the copy, every reference to the first object of a pair
+    /// becomes one to the second (the kernel module, which the classes it
+    /// encloses refer to, becomes the copy the entry is in). The roles are
+    /// the running ones, so reached through the same objects, except that
+    /// `root` is the entry and there is no message loop, platform template,
+    /// restore handler, incarnation or lineage: genesis makes those. Objects
+    /// keep their sequence numbers, so identity hashes are unchanged. Without
+    /// `keep_sources`, methods (and lazy slots' metadata) and class headers
+    /// have no sources.
+    fn genesis_heap(
+        &self,
+        root: Value,
+        pairs: &[(Value, Value)],
+        keep_sources: bool,
+    ) -> (Heap, Roles) {
+        let mut heap = self.heap.clone();
+        let map: BTreeMap<u64, Value> = pairs
+            .iter()
+            .filter(|(o, n)| o != n)
+            .filter_map(|(o, n)| o.as_reference().map(|i| (i, *n)))
+            .collect();
+        let forward = |v: Value| match v.as_reference() {
+            Some(i) => map.get(&i).copied().unwrap_or(v),
+            None => v,
+        };
+        if !map.is_empty() {
+            heap.forward_identities(&forward);
+        }
+        let nil = self.nil();
+        let mut roles = self.roles.clone();
+        let running: Vec<(Role, Value)> = self.roles.pairs().collect();
+        for (role, v) in running {
+            roles.set(role, forward(v));
+        }
+        roles.set(Role::Entry, forward(root));
+        for role in [
+            Role::MessageLoop,
+            Role::PlatformTemplate,
+            Role::RestoreHandler,
+            Role::Incarnation,
+            Role::Lineage,
+        ] {
+            roles.set(role, nil);
+        }
+        let roots: Vec<Value> = roles.pairs().map(|(_, v)| v).collect();
+        let (fwd, _) = heap.collect(&roots, nil);
+        let held: Vec<(Role, Value)> = roles.pairs().collect();
+        for (role, v) in held {
+            roles.set(role, fwd.forward(v));
+        }
+        if !keep_sources {
+            for v in heap.objects() {
+                if let Some(m) = heap.method(v) {
+                    let source = m.source();
+                    if heap.string_bytes(source).is_some() {
+                        heap.set_method_field(v, 3, nil);
+                    } else if let Some(slots) = heap.regular_slots_mut(source) {
+                        // A lazy slot's metadata: {source. isLazy}.
+                        if let Some(s) = slots.first_mut() {
+                            *s = nil;
+                        }
+                    }
+                } else if let Some(m) = heap.mixin(v) {
+                    // The library field: {nested mixins. access. factory. header source}.
+                    let library = m.library();
+                    if let Some(fields) = heap.array_elements_mut(library)
+                        && fields.len() == 4
+                    {
+                        fields[3] = nil;
+                    }
+                }
+            }
         }
         (heap, roles)
     }
@@ -2618,6 +2697,31 @@ impl Vm {
                     self.ordinary_send(signal, 0, host)
                 }
             },
+            Outcome::GenesisImage {
+                root,
+                pairs,
+                keep_sources,
+            } => match self.snapshot_writer {
+                Some(write) => {
+                    let (heap, roles) = self.genesis_heap(root, &pairs, keep_sources);
+                    let bytes = write(&heap, &roles, None);
+                    let class = self.roles.get(Role::ByteArrayClass);
+                    let v = self.heap.allocate(
+                        class,
+                        Space::Actor(self.current as u32),
+                        Body::Bytes(bytes),
+                    );
+                    self.stack.push(v);
+                    Ok(None)
+                }
+                None => {
+                    let failure =
+                        self.new_failure(native, receiver, args, Reason::Unsupported, host);
+                    self.stack.push(failure);
+                    let signal = self.symbol("signal");
+                    self.ordinary_send(signal, 0, host)
+                }
+            },
             Outcome::SetRole { role, value } => {
                 self.roles.set(role, value);
                 self.stack.push(receiver);
@@ -3598,6 +3702,19 @@ impl Vm {
                 if now != v {
                     moved.push((v.as_reference().expect("an object"), now));
                 }
+            }
+        }
+        // Each new object takes its old one's identity hash, as psoup's
+        // become copies it: identity-keyed tables (a Map keyed by a mixin)
+        // hold the old object at its hash, and after forwarding they hold
+        // the new one, which must hash the same. It takes the old sequence
+        // number; the old object, unreachable once forwarded, keeps the new
+        // one. A new object named twice takes the first old one's.
+        let mut renumbered: BTreeSet<u64> = BTreeSet::new();
+        for (o, n) in olds.iter().zip(news.iter()) {
+            let Some(r) = n.as_reference() else { continue };
+            if o != n && renumbered.insert(r) {
+                self.heap.exchange_seqs(*o, *n);
             }
         }
         // Forward identities, in the heap and in every root the VM holds.

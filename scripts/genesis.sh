@@ -28,7 +28,7 @@ echo "== building EurasiaPackager.vfuel"
   || { echo "building the packager failed; see $OUT/build.log"; exit 1; }
 
 echo "== packaging the genesis image"
-"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" "$OUT/EurasiaPackager.vfuel" \
+"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" "$OUT/EurasiaPackager.vfuel" --entry-in-kernel \
   "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" "$EURASIA/kernel/natives.tsv" \
   "$NEWSPEAK/EurasiaKernelSmokeTest.ns" $MODULES "$OUT/genesis.eus"
 
@@ -65,7 +65,7 @@ cat "$OUT/unhandled.txt"
 grep -q "failDeeper" "$OUT/unhandled.txt" || { echo "the trace lacks failDeeper"; exit 1; }
 echo "== reproducibility: building again must give byte-identical images"
 mkdir -p "$OUT/again"
-"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" "$OUT/EurasiaPackager.vfuel" \
+"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" "$OUT/EurasiaPackager.vfuel" --entry-in-kernel \
   "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" "$EURASIA/kernel/natives.tsv" \
   "$NEWSPEAK/EurasiaKernelSmokeTest.ns" $MODULES "$OUT/again/genesis.eus" > /dev/null
 # A different output path: a snapshot saves only what the roles reach, so

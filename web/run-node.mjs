@@ -32,6 +32,8 @@ try {
     jit: Number(process.env.EURASIA_JIT ?? 0),
     // With EURASIA_JIT_NAMES=1, compiled methods are named in profiles.
     names: Boolean(process.env.EURASIA_JIT_NAMES),
+    // The program's files: this machine's.
+    files: { read: (path) => readFileSync(path), write: (path, bytes) => writeFileSync(path, bytes) },
     // With EURASIA_GC_STRESS=n, a collection after every n allocations.
     gcStress: Number(process.env.EURASIA_GC_STRESS ?? 0),
     // Arguments after the snapshot are the program's.

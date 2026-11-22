@@ -73,7 +73,7 @@ NEWSPEAK=${NEWSPEAK:-$EURASIA/../newspeak}
 PRIMORDIALSOUP=${PRIMORDIALSOUP:-$EURASIA/../primordialsoup}
 P=$PRIMORDIALSOUP/newspeak
 mkdir -p "$OUT/gcprobe"
-"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel \
+"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel --entry-in-kernel \
   "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv "$NEWSPEAK/EurasiaCompiledGCProbe.ns" \
   "$P/Kernel.ns" "$P/platform/PrimordialSoup/Collections.ns" "$NEWSPEAK/platform/Eurasia/Actors.ns" "$NEWSPEAK/platform/Eurasia/Runtime.ns" \
   "$OUT/gcprobe/genesis.eus" > "$OUT/gcprobe/package.log"
@@ -91,7 +91,7 @@ echo "== the JS FFI and callbacks: JSTesting and EurasiaHostTesting on wasm"
 JSMODULES="$P/Kernel.ns $P/platform/PrimordialSoup/Collections.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $P/Minitest.ns $P/JSTesting.ns $NEWSPEAK/EurasiaHostTesting.ns"
 mkdir -p "$OUT/js"
 # shellcheck disable=SC2086
-"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel \
+"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel --entry-in-kernel \
   "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv "$NEWSPEAK/EurasiaKernelTestRunner.ns" \
   $JSMODULES "$OUT/js/genesis.eus" > "$OUT/js/package.log"
 (cd "$OUT/js" && "$EURASIA/target/release/eurasia" genesis.eus base.eus)
@@ -119,4 +119,6 @@ ls -l "$OUT/counter/base.eus"
 cp "$NEWSPEAK"/*.png "$OUT/"
 
 cp web/index.html web/eurasia.mjs "$WASM" target/genesis/base.eus "$OUT/"
+# psoup's page helpers (safeDownloadBlob), canonical in primordialsoup.
+cp "$PRIMORDIALSOUP/meta/custom-post.js" "$OUT/"
 echo "Web host: wasm32 output matches native. For a browser, serve $OUT and open index.html (?snapshot=counter/base.eus for CounterApp)."

@@ -42,5 +42,5 @@ fn version_names_the_supported_versions() {
     let out = eurasia().arg("--version").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("snapshot format 8"));
-    assert!(text.contains("kernel 1"));
+    assert!(text.contains("kernel 2"));
 }

@@ -18,6 +18,10 @@
 <script src="vendor/lightning-fs-4.6.2.min.js"></script>
 <script src="vendor/isomorphic-git-1.38.4-http-web.umd.js"></script>
 <script src="vendor/diff_match_patch-2019-07.js"></script>
+<!-- psoup's page helpers that Newspeak reaches as window globals
+     (safeDownloadBlob, for WebFiles' saves): primordialsoup/meta/custom-post.js,
+     canonical there, staged here by scripts/ide.sh. -->
+<script src="custom-post.js"></script>
 <style>
 body { margin: 0; background: #fff; }
 #eurasia-images { font: 14px system-ui, sans-serif; max-width: 40em; margin: 4em auto; padding: 0 16px; }
@@ -46,7 +50,7 @@ body { margin: 0; background: #fff; }
      images and no snapshot parameter, the page offers them, or a fresh IDE,
      before it starts; image=name opens one directly. -->
 <script type="module">
-  import { run } from './eurasia.mjs';
+  import { run, genesis } from './eurasia.mjs';
   const params = new URLSearchParams(location.search);
   const fetchBytes = async (url) => {
     const response = await fetch(url);
@@ -122,6 +126,31 @@ body { margin: 0; background: #fff; }
     show(images);
     document.body.append(panel);
   });
+  // A deployed application, zipped (JSZip, which this page loads): its base
+  // image, the VM it was made for, its page, and the files its platform
+  // needs (Hopscotch's CodeMirror and page helpers; its image resources).
+  const bundle = async (request, base, wasm) => {
+    const zip = new JSZip();
+    const fetchText = async (url) => {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`cannot fetch ${url}: ${response.status}`);
+      return response.text();
+    };
+    const libraries = request.hopscotch
+      ? ['CodeMirror/lib/codemirror.js', 'CodeMirror/lib/codemirror.css', 'CodeMirror/addon/display/autorefresh.js', 'custom-post.js']
+      : [];
+    const tags = libraries.map((f) => f.endsWith('.css')
+      ? `<link rel="stylesheet" href="${f}">`
+      : `<script src="${f}"><\/script>`).join('\n');
+    const page = (await fetchText('app.html')).replace('<!-- LIBRARIES -->', tags);
+    zip.file('index.html', page);
+    zip.file('base.eus', base);
+    zip.file('eurasia_web.wasm', wasm);
+    zip.file('eurasia.mjs', await fetchText('eurasia.mjs'));
+    for (const f of libraries) zip.file(f, await fetchText(f));
+    for (const image of request.images) zip.file(`${image}.png`, await fetchBytes(`${image}.png`));
+    return zip.generateAsync({ type: 'blob' });
+  };
   const startingImage = async () => {
     if (params.has('snapshot')) return fetchBytes(params.get('snapshot'));
     if (params.has('image')) return readImage(fileName(params.get('image')));
@@ -175,6 +204,34 @@ body { margin: 0; background: #fff; }
       jit,
       names: params.has('names'),
       onStart: (c) => { controls = c; },
+      // The IDE hands over a genesis image (Mirrors>>deliverImage:named:)
+      // with a JSON request ({kind: 'bundle', name, hopscotch, images}): a
+      // deployment from the IDE (DeploymentManager; build and deploy design,
+      // sections 2.5 and 2.6). A VM of its own runs genesis on it, and the
+      // base image, the VM it was made for, a page (app.html) and what the
+      // application's platform needs are zipped. That may outlast the click's
+      // activation, so the page does not save the zip: it sets
+      // window.eurasiaDelivery, synchronously, to a promise of a delivery
+      // ({ok, file, size, save} or {ok: false, message}; never rejected).
+      // The IDE calls save() (a promise of safeDownloadBlob's outcome) at
+      // once if the deploy click still allows a save, else from the click
+      // on Save of a confirmation (Browsing>>saveOrConfirm:saving:).
+      onDeliverImage: (name, genesisImage) => {
+        const request = JSON.parse(name);
+        const file = `${request.name}_eurasia_app.zip`;
+        window.eurasiaDelivery = genesis(wasm, genesisImage)
+          .then((base) => bundle(request, base, wasm))
+          .then((blob) => ({
+            ok: true,
+            file,
+            size: `${(blob.size / 1048576).toFixed(1)} MB`,
+            save: () => safeDownloadBlob(file, blob),
+          }))
+          .catch((e) => {
+            console.error(`eurasia: ${request.name} was not built:`, e);
+            return { ok: false, message: e.message };
+          });
+      },
       onSaveImage: (name, bytes) => {
         storeImage(name, bytes).catch((e) => {
           console.error('eurasia: the image was not saved:', e);

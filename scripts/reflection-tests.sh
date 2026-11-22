@@ -31,7 +31,7 @@ echo "== building EurasiaPackager.vfuel"
 echo "== the compiler probe"
 MODULES="$P/Kernel.ns $P/platform/PrimordialSoup/Collections.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $P/NewspeakASTs.ns $P/NewspeakPredictiveParsing.ns $P/IntermediatesForPrimordialSoup.ns $P/NewspeakCompilation.ns $P/NewspeakBytecodeCompilation.ns $NEWSPEAK/Newspeak2V5BytecodeCompilation.ns"
 # shellcheck disable=SC2086
-"$PSOUP" "$OUT/EurasiaPackager.vfuel" "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv \
+"$PSOUP" "$OUT/EurasiaPackager.vfuel" --entry-in-kernel "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv \
   "$NEWSPEAK/EurasiaCompilerProbe.ns" $MODULES "$OUT/genesis.eus" > "$OUT/package.log"
 cargo build -q --release -p eurasia-native
 EURASIA_BIN=$EURASIA/target/release/eurasia
@@ -45,7 +45,7 @@ echo "== the debugger probe: a broken thread outlives its turn"
 REFLECTIVE="$P/Kernel.ns $P/platform/PrimordialSoup/Collections.ns $NEWSPEAK/platform/Eurasia/Actors.ns $NEWSPEAK/platform/Eurasia/Runtime.ns $NEWSPEAK/platform/Eurasia/Mirrors.ns $NEWSPEAK/platform/Eurasia/RuntimeWithMirrors.ns $P/NewspeakASTs.ns $P/NewspeakPredictiveParsing.ns $P/IntermediatesForPrimordialSoup.ns $P/NewspeakCompilation.ns $P/NewspeakBytecodeCompilation.ns $NEWSPEAK/Newspeak2V5BytecodeCompilation.ns $P/MetadataParsing.ns"
 mkdir -p "$OUT/debugger"
 # shellcheck disable=SC2086
-"$PSOUP" "$OUT/EurasiaPackager.vfuel" "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv \
+"$PSOUP" "$OUT/EurasiaPackager.vfuel" --entry-in-kernel "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv \
   "$NEWSPEAK/EurasiaDebuggerProbe.ns" $REFLECTIVE "$OUT/debugger/genesis.eus" > "$OUT/debugger/package.log"
 (cd "$OUT/debugger" && "$EURASIA_BIN" genesis.eus base.eus)
 "$EURASIA_BIN" "$OUT/debugger/base.eus" | tee "$OUT/debugger/output.txt"
@@ -57,4 +57,21 @@ expected=$(printf '%s\n' \
 [ "$(cat "$OUT/debugger/output.txt")" = "$expected" ] || { echo "Unexpected output from the debugger probe."; exit 1; }
 EURASIA_GC_STRESS=200 "$EURASIA_BIN" "$OUT/debugger/base.eus" > "$OUT/debugger/output-stress.txt"
 cmp "$OUT/debugger/output.txt" "$OUT/debugger/output-stress.txt" || { echo "GC stress changed the debugger probe's output"; exit 1; }
-echo "Reflection: the compiler runs on Eurasia and its classes run; a broken thread outlives its turn."
+echo "== deploying from what is running: an application writes a genesis image of itself"
+# The build and deploy design, section 4.2: platform mirrors
+# genesisImageOfApplicationKeepingSources: (the native VmGenesisImage). The
+# image it writes must hold the same methods as the one packaged from source
+# (eurasia --methods), and run, afresh, as that one does.
+DEPLOY=$OUT/deploy
+python3 scripts/tool-image.py "$NEWSPEAK/EurasiaDeployProbe.ns" "$DEPLOY" > /dev/null
+"$EURASIA_BIN" "$DEPLOY/base.eus" deploy "$DEPLOY/self.genesis.eus" | tee "$DEPLOY/deploying.txt"
+grep -q '^deployed [0-9]* bytes$' "$DEPLOY/deploying.txt" || { echo "the probe did not deploy itself"; exit 1; }
+"$EURASIA_BIN" --methods "$DEPLOY/genesis.eus" > "$DEPLOY/packaged-methods.txt"
+"$EURASIA_BIN" --methods "$DEPLOY/self.genesis.eus" > "$DEPLOY/deployed-methods.txt"
+cmp "$DEPLOY/packaged-methods.txt" "$DEPLOY/deployed-methods.txt" \
+  || { echo "the deployed image's methods differ from the packaged image's"; exit 1; }
+(cd "$DEPLOY" && "$EURASIA_BIN" self.genesis.eus self.base.eus)
+[ "$("$EURASIA_BIN" "$DEPLOY/self.base.eus")" = "running, run 1" ] \
+  || { echo "the deployed image does not run afresh"; exit 1; }
+echo "deployed: $(wc -l < "$DEPLOY/deployed-methods.txt") methods, as packaged; the image runs afresh"
+echo "Reflection: the compiler runs on Eurasia and its classes run; a broken thread outlives its turn; an application deploys itself."

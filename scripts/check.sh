@@ -12,6 +12,10 @@ echo "== clippy (native)"
 cargo clippy --workspace --all-targets -- -D warnings
 echo "== tests (native)"
 cargo test --workspace
+echo "== natives module (newspeak/platform/Eurasia/EurasiaNatives.ns)"
+python3 scripts/natives-module.py --check
+echo "== Eurasia's forks of the command-line applications (kernel/fork-apps.py)"
+python3 kernel/fork-apps.py --check
 echo "== build (wasm32)"
 cargo build --workspace --exclude eurasia-native --target wasm32-unknown-unknown
 echo "== clippy (wasm32)"

@@ -326,6 +326,11 @@ impl Host for Recorder<'_> {
         self.inner.save_image(name, bytes);
     }
 
+    // Not an event either, for the same reason.
+    fn deliver_image(&mut self, name: &str, bytes: &[u8]) {
+        self.inner.deliver_image(name, bytes);
+    }
+
     fn wants_checkpoints(&self) -> bool {
         true
     }

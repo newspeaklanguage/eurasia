@@ -628,6 +628,28 @@ impl Host for WebHost {
     fn save_image(&mut self, name: &str, bytes: Vec<u8>) {
         imports::save_image(name.as_bytes(), &bytes);
     }
+
+    fn deliver_image(&mut self, name: &str, bytes: &[u8]) {
+        imports::deliver_image(name.as_bytes(), bytes);
+    }
+
+    fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        let ok = imports::read_file(path.as_bytes());
+        let staged = imports::take_staged();
+        if ok {
+            Ok(staged)
+        } else {
+            Err(String::from_utf8_lossy(&staged).into_owned())
+        }
+    }
+
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        if imports::write_file(path.as_bytes(), bytes) {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&imports::take_staged()).into_owned())
+        }
+    }
 }
 
 /// The host imports, on wasm32; elsewhere (the crate's own tests) inert
@@ -642,10 +664,20 @@ mod imports {
         fn host_monotonic_nanos() -> f64;
         #[link_name = "utc_nanos"]
         fn host_utc_nanos() -> f64;
+        #[link_name = "read_file"]
+        fn host_read_file(path: *const u8, path_len: usize) -> i32;
+        #[link_name = "write_file"]
+        fn host_write_file(path: *const u8, path_len: usize, ptr: *const u8, len: usize) -> i32;
+        #[link_name = "staged_length"]
+        fn host_staged_length() -> usize;
+        #[link_name = "staged_copy"]
+        fn host_staged_copy(ptr: *mut u8);
         #[link_name = "random_bytes"]
         fn host_random_bytes(ptr: *mut u8, len: usize);
         #[link_name = "save_image"]
         fn host_save_image(name: *const u8, name_len: usize, ptr: *const u8, len: usize);
+        #[link_name = "deliver_image"]
+        fn host_deliver_image(name: *const u8, name_len: usize, ptr: *const u8, len: usize);
         #[link_name = "install_code"]
         fn host_install_code(ptr: *const u8, len: usize) -> i32;
         fn ffi_arg_undefined();
@@ -748,6 +780,35 @@ mod imports {
         unsafe { host_save_image(name.as_ptr(), name.len(), bytes.as_ptr(), bytes.len()) }
     }
 
+    pub fn deliver_image(name: &[u8], bytes: &[u8]) {
+        // SAFETY: the host reads both byte ranges during the call.
+        unsafe { host_deliver_image(name.as_ptr(), name.len(), bytes.as_ptr(), bytes.len()) }
+    }
+
+    /// Reads the file `path` (a host with files: Node): whether it could,
+    /// the contents or the reason staged ([`take_staged`]).
+    pub fn read_file(path: &[u8]) -> bool {
+        // SAFETY: the host reads the path during the call.
+        unsafe { host_read_file(path.as_ptr(), path.len()) == 0 }
+    }
+
+    /// Writes `bytes` to the file `path`: whether it could (if not, the
+    /// reason staged).
+    pub fn write_file(path: &[u8], bytes: &[u8]) -> bool {
+        // SAFETY: the host reads both byte ranges during the call.
+        unsafe { host_write_file(path.as_ptr(), path.len(), bytes.as_ptr(), bytes.len()) == 0 }
+    }
+
+    /// The bytes the host staged (a file's contents, or a reason).
+    pub fn take_staged() -> Vec<u8> {
+        // SAFETY: the host writes exactly the staged length at the pointer.
+        unsafe {
+            let mut v = vec![0; host_staged_length()];
+            host_staged_copy(v.as_mut_ptr());
+            v
+        }
+    }
+
     /// Compiles and instantiates a module, puts its function in this
     /// module's function table, and answers its index.
     pub fn install_code(module: &[u8]) -> Option<u32> {
@@ -777,6 +838,24 @@ mod imports {
 
     pub fn save_image(name: &[u8], bytes: &[u8]) {
         let _ = (name, bytes);
+    }
+
+    pub fn deliver_image(name: &[u8], bytes: &[u8]) {
+        let _ = (name, bytes);
+    }
+
+    pub fn read_file(path: &[u8]) -> bool {
+        let _ = path;
+        false
+    }
+
+    pub fn write_file(path: &[u8], bytes: &[u8]) -> bool {
+        let _ = (path, bytes);
+        false
+    }
+
+    pub fn take_staged() -> Vec<u8> {
+        b"this host has no files".to_vec()
     }
 
     pub fn install_code(module: &[u8]) -> Option<u32> {

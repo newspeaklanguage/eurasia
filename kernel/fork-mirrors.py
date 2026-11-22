@@ -384,6 +384,56 @@ def main():
 	)
 	private commit: changeSet = (""")
 
+    # 8. Deploying from what is running (build and deploy design, section
+    #    4.2): a genesis image of an application, over a copy of the kernel
+    #    module, by the native VmGenesisImage; clone: (VmClone) makes the copy.
+    t = replace(t, """	private commit: changeSet = (""", """	private clone: object = (
+		(* Eurasia: a native (VmClone): a shallow copy. *)
+
+		halt
+	)
+	private commit: changeSet = (""")
+    t = replace(t, """	public compiler = (""", """	public genesisImageOf: entry replacing: pairs <Array> keepingSources: keep <Boolean> ^<ByteArray> = (
+		(* A genesis image of the application whose entry is entry, made from what is running, with no parsing or compilation (EURASIA_BUILD_AND_DEPLOY_DESIGN_2026-11-21.md, section 4.2): the kernel's classes and whatever entry reaches (its modules' classes), over a copy of this kernel module that refers to entry and has no message loop; every reference to the kernel module (the kernel's classes are nested in it) is written as one to the copy, and every reference to the first object of a pair in pairs (a flat Array: old, new, ...) as one to the second, in the image only (a fresh BuildInfo for the running one, say). Genesis then builds the platform afresh, so no running state goes with it. Sources are kept when keep is true; a platform's runtime class says which (keepsSources). *)
+
+		| kernel |
+		kernel:: clone: internalKernel.
+		(ObjectMirror reflecting: kernel) setSlot: #application to: entry;
+			setSlot: #messageLoop to: nil;
+			setSlot: #reportingUnhandled to: nil.
+		^genesisImageFrom: kernel replacing: {internalKernel. kernel. } , pairs keepingSources: keep
+	)
+	public genesisImageOfApplicationReplacing: pairs <Array> keepingSources: keep <Boolean> ^<ByteArray> = (
+		(* A genesis image of the running application itself: its entry, as the kernel holds it, made afresh (genesisImageOf:replacing:keepingSources:). For the IDE, this is Build IDE image: the IDE's classes, accepted changes included, without the session. *)
+
+		^genesisImageOf: ((ObjectMirror reflecting: internalKernel) getSlot: #application) reflectee
+			replacing: pairs
+			keepingSources: keep
+	)
+	private genesisImageFrom: root replacing: pairs keepingSources: keep = (
+		(* Eurasia: a native (VmGenesisImage). *)
+
+		halt
+	)
+	public buildImageOfApplicationNamed: name <String> replacing: pairs <Array> keepingSources: keep <Boolean> = (
+		(* Build IDE image, and its like for any running application: a genesis image of the running application (genesisImageOfApplicationReplacing:keepingSources:), handed to the host to keep as name. The web page runs genesis on it in a VM of its own and keeps the base image with its saved images; a host without that keeps nothing (deliverImage:named:). *)
+
+		deliverImage: (genesisImageOfApplicationReplacing: pairs keepingSources: keep) named: name
+	)
+	public deliverImage: bytes <ByteArray> named: name <String> = (
+		(* Eurasia: a native (VmDeliverImage): hands a genesis image to the host to keep as name; the web page runs genesis on it and keeps the base image with its saved images, or, when name is a JSON request, bundles it as a deployed application (DeploymentManager). *)
+
+		halt
+	)
+	public compiler = (""")
+
+    # Last: psoup's primitive pragmas go. Eurasia's natives come from its
+    # natives table (by class and selector), and no module Eurasia runs carries
+    # a primitive (EURASIA_BUILD_AND_DEPLOY_DESIGN_2026-11-21.md, section 6):
+    # each becomes a plain comment saying what it was.
+    t, count = re.subn(r"\(\* :literalmessage: primitive: (\d+) \*\)",
+                       lambda m: f"(* psoup's primitive {m.group(1)}; Eurasia's natives come from its natives table. *)", t)
+    print(f"fork-mirrors: replaced {count} primitive pragmas")
     open(output, "w").write(t)
     print(f"fork-mirrors: wrote {output}")
 

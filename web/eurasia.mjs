@@ -115,16 +115,42 @@ function hostObjects(bytesAt, decoder, encoder, link) {
 // given the name and the image's bytes (a copy), to keep as the page sees
 // fit; without one the image is dropped, with a warning.
 //
+// When the program hands over a genesis image it made (deliverImage:named:,
+// the build and deploy design, section 2.5), `onDeliverImage` is given the
+// name and the genesis image's bytes (a copy); `genesis` turns them into a
+// base image. Without one the image is dropped, with a warning.
+//
 // `args` are the program's arguments (strings; none by default, as in
 // psoup's web host), for a fresh start.
-export async function run(wasm, snapshot, { print = console.log, record, keep = 0, jit = 0, names = false, gcStress = 0, args = [], onStart, onSaveImage } = {}) {
+//
+// `files`, when given ({read(path) -> bytes, write(path, bytes)}: Node's),
+// serves the program's file input and output (`vm readFile:`,
+// `vm writeBytes:toFile:`); without it they fail (a page has no files).
+export async function run(wasm, snapshot, { print = console.log, record, keep = 0, jit = 0, names = false, gcStress = 0, args = [], files, onStart, onSaveImage, onDeliverImage } = {}) {
   let memory = null;
   const link = { exports: null, depth: 0, afterIdleCallback: () => {} };
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const bytesAt = (ptr, len) => new Uint8Array(memory.buffer, ptr, len);
+  // A file's contents, or why it could not be read or written.
+  let staged = new Uint8Array(0);
+  const failed = (message) => { staged = encoder.encode(message); return 1; };
   const imports = {
     eurasia: {
+      read_file: (ptr, len) => {
+        const path = decoder.decode(bytesAt(ptr, len));
+        if (!files) return failed('this host has no files');
+        try { staged = new Uint8Array(files.read(path)); return 0; }
+        catch (e) { return failed(`cannot read ${path}: ${e.message}`); }
+      },
+      write_file: (pathPtr, pathLen, ptr, len) => {
+        const path = decoder.decode(bytesAt(pathPtr, pathLen));
+        if (!files) return failed('this host has no files');
+        try { files.write(path, bytesAt(ptr, len).slice()); return 0; }
+        catch (e) { return failed(`cannot write ${path}: ${e.message}`); }
+      },
+      staged_length: () => staged.length,
+      staged_copy: (ptr) => { bytesAt(ptr, staged.length).set(staged); },
       print: (ptr, len) => print(decoder.decode(bytesAt(ptr, len))),
       monotonic_nanos: () => Math.floor(performance.now() * 1e6),
       utc_nanos: () => Date.now() * 1e6,
@@ -162,6 +188,11 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
         const name = decoder.decode(bytesAt(namePtr, nameLen));
         if (onSaveImage) onSaveImage(name, bytesAt(ptr, len).slice());
         else console.warn(`eurasia: the image ${name} was dropped (this page keeps no images)`);
+      },
+      deliver_image: (namePtr, nameLen, ptr, len) => {
+        const name = decoder.decode(bytesAt(namePtr, nameLen));
+        if (onDeliverImage) onDeliverImage(name, bytesAt(ptr, len).slice());
+        else console.warn(`eurasia: the genesis image ${name} was dropped (this page keeps no images)`);
       },
       ...hostObjects(bytesAt, decoder, encoder, link),
     },
@@ -234,4 +265,22 @@ export async function run(wasm, snapshot, { print = console.log, record, keep = 
     };
     settle(call(vm.eurasia_start));
   });
+}
+
+// Runs genesis on a genesis image (bytes) on the VM in `wasm`, as
+// `eurasia genesis.eus base.eus` does on the command line, in a VM of its
+// own: the genesis entry builds the platform and writes the base image, which
+// is answered (bytes). `print` gets what genesis prints.
+export async function genesis(wasm, genesisImage, { print = console.log } = {}) {
+  let base = null;
+  const result = await run(wasm, genesisImage, {
+    print,
+    args: ['base.eus'],
+    files: {
+      read: (path) => { throw new Error(`genesis reads no files (${path})`); },
+      write: (path, bytes) => { base = bytes; },
+    },
+  });
+  if (base === null) throw new Error(`genesis wrote no image (${result.status}${result.status === 'exited' ? ` ${result.code}` : ''})`);
+  return base;
 }

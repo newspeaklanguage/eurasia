@@ -19,6 +19,15 @@
 //!   they were taken, the dropped ones included.
 //! - `eurasia --checkpoint LOG CHECKPOINT FILE` writes a log's checkpoint to
 //!   a file, to be run (restored) on its own.
+//! - `eurasia --methods SNAPSHOT` lists the image's methods, one a line,
+//!   sorted: where each is (its mixin, qualified by the mixins enclosing it,
+//!   and its side), its selector, header, literals and bytecode. Two images
+//!   of the same program list the same lines, whatever their sequence
+//!   numbers; the build and deploy design (section 4.4) compares an image
+//!   deployed from a running program with one built from source this way.
+//! - `eurasia --census SNAPSHOT` counts the image's objects by class (and
+//!   their bytes, for byte objects), one class a line, sorted by name: what
+//!   an image holds beyond its methods, to see what a deployment took along.
 //! - `eurasia --version`.
 //!
 //! With `EURASIA_GC_STRESS=n` in the environment the VM collects at the first
@@ -108,7 +117,7 @@ fn version() -> String {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: eurasia SNAPSHOT [ARGS...]\n       eurasia --record LOG [--checkpoint-every N] [--keep-checkpoints K] SNAPSHOT [ARGS...]\n       eurasia --replay LOG [CHECKPOINT]\n       eurasia --checkpoint LOG CHECKPOINT FILE\n       eurasia --version"
+        "usage: eurasia SNAPSHOT [ARGS...]\n       eurasia --record LOG [--checkpoint-every N] [--keep-checkpoints K] SNAPSHOT [ARGS...]\n       eurasia --replay LOG [CHECKPOINT]\n       eurasia --checkpoint LOG CHECKPOINT FILE\n       eurasia --methods SNAPSHOT\n       eurasia --census SNAPSHOT\n       eurasia --version"
     );
     ExitCode::from(2)
 }
@@ -186,6 +195,122 @@ fn run(args: &[String]) -> Result<ExitCode, ExitCode> {
         eprintln!("eurasia: {} collections", vm.collections());
     }
     Ok(exit_status(outcome))
+}
+
+fn list_methods(args: &[String]) -> Result<ExitCode, ExitCode> {
+    let [path] = args else {
+        return Err(usage());
+    };
+    let bytes = read(path)?;
+    let (heap, _) = eurasia_snapshot::read_image(&bytes).map_err(|e| {
+        eprintln!("eurasia: {path}: {e}");
+        ExitCode::from(65)
+    })?;
+    let mut lines: Vec<String> = heap
+        .objects()
+        .filter_map(|v| {
+            let m = heap.method(v)?;
+            let literals: Vec<String> = heap
+                .array_elements(m.literals())
+                .unwrap_or(&[])
+                .iter()
+                .map(|&l| literal_text(&heap, l))
+                .collect();
+            let code: String = m.bytecode().iter().map(|b| format!("{b:02x}")).collect();
+            Some(format!(
+                "{}>>{} {:?} [{}] {}",
+                mixin_path(&heap, m.mixin()),
+                text_of(&heap, m.selector()),
+                m.header(),
+                literals.join(" "),
+                code
+            ))
+        })
+        .collect();
+    lines.sort();
+    let mut out = std::io::stdout().lock();
+    for line in lines {
+        let _ = writeln!(out, "{line}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn census(args: &[String]) -> Result<ExitCode, ExitCode> {
+    let [path] = args else {
+        return Err(usage());
+    };
+    let bytes = read(path)?;
+    let (heap, _) = eurasia_snapshot::read_image(&bytes).map_err(|e| {
+        eprintln!("eurasia: {path}: {e}");
+        ExitCode::from(65)
+    })?;
+    let mut counts: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
+    for v in heap.objects() {
+        let Some(o) = heap.object(v) else { continue };
+        let class = o.header.class;
+        let name = match (heap.object(class).map(|c| c.body), heap.behavior(class)) {
+            // A metaclass's instance is a class: named by its this-class.
+            (Some(eurasia_core::object::Body::Metaclass(_)), Some(b)) => {
+                let this = heap.behavior(b.this_class()).map_or(b.name(), |t| t.name());
+                format!("{} class", text_of(&heap, this))
+            }
+            (_, Some(b)) => text_of(&heap, b.name()),
+            _ => String::from("?"),
+        };
+        let size = heap.bytes(v).map_or(0, |b| b.len() as u64);
+        let entry = counts.entry(name).or_default();
+        entry.0 += 1;
+        entry.1 += size;
+    }
+    let mut out = std::io::stdout().lock();
+    for (name, (count, size)) in counts {
+        let _ = writeln!(out, "{name}\t{count}\t{size}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn text_of(heap: &eurasia_core::object::Heap, v: eurasia_core::Value) -> String {
+    heap.string_bytes(v)
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_else(|| String::from("?"))
+}
+
+/// A mixin's name, after those of the mixins enclosing it; a class-side
+/// mixin (whose library is {its instance mixin}) is its instance mixin's,
+/// with ` class`.
+fn mixin_path(heap: &eurasia_core::object::Heap, mixin: eurasia_core::Value) -> String {
+    let Some(m) = heap.mixin(mixin) else {
+        return String::from("?");
+    };
+    if let Some([instance]) = heap.array_elements(m.library()) {
+        return format!("{} class", mixin_path(heap, *instance));
+    }
+    let name = text_of(heap, m.name());
+    match heap.mixin(m.enclosing_mixin()) {
+        Some(_) => format!("{}`{name}", mixin_path(heap, m.enclosing_mixin())),
+        None => name,
+    }
+}
+
+/// A literal, as text that does not depend on where objects are.
+fn literal_text(heap: &eurasia_core::object::Heap, v: eurasia_core::Value) -> String {
+    if let Some(i) = v.as_small_integer() {
+        return format!("{i}");
+    }
+    if let Some(b) = heap.string_bytes(v) {
+        return format!("{:?}", String::from_utf8_lossy(b));
+    }
+    if let Some(elements) = heap.array_elements(v) {
+        let inner: Vec<String> = elements.iter().map(|&e| literal_text(heap, e)).collect();
+        return format!("{{{}}}", inner.join(" "));
+    }
+    if let Some(m) = heap.method(v) {
+        return format!("<method {}>", text_of(heap, m.selector()));
+    }
+    match heap.class(v).and_then(|c| heap.behavior(c)) {
+        Some(b) => format!("<{}>", text_of(heap, b.name())),
+        None => String::from("<?>"),
+    }
 }
 
 fn record(args: &[String]) -> Result<ExitCode, ExitCode> {
@@ -320,6 +445,8 @@ fn main() -> ExitCode {
         Some("--record") => record(&args[2..]),
         Some("--replay") => replay_log(&args[2..]),
         Some("--checkpoint") => extract(&args[2..]),
+        Some("--methods") => list_methods(&args[2..]),
+        Some("--census") => census(&args[2..]),
         Some(_) => run(&args[1..]),
     };
     result.unwrap_or_else(|code| code)

@@ -31,7 +31,7 @@ for b in ClosureDefFibonacci ClosureFibonacci DeltaBlue MethodFibonacci NLRImmed
   MODULES="$MODULES $P/$b.ns"
 done
 # shellcheck disable=SC2086
-"$PSOUP_BIN" "$OUT/EurasiaPackager.vfuel" "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv \
+"$PSOUP_BIN" "$OUT/EurasiaPackager.vfuel" --entry-in-kernel "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv \
   "$NEWSPEAK/EurasiaBenchmarkApp.ns" $MODULES "$OUT/genesis.eus" > "$OUT/package.log"
 cargo build -q --release -p eurasia-native
 (cd "$OUT" && "$EURASIA/target/release/eurasia" genesis.eus base.eus)

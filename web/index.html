@@ -18,6 +18,10 @@
      page, and jit=n to compile methods at their nth activation (off by default). scripts/web-tests.sh copies the build and images beside it. -->
 <div id="status">loading</div>
 <pre id="output"></pre>
+<!-- psoup's page helpers that Newspeak reaches as window globals
+     (safeDownloadBlob, for WebFiles' saves): primordialsoup/meta/custom-post.js,
+     canonical there, staged here by scripts/web-tests.sh. -->
+<script src="custom-post.js"></script>
 <script type="module">
   import { run } from './eurasia.mjs';
   const params = new URLSearchParams(location.search);
