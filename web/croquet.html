@@ -1,0 +1,51 @@
+<!doctype html>
+<!-- Copyright (c) 2026-2027, Gilad Bracha. All rights reserved. Use of this source
+     code is governed by a BSD-style license that can be found in the LICENSE file. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Newspeak on Croquet on Eurasia</title>
+<!-- Newspeak under Croquet on Eurasia: the page psoup's is
+     (croquetpsoup.html?snapshot=CroquetAmpleforthViewer.vfuel or
+     CroquetHopscotchWebIDE.vfuel), with an image built on the Croquet platform
+     (newspeak/platform/Eurasia/CroquetRuntime.ns; scripts/build.sh
+     croquet-viewer croquet-ide) and Eurasia's VM.
+
+       croquet.html?app=viewer&docName=<document>   (the default app)
+       croquet.html?app=ide
+         &sessionId=<fresh name>&pwd=<anything>&appId=<reverse DNS>
+         &apiKey=none&reflector=ws://localhost:9090[&files=<file server>]
+
+     The Croquet parameters are psoup's (newspeak/CROQUET_NOTES.md): run the
+     reflector with newspeak/tool/run-croquet-reflector.sh, and use a fresh
+     sessionId per test. ?interpret runs without the compiler.
+
+     Croquet's client (croquet.min.js, the local build of the patched fork) and
+     the Croquet support script (croquet-glue.js: the JS deploy's copy, made by
+     newspeak/tool/mirror-croquet-glue.py --emit from
+     primordialsoup/meta/croquet-post.js) are staged beside this page by
+     scripts/ide.sh. The support script joins the session and only then loads
+     nsProgramSrc, croquet-boot.js, which starts Eurasia: Newspeak's boot
+     reads the view the join makes (HopscotchShell>>setupCroquetView). -->
+<script src="croquet.min.js"></script>
+<script src="vendor/buffer-6.0.3.bundle.min.js"></script>
+<script>window.Buffer = window.buffer.Buffer;</script>
+<script src="CodeMirror/lib/codemirror.js"></script>
+<link rel="stylesheet" href="CodeMirror/lib/codemirror.css">
+<script src="CodeMirror/addon/display/autorefresh.js"></script>
+<script src="jszip.min.js"></script>
+<script src="vendor/isomorphic-git-1.38.4.umd.min.js"></script>
+<script src="vendor/lightning-fs-4.6.2.min.js"></script>
+<script src="vendor/isomorphic-git-1.38.4-http-web.umd.js"></script>
+<script src="vendor/diff_match_patch-2019-07.js"></script>
+<script src="custom-post.js"></script>
+<style>
+body { margin: 0; background: #fff; }
+</style>
+</head>
+<body>
+<script>var nsProgramSrc = 'croquet-boot.js';</script>
+<script src="croquet-glue.js"></script>
+</body>
+</html>
