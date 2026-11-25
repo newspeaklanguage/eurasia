@@ -50,8 +50,11 @@ cp web/eurasia.mjs target/wasm32-unknown-unknown/release/eurasia_web.wasm "$OUTD
 cp web/viewer.html "$OUTDIR/eurasia-viewer.html"
 cp "$PRIMORDIALSOUP/meta/custom-post.js" "$OUTDIR/"
 cp "$NEWSPEAK/deploy-boot.js" "$OUTDIR/"
-cp -R web/libs/. "$OUTDIR/"
-rm -f "$OUTDIR/README.md"
+# Everything in web/libs but its README, which must not land on (or replace)
+# a README of the target's own.
+(cd web/libs && find . -type f ! -name README.md | while read -r f; do
+  mkdir -p "$OUTDIR/$(dirname "$f")" && cp "$f" "$OUTDIR/$f"
+done)
 for n in $(cat target/build/viewer.images.txt); do
   cp "$NEWSPEAK/$n.png" "$OUTDIR/"
 done

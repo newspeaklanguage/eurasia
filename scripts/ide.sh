@@ -53,8 +53,11 @@ cp "$PRIMORDIALSOUP/meta/custom-post.js" "$WEB/"
 # The boot the viewer page uses, canonical in newspeak.
 cp "$NEWSPEAK/deploy-boot.js" "$WEB/"
 # The libraries (web/libs, laid out as served) and the images, all tracked.
-cp -R web/libs/. "$WEB/"
-rm -f "$WEB/README.md"
+# Everything in web/libs but its README, which must not land on (or replace)
+# a README of the target's own.
+(cd web/libs && find . -type f ! -name README.md | while read -r f; do
+  mkdir -p "$WEB/$(dirname "$f")" && cp "$f" "$WEB/$f"
+done)
 cp "$NEWSPEAK"/*.png "$WEB/"
 echo "IDE: serve $WEB and open ide.html; documents: viewer.html?docName=<document>."
 

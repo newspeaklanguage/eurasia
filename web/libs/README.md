@@ -2,7 +2,7 @@
 
 Third-party JavaScript the IDE, viewer and site pages load before the VM. This
 directory has the same layout as a served site, so `scripts/site-runtime.sh`
-and `scripts/ide.sh` copy it as it is (`cp -R web/libs/. OUT/`).
+and `scripts/ide.sh` copy it as it is, all but this README.
 
 Only the files the pages load are here: the pages name them, and so does the
 Newspeak code that loads CodeMirror (`codemirror.js`, `codemirror.css`,
