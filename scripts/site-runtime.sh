@@ -10,6 +10,7 @@
 # Builds the document viewer (scripts/build.sh viewer) and writes to OUTDIR
 #
 #   eurasia.mjs, eurasia_web.wasm   the loader and the VM
+#   images.mjs                      saved images (Save Image), kept in the browser
 #   viewer/base.eus                 the document viewer (AmpleforthViewer)
 #   eurasia-viewer.html             the viewer's page: eurasia-viewer.html?docName=<document>
 #   deploy-boot.js                  the boot of every document page (newspeak's), and of the viewer's
@@ -46,7 +47,7 @@ test -z "$missing" || { echo "not tracked in $NEWSPEAK:$missing" >&2; exit 1; }
 echo "== staging in $OUTDIR"
 mkdir -p "$OUTDIR/viewer"
 cp target/build/viewer/base.eus "$OUTDIR/viewer/"
-cp web/eurasia.mjs target/wasm32-unknown-unknown/release/eurasia_web.wasm "$OUTDIR/"
+cp web/eurasia.mjs web/images.mjs target/wasm32-unknown-unknown/release/eurasia_web.wasm "$OUTDIR/"
 cp web/viewer.html "$OUTDIR/eurasia-viewer.html"
 cp "$PRIMORDIALSOUP/meta/custom-post.js" "$OUTDIR/"
 cp "$NEWSPEAK/deploy-boot.js" "$OUTDIR/"

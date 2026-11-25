@@ -437,6 +437,12 @@ pub extern "C" fn eurasia_buffer_address() -> *const u8 {
 /// continues instead (M7 design, section 3.4).
 #[unsafe(no_mangle)]
 pub extern "C" fn eurasia_start() -> i32 {
+    // A panic aborts (the trap the page sees says only `unreachable`), so
+    // print its message and place first: a page in the field reports the
+    // cause, not just the trap.
+    std::panic::set_hook(Box::new(|info| {
+        imports::print(format!("eurasia: VM panic: {info}").as_bytes());
+    }));
     STATE.with_borrow_mut(|s| {
         let (heap, roles, machine) = match read_checkpoint(&s.buffer) {
             Ok(image) => image,

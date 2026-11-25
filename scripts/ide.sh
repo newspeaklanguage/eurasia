@@ -47,7 +47,7 @@ cp target/build/croquet-viewer/base.eus "$WEB/viewer/croquet.eus"
 python3 "$NEWSPEAK/tool/mirror-croquet-glue.py" --check --emit "$WEB/croquet-glue.js" ||
   echo "WARNING: DeploymentManager.ns's copy of the Croquet glue is stale (newspeak/tool/mirror-croquet-glue.py)"
 cp "$NEWSPEAK/out/croquet.min.js" web/croquet.html web/croquet-boot.js "$WEB/"
-cp web/ide.html web/viewer.html web/app.html web/eurasia.mjs target/wasm32-unknown-unknown/release/eurasia_web.wasm "$WEB/"
+cp web/ide.html web/viewer.html web/app.html web/eurasia.mjs web/images.mjs target/wasm32-unknown-unknown/release/eurasia_web.wasm "$WEB/"
 # psoup's page helpers (safeDownloadBlob), canonical in primordialsoup.
 cp "$PRIMORDIALSOUP/meta/custom-post.js" "$WEB/"
 # The boot the viewer page uses, canonical in newspeak.
@@ -71,7 +71,7 @@ if [ "${EURASIA_NO_OUT:-}" != 1 ]; then
   cp "$WEB/viewer/croquet.eus" "$NSOUT/viewer/"
   cp "$WEB/croquet-glue.js" web/croquet-boot.js "$NSOUT/"
   cp web/croquet.html "$NSOUT/eurasia-croquet.html"
-  cp web/eurasia.mjs target/wasm32-unknown-unknown/release/eurasia_web.wasm "$PRIMORDIALSOUP/meta/custom-post.js" "$NSOUT/"
+  cp web/eurasia.mjs web/images.mjs target/wasm32-unknown-unknown/release/eurasia_web.wasm "$PRIMORDIALSOUP/meta/custom-post.js" "$NSOUT/"
   cp web/ide.html "$NSOUT/eurasia-ide.html"
   cp web/viewer.html "$NSOUT/eurasia-viewer.html"
   cp "$NEWSPEAK/deploy-boot.js" "$NSOUT/"

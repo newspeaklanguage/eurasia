@@ -1080,14 +1080,20 @@ impl Vm {
 
     /// The allocation count at which [`Vm::gc_due`] or
     /// [`Vm::checkpoint_due`] can next be true, if nothing else changes.
+    /// Inside a callback only a collection counts: no checkpoint is taken
+    /// there (its safepoints cannot take one), so a pending one must not
+    /// keep a safepoint due, or compiled code would hand every frame back
+    /// to the callback's loop at every call. The outermost callback's end
+    /// makes the safepoint due again (`HostCallbacks::callback`).
     fn next_safepoint(&self) -> u64 {
-        if self.checkpoint_pending {
+        let in_callback = self.callback_depth > 0;
+        if self.checkpoint_pending && !in_callback {
             return 0;
         }
         let gc = self
             .gc_counter
             .saturating_add(self.gc_stress.unwrap_or(self.gc_budget));
-        let checkpoint = if self.checkpoint_every == 0 {
+        let checkpoint = if self.checkpoint_every == 0 || in_callback {
             u64::MAX
         } else {
             self.last_checkpoint.saturating_add(self.checkpoint_every)
@@ -6257,6 +6263,11 @@ impl HostCallbacks for Vm {
         self.callback_depth += 1;
         let outcome = self.run_callback(closure, arguments, host);
         self.callback_depth -= 1;
+        // A checkpoint asked for in the callback (saveImage:) waited for its
+        // end (next_safepoint): the event loop takes it at its next safepoint.
+        if self.callback_depth == 0 && self.checkpoint_due() {
+            self.safepoint_at = 0;
+        }
         if !in_turn {
             self.actors[owner as usize].poked = true;
         }

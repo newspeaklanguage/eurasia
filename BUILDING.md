@@ -68,6 +68,7 @@ the build stamp (BuildInfo). `eurasia --methods IMAGE` and
 | File | What |
 |---|---|
 | `eurasia.mjs`, `eurasia_web.wasm` | the loader and the VM |
+| `images.mjs` | saved images: Save Image keeps the running image in the browser, offered at the next load |
 | `viewer/base.eus` | the document viewer (AmpleforthViewer) |
 | `eurasia-viewer.html` | its page: `eurasia-viewer.html?docName=<document>` shows `<document>.zip` from the same server |
 | `deploy-boot.js` | the boot of every document page, and of `eurasia-viewer.html`, from newspeak |
