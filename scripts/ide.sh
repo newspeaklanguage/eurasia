@@ -6,7 +6,7 @@
 # newspeak/EurasiaBuild.ns generates each one's entry and finds its modules,
 # the packager packages them, genesis makes their images, stamped by
 # BuildInfo), and stages the images, the pages (web/ide.html, web/viewer.html),
-# the VM and the libraries and images psoup's IDE page uses in target/web, to
+# the VM, the libraries (web/libs) and the images in target/web, to
 # be served and opened as ide.html and viewer.html?docName=<document>.
 #
 # Both are built a second time on the Croquet platform (croquet-ide,
@@ -23,8 +23,8 @@
 # (eurasia.mjs, eurasia_web.wasm) and custom-post.js; the libraries and icons
 # these pages load are out/'s own. Set EURASIA_NO_OUT=1 to skip it.
 #
-# Needs what scripts/genesis.sh needs, and the newspeak checkout's out/ for the
-# libraries.
+# Needs what scripts/build.sh needs (BUILDING.md), and newspeak/out/croquet.min.js
+# for the Croquet pages.
 set -eu
 cd "$(dirname "$0")/.."
 EURASIA=$(pwd)
@@ -50,13 +50,12 @@ cp "$NEWSPEAK/out/croquet.min.js" web/croquet.html web/croquet-boot.js "$WEB/"
 cp web/ide.html web/viewer.html web/app.html web/eurasia.mjs target/wasm32-unknown-unknown/release/eurasia_web.wasm "$WEB/"
 # psoup's page helpers (safeDownloadBlob), canonical in primordialsoup.
 cp "$PRIMORDIALSOUP/meta/custom-post.js" "$WEB/"
-cp -R "$NEWSPEAK/out/CodeMirror" "$WEB/"
-cp "$NEWSPEAK/out/jszip.min.js" "$WEB/"
-for v in buffer-6.0.3.bundle.min.js isomorphic-git-1.38.4.umd.min.js lightning-fs-4.6.2.min.js \
-         isomorphic-git-1.38.4-http-web.umd.js diff_match_patch-2019-07.js; do
-  cp "$NEWSPEAK/out/vendor/$v" "$WEB/vendor/"
-done
-cp "$NEWSPEAK"/*.png "$NEWSPEAK"/out/privateImage.png "$NEWSPEAK"/out/protectedImage.png "$NEWSPEAK"/out/publicImage.png "$WEB/"
+# The boot the viewer page uses, canonical in newspeak.
+cp "$NEWSPEAK/deploy-boot.js" "$WEB/"
+# The libraries (web/libs, laid out as served) and the images, all tracked.
+cp -R web/libs/. "$WEB/"
+rm -f "$WEB/README.md"
+cp "$NEWSPEAK"/*.png "$WEB/"
 echo "IDE: serve $WEB and open ide.html; documents: viewer.html?docName=<document>."
 
 if [ "${EURASIA_NO_OUT:-}" != 1 ]; then
@@ -72,5 +71,6 @@ if [ "${EURASIA_NO_OUT:-}" != 1 ]; then
   cp web/eurasia.mjs target/wasm32-unknown-unknown/release/eurasia_web.wasm "$PRIMORDIALSOUP/meta/custom-post.js" "$NSOUT/"
   cp web/ide.html "$NSOUT/eurasia-ide.html"
   cp web/viewer.html "$NSOUT/eurasia-viewer.html"
+  cp "$NEWSPEAK/deploy-boot.js" "$NSOUT/"
   echo "Served from out/: eurasia-ide.html, eurasia-viewer.html?docName=<document>, eurasia-croquet.html?app=viewer|ide&...."
 fi
