@@ -8,7 +8,8 @@
 # timers, must also have waited for one (the non-blocking path). Compiled:
 # the kernel tests with every method compiled must have the same outcomes,
 # and compiled code must not go on after a collection
-# (EurasiaCompiledGCProbe); STRESS=1 adds the kernel tests compiled under GC
+# (EurasiaCompiledGCProbe) nor trap in a callback with a checkpoint pending
+# (EurasiaCallbackSafepointProbe); STRESS=1 adds the kernel tests compiled under GC
 # stress.
 # Run genesis.sh and kernel-tests.sh first. Also copies the build and the base
 # image into target/web/ beside the page, for a browser (web/index.html).
@@ -82,6 +83,21 @@ EURASIA_JIT=1 node web/run-node.mjs "$WASM" "$OUT/gcprobe/base.eus" > "$OUT/gcpr
 cat "$OUT/gcprobe/output.txt"
 grep -qx "compiled code across collections: 0 of 20 rounds failed" "$OUT/gcprobe/output.txt" \
   || { echo "compiled code went on after a collection"; exit 1; }
+
+echo "== compiled code in a callback with a checkpoint pending (EurasiaCallbackSafepointProbe)"
+# Save Image from a DOM event used to trap: see the probe's comment. A host
+# timer's callback asks for a checkpoint and makes three million sends,
+# compiled; it must run to its end.
+mkdir -p "$OUT/cbprobe"
+"$PRIMORDIALSOUP/out/ReleaseX64/primordialsoup" target/kerneltests/EurasiaPackager.vfuel --entry-in-kernel \
+  "$NEWSPEAK/platform/Eurasia/InternalKernel.ns" kernel/natives.tsv "$NEWSPEAK/EurasiaCallbackSafepointProbe.ns" \
+  "$P/Kernel.ns" "$P/platform/PrimordialSoup/Collections.ns" "$NEWSPEAK/platform/Eurasia/Actors.ns" "$NEWSPEAK/platform/Eurasia/Runtime.ns" \
+  "$OUT/cbprobe/genesis.eus" > "$OUT/cbprobe/package.log"
+(cd "$OUT/cbprobe" && "$EURASIA/target/release/eurasia" genesis.eus base.eus > /dev/null)
+EURASIA_JIT=1 node web/run-node.mjs "$WASM" "$OUT/cbprobe/base.eus" > "$OUT/cbprobe/output.txt" 2>&1 || true
+cat "$OUT/cbprobe/output.txt"
+grep -qx "sends in a callback with a checkpoint pending: 3000000 sends, sum 9000003" "$OUT/cbprobe/output.txt" \
+  || { echo "compiled code in a callback with a checkpoint pending did not run to its end"; exit 1; }
 
 echo "== the JS FFI and callbacks: JSTesting and EurasiaHostTesting on wasm"
 # psoup's native VM cannot run these (a failing JS primitive halts it), so

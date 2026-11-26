@@ -4635,6 +4635,17 @@ impl Vm {
             let len = self.stack.len();
             self.stack.truncate(len - 2);
             self.stack.push(v);
+            // The instruction is done: the frame continues at next_ip, as
+            // after any other send. Compiled code that finds a safepoint due
+            // after a call hands the frame to the interpreter's loop at the
+            // frame's instruction pointer; left at an earlier one, the loop
+            // ran the instructions since it again. A safepoint is due here
+            // only if it was due when compiled code was entered, which no
+            // loop allows since a pending checkpoint stopped counting inside
+            // callbacks; before that, every round of a callback did so, a
+            // value more on the operand stack each time, until it overflowed
+            // (newspeak's EurasiaCallbackSafepointProbe).
+            self.frames.last_mut().expect("a frame").ip = next_ip;
             self.jit_regs.ic_kind = 0;
             self.refresh_jit_regs();
             return crate::compiler::DONE;
