@@ -195,18 +195,17 @@ fn invalid_bytecode_is_an_error_not_a_crash() {
 }
 
 #[test]
-fn identity_hash_is_the_allocation_sequence_number() {
+fn only_classes_have_a_hash_number_before_one_is_asked_for() {
     let k = kernel();
     let (heap, _) = k.b.finish();
-    let mut seqs: Vec<u64> = heap.objects().map(|v| heap.seq(v).unwrap()).collect();
-    let sorted = {
-        let mut s = seqs.clone();
-        s.sort_unstable();
-        s
-    };
-    assert_eq!(seqs, sorted);
-    seqs.dedup();
-    assert_eq!(seqs.len(), heap.len());
+    let mut classes = 0;
+    for v in heap.objects() {
+        let numbered = heap.hash_word(v).unwrap() != 0;
+        let class = heap.format(v) == Some(eurasia_core::object::Format::Class);
+        assert_eq!(numbered, class);
+        classes += usize::from(class);
+    }
+    assert!(classes > 0);
     let _ = Value::small_integer(0);
 }
 

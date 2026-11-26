@@ -21,7 +21,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::host::{Host, HostCallbacks, HostError, HostOp, HostValue};
+use crate::host::{Clearing, Host, HostCallbacks, HostError, HostOp, HostValue};
 use crate::interpreter::{Completion, Vm, VmError};
 
 /// How a top-level event ended (an output).
@@ -121,6 +121,9 @@ pub enum Event {
         /// The digest of its bytes.
         digest: u64,
     },
+    /// Input: what the recording VM's collector cleared at a clearing
+    /// point, and when the next scheduled one is.
+    Cleared(Clearing),
 }
 
 impl Event {
@@ -139,6 +142,10 @@ pub struct Log {
     /// The checkpoint policy the embedder set at the start (allocations; 0
     /// none); a replay from the start sets the same.
     pub checkpoint_every: u64,
+    /// The allocations to the first scheduled clearing point, when the
+    /// recording began at a start ([`Vm::clearing_budget`]); a replay from
+    /// the start sets the same.
+    pub clearing_budget: u64,
     /// The events, in order.
     pub events: Vec<Event>,
     /// Checkpoints: snapshot bytes. The first is the image the run started
@@ -255,6 +262,11 @@ impl HostCallbacks for RecordingCallbacks<'_> {
 }
 
 impl Host for Recorder<'_> {
+    fn weak_cleared(&mut self, clearing: &Clearing) {
+        self.log.events.push(Event::Cleared(clearing.clone()));
+        self.inner.weak_cleared(clearing);
+    }
+
     fn print(&mut self, text: &str) {
         self.log.events.push(Event::Print(String::from(text)));
         self.inner.print(text);
@@ -371,6 +383,7 @@ pub fn record_run(
 ) -> Result<Completion, VmError> {
     log.description = String::from(host.description());
     log.blocks = host.blocks();
+    log.clearing_budget = vm.clearing_budget();
     log.events.push(Event::Start(
         args.iter().map(|&a| String::from(a)).collect(),
     ));
@@ -557,6 +570,18 @@ impl<'a> Replayer<'a> {
 }
 
 impl Host for Replayer<'_> {
+    fn weak_clearing(&mut self) -> Option<Clearing> {
+        // After a divergence, nothing: the VM's collector decides, and the
+        // event loop stops the run.
+        self.take(
+            || String::from("a clearing point"),
+            |e| match e {
+                Event::Cleared(clearing) => Some(clearing.clone()),
+                _ => None,
+            },
+        )
+    }
+
     fn print(&mut self, text: &str) {
         if let Some(echo) = self.echo {
             echo(text);
@@ -777,6 +802,9 @@ pub fn replay(
     let mut top_level_events = 0;
     if !continuing && position == 0 {
         vm.set_checkpoint_policy(log.checkpoint_every);
+        if log.clearing_budget != 0 {
+            vm.set_clearing_budget(log.clearing_budget);
+        }
     }
     if continuing {
         top_level_events += 1;
@@ -820,7 +848,7 @@ pub fn replay(
 /// The log file's magic number.
 pub const LOG_MAGIC: [u8; 4] = *b"EURL";
 /// The log format's version.
-pub const LOG_VERSION: u16 = 2;
+pub const LOG_VERSION: u16 = 3;
 
 /// Why a log could not be read.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -934,6 +962,7 @@ impl Log {
         o.str(&self.description);
         o.u8(u8::from(self.blocks));
         o.uv(self.checkpoint_every);
+        o.uv(self.clearing_budget);
         o.uv(self.base);
         o.uv(self.first_checkpoint.into());
         o.uv(self.keep_checkpoints.into());
@@ -1035,6 +1064,15 @@ impl Log {
                     o.uv((*index).into());
                     o.uv(*digest);
                 }
+                Event::Cleared(clearing) => {
+                    o.u8(19);
+                    o.uv(clearing.next);
+                    o.uv(clearing.cleared.len() as u64);
+                    for &(number, index) in &clearing.cleared {
+                        o.uv(number);
+                        o.uv(index.into());
+                    }
+                }
             }
         }
         o.uv(self.checkpoints.len() as u64);
@@ -1052,26 +1090,26 @@ impl Log {
             return Err(LogError(String::from("not a Eurasia log")));
         }
         let version = u16::from_le_bytes(i.take(2)?.try_into().expect("2 bytes"));
-        // Version 1 had no base, first checkpoint or retention: it kept
-        // every event and checkpoint.
-        if version != 1 && version != LOG_VERSION {
+        // Weak clearing is an input since version 3 (Eastasia design,
+        // section 3.2): an older log does not say what was cleared, so it
+        // cannot be replayed.
+        if version != LOG_VERSION {
             return Err(LogError(format!(
-                "log format {version}; this VM reads 1 and {LOG_VERSION}"
+                "log format {version}; this VM reads {LOG_VERSION}. Record again"
             )));
         }
         let mut log = Log {
             description: i.string()?,
             blocks: i.u8()? != 0,
             checkpoint_every: i.uv()?,
+            clearing_budget: i.uv()?,
             ..Log::default()
         };
-        if version >= 2 {
-            log.base = i.uv()?;
-            log.first_checkpoint = u32::try_from(i.uv()?)
-                .map_err(|_| LogError(String::from("a first checkpoint out of range")))?;
-            log.keep_checkpoints = u32::try_from(i.uv()?)
-                .map_err(|_| LogError(String::from("a retention out of range")))?;
-        }
+        log.base = i.uv()?;
+        log.first_checkpoint = u32::try_from(i.uv()?)
+            .map_err(|_| LogError(String::from("a first checkpoint out of range")))?;
+        log.keep_checkpoints = u32::try_from(i.uv()?)
+            .map_err(|_| LogError(String::from("a retention out of range")))?;
         let n = i.uv()?;
         for _ in 0..n {
             let event = match i.u8()? {
@@ -1142,6 +1180,15 @@ impl Log {
                     index: i.u32()?,
                     digest: i.uv()?,
                 },
+                19 => {
+                    let next = i.uv()?;
+                    let k = i.uv()?;
+                    let mut cleared = Vec::new();
+                    for _ in 0..k {
+                        cleared.push((i.uv()?, i.u32()?));
+                    }
+                    Event::Cleared(Clearing { cleared, next })
+                }
                 t => return Err(LogError(format!("unknown event {t}"))),
             };
             log.events.push(event);
@@ -1245,9 +1292,14 @@ mod tests {
             description: String::from("test"),
             blocks: false,
             checkpoint_every: 7,
+            clearing_budget: 1 << 20,
             events: alloc::vec![
                 Event::Start(alloc::vec![String::from("a")]),
                 Event::Monotonic(5),
+                Event::Cleared(Clearing {
+                    cleared: alloc::vec![(5, 0), (1 << 61, crate::host::MOURNED)],
+                    next: 9,
+                }),
                 Event::Utc(-3),
                 Event::Random(alloc::vec![1, 2]),
                 Event::HostOp {

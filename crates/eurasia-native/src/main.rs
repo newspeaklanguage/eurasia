@@ -342,6 +342,9 @@ fn record(args: &[String]) -> Result<ExitCode, ExitCode> {
         return Err(ExitCode::from(2));
     }
     vm.set_checkpoint_policy(every);
+    // Where the clearing points are is in the log, so a recording can be
+    // made under collection stress.
+    vm.set_gc_stress(gc_stress());
     let mut log = Log {
         checkpoint_every: every,
         checkpoints: vec![bytes],

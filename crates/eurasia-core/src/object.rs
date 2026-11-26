@@ -52,8 +52,9 @@ pub const FLAGS: u8 = FROZEN | VALUE | VALUE_CLASS | SHARED | SIMULATION_ROOT;
 /// The fields every object has.
 #[derive(Clone, Debug)]
 pub struct Header {
-    /// The allocation sequence number.
-    pub seq: u64,
+    /// The hash word: 0 for an object with no identity hash yet, else its
+    /// hash number plus one ([`Heap::hash_word`]).
+    pub hash: u64,
     /// The object's class.
     pub class: Value,
     /// Flags: [`FROZEN`].
@@ -305,27 +306,128 @@ pub struct Object {
     pub body: Body,
 }
 
-/// Why the heap refused an operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum HeapError {
-    /// A sequence number did not exceed the previous one.
-    SequenceNotIncreasing {
-        /// The offending sequence number.
-        seq: u64,
-    },
-    /// A sequence number is not below the allocation counter.
-    SequenceBeyondCounter {
-        /// The offending sequence number.
-        seq: u64,
+/// What a hash word says ([`Heap::hash_word`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HashWord {
+    /// The identity hash has not been asked for.
+    None,
+    /// The hash number is a sequence number, from an image older than
+    /// format version 9.
+    Sequence(u64),
+    /// The hash number was the `count`-th that actor `actor` gave out.
+    Fresh {
+        /// The actor.
+        actor: u32,
+        /// Its hash counter at the time.
+        count: u64,
     },
 }
+
+impl HashWord {
+    /// Reads a hash word.
+    pub fn of(word: u64) -> HashWord {
+        match word.checked_sub(1) {
+            None => HashWord::None,
+            Some(n) if n & FRESH_HASH == 0 => HashWord::Sequence(n),
+            Some(n) => HashWord::Fresh {
+                actor: ((n & !FRESH_HASH) >> HASH_ACTOR_SHIFT) as u32,
+                count: n & ((1 << HASH_ACTOR_SHIFT) - 1),
+            },
+        }
+    }
+
+    /// The hash word, or `None` if a number is out of range.
+    pub fn word(self) -> Option<u64> {
+        match self {
+            HashWord::None => Some(0),
+            HashWord::Sequence(n) if n < FRESH_HASH => Some(n + 1),
+            HashWord::Fresh { actor, count }
+                if count < 1 << HASH_ACTOR_SHIFT
+                    && u64::from(actor) < 1 << (61 - HASH_ACTOR_SHIFT) =>
+            {
+                Some((FRESH_HASH | u64::from(actor) << HASH_ACTOR_SHIFT | count) + 1)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Object {
+    /// What the object refers to, in the order of its edge record in the
+    /// snapshot format (section 5): its class, then its fields. The list
+    /// holds the fields' SmallIntegers too. With `strong`, a WeakArray's
+    /// elements and an ephemeron's key are left out.
+    pub fn edges(&self, strong: bool) -> Vec<Value> {
+        let mut e = alloc::vec![self.header.class];
+        match &self.body {
+            Body::Regular(x) | Body::Array(x) => e.extend_from_slice(x),
+            Body::WeakArray(x) => {
+                if !strong {
+                    e.extend_from_slice(x);
+                }
+            }
+            Body::Ephemeron {
+                key,
+                value,
+                finalizer,
+            } => {
+                if !strong {
+                    e.push(*key);
+                }
+                e.extend([*value, *finalizer]);
+            }
+            Body::Method(m) => e.extend([m.literals, m.mixin, m.selector, m.source, m.library]),
+            Body::Mixin(m) => e.extend([
+                m.name,
+                m.methods,
+                m.enclosing_mixin,
+                m.slot_names,
+                m.class_mixin,
+                m.library,
+            ]),
+            Body::Class(b) => {
+                e.extend([b.mixin, b.superclass, b.enclosing_object, b.name, b.library]);
+            }
+            Body::Metaclass(b) => e.extend([
+                b.mixin,
+                b.superclass,
+                b.enclosing_object,
+                b.this_class,
+                b.library,
+            ]),
+            Body::Closure(c) => {
+                e.push(c.defining);
+                e.extend_from_slice(&c.copied);
+            }
+            Body::Activation(a) => {
+                e.extend([a.method, a.receiver, a.closure]);
+                if let Some(d) = &a.detached {
+                    e.extend([d.sender, d.bci, d.temps]);
+                }
+            }
+            Body::FarRef { target, .. } => e.push(*target),
+            Body::Promise(p) => e.extend([p.value, p.owner, p.waiters, p.queue]),
+            Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => {}
+        }
+        e
+    }
+}
+
+/// The bit that marks a hash number given on first request, apart from the
+/// sequence numbers of images older than format version 9, which stay their
+/// objects' hash numbers.
+const FRESH_HASH: u64 = 1 << 61;
+/// Where the actor number sits in a fresh hash number, above the actor's
+/// count.
+const HASH_ACTOR_SHIFT: u32 = 40;
 
 /// The objects of a VM: one arena of words, in allocation order (a moved
 /// object, see [`Heap::reshape`], is the exception), with byte contents in
 /// a byte space and bytecode in a table of codes.
 ///
 /// An object at word offset `o` is `words[o]` its class, `words[o + 1]` its
-/// sequence number (raw), `words[o + 2]` its format, flags, space and size
+/// hash word (raw; 0 until its identity hash is first asked for, see
+/// [`Heap::hash_number`]), `words[o + 2]` its format, flags, space and size
 /// (raw, see [`meta`]), then its contents (EURASIA_ARENA_DESIGN_2026-11-19.md
 /// section 2).
 #[derive(Default, Debug, Clone)]
@@ -335,6 +437,9 @@ pub struct Heap {
     pub(crate) codes: Vec<CodeEntry>,
     pub(crate) count: usize,
     next_seq: u64,
+    /// Each actor's hash counter: how many hash numbers it has given out
+    /// (EASTASIA_DESIGN_2026-11-23.md section 3.1).
+    hash_counts: Vec<u64>,
     /// The nursery (EURASIA_NURSERY_DESIGN_2026-11-19.md): objects from this
     /// word offset on are young; below it, old. Likewise for the byte
     /// space and the code table.
@@ -351,6 +456,8 @@ pub struct Heap {
     /// Something rewrote references wholesale (a commit): the next
     /// collection must be full.
     pub(crate) full_due: bool,
+    /// What the last collection cleared ([`Heap::take_cleared`]).
+    pub(crate) cleared: Vec<(u64, u32)>,
 }
 
 /// An entry of the code table: a method's bytecode, and the compiler's word
@@ -522,6 +629,35 @@ pub(crate) fn content_words(code: Code, size: usize) -> usize {
     }
 }
 
+/// The actor whose counter numbers a weak object made in `space`.
+fn weak_actor(space: Space) -> u32 {
+    match space {
+        Space::Actor(actor) => actor,
+        Space::Program => 0,
+    }
+}
+
+/// The fields of an object of format `code` that are references, in the
+/// order of its edge record in the snapshot format ([`Object::edges`]),
+/// for the formats whose fields are at fixed places. With `strong`, an
+/// ephemeron's key is left out. `detached`: of an Activation, whether it
+/// is.
+fn edge_fields(code: Code, strong: bool, detached: bool) -> &'static [usize] {
+    match code {
+        Code::Method => &[2, 3, 4, 5, 6],
+        Code::Mixin => &[0, 1, 2, 3, 5, 6],
+        Code::Class => &[0, 1, 2, 3, 5],
+        Code::Metaclass => &[0, 1, 2, 4, 5],
+        Code::Ephemeron if strong => &[1, 2],
+        Code::Ephemeron => &[0, 1, 2],
+        Code::Activation if detached => &[1, 2, 3, 5, 6, 7],
+        Code::Activation => &[1, 2, 3],
+        Code::FarRef => &[1],
+        Code::Promise => &[1, 2, 3, 4],
+        _ => &[],
+    }
+}
+
 fn small(n: i64) -> Value {
     Value::small_integer(n).expect("a SmallInteger")
 }
@@ -617,14 +753,16 @@ impl Heap {
         self.count == 0
     }
 
-    /// The allocation counter `n_α`: the next sequence number to allocate.
+    /// The allocation counter `n_α`: how many objects have been allocated.
+    /// It is the clock of safepoints, collections and checkpoints; since
+    /// format version 9 an object does not carry its number.
     pub fn allocation_counter(&self) -> u64 {
         self.next_seq
     }
 
     /// After compiled code allocated `allocated` objects itself (in the
-    /// arena, whose length the host adopted), taking sequence numbers up to
-    /// `next_seq`.
+    /// arena, whose length the host adopted), moving the allocation counter
+    /// to `next_seq`.
     pub(crate) fn adopt_allocation(&mut self, next_seq: u64, allocated: usize) {
         self.next_seq = next_seq;
         self.count += allocated;
@@ -635,16 +773,105 @@ impl Heap {
         self.words.len()
     }
 
-    /// Allocates an object with the next sequence number. Strings, floats
-    /// and large integers are values from allocation.
+    /// Allocates an object. Strings, floats and large integers are values
+    /// from allocation. A class takes a hash number at once, from its
+    /// actor's counter, so that classes can be listed in the order they
+    /// were made (section 3.3 of the Eastasia design).
     pub fn allocate(&mut self, class: Value, space: Space, body: Body) -> Value {
-        let seq = self.next_seq;
         self.next_seq += 1;
         let flags = match body {
             Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => VALUE,
             _ => 0,
         };
-        self.push(seq, class, flags, space, body)
+        let hash = match (&body, space) {
+            (Body::Class(_), Space::Actor(actor)) => self.fresh_hash_word(actor),
+            // A weak object is numbered too: the log of what was cleared
+            // names it by its number (section 3.2 of the design).
+            (Body::WeakArray(_) | Body::Ephemeron { .. }, _) => {
+                self.fresh_hash_word(weak_actor(space))
+            }
+            _ => 0,
+        };
+        self.push(hash, class, flags, space, body)
+    }
+
+    /// What collections cleared since this was last asked: for each
+    /// element of a WeakArray that became nil, the array's hash number and
+    /// the element's index; for each Ephemeron mourned, its hash number
+    /// and [`crate::host::MOURNED`].
+    pub fn take_cleared(&mut self) -> Vec<(u64, u32)> {
+        core::mem::take(&mut self.cleared)
+    }
+
+    /// Numbers the WeakArrays and Ephemerons that have no hash number (a
+    /// loaded image's, written before they were numbered when made), in
+    /// the order they lie in.
+    pub fn number_weak_objects(&mut self) {
+        for v in self.objects() {
+            let o = self.start(v).expect("an object");
+            if matches!(self.code_at(o), Code::WeakArray | Code::Ephemeron)
+                && self.words[o + 1].to_bits() == 0
+            {
+                let space = self.space(v).expect("an object");
+                self.words[o + 1] = Value::from_bits(self.fresh_hash_word(weak_actor(space)));
+            }
+        }
+    }
+
+    /// The next hash word of `actor`: a fresh hash number, plus one.
+    fn fresh_hash_word(&mut self, actor: u32) -> u64 {
+        let a = actor as usize;
+        if self.hash_counts.len() <= a {
+            self.hash_counts.resize(a + 1, 0);
+        }
+        let count = self.hash_counts[a];
+        assert!(
+            count < 1 << HASH_ACTOR_SHIFT && u64::from(actor) < 1 << (61 - HASH_ACTOR_SHIFT),
+            "hash numbers exhausted"
+        );
+        self.hash_counts[a] = count + 1;
+        (FRESH_HASH | u64::from(actor) << HASH_ACTOR_SHIFT | count) + 1
+    }
+
+    /// The hash word of object `v`: 0 if its identity hash has never been
+    /// asked for, else its hash number plus one.
+    pub fn hash_word(&self, v: Value) -> Option<u64> {
+        Some(self.words[self.start(v)? + 1].to_bits())
+    }
+
+    /// The hash number of object `v`, giving it one from `actor`'s counter
+    /// if it has none: the first request fixes it (eq:kernel-identity-hash
+    /// as revised; Eastasia design, section 3.1). The order of first
+    /// requests is the program's, so the number does not depend on what the
+    /// VM allocates behind the program's back, or elides.
+    pub fn hash_number(&mut self, v: Value, actor: u32) -> Option<u64> {
+        let o = self.start(v)?;
+        let mut word = self.words[o + 1].to_bits();
+        if word == 0 {
+            word = self.fresh_hash_word(actor);
+            self.words[o + 1] = Value::from_bits(word);
+        }
+        Some(word - 1)
+    }
+
+    /// The hash number a class was given when it was made, by which classes
+    /// are ordered; `u64::MAX` for one without (from an image whose writer
+    /// gave it none).
+    pub fn creation_number(&self, v: Value) -> u64 {
+        match self.hash_word(v) {
+            Some(w) if w != 0 => w - 1,
+            _ => u64::MAX,
+        }
+    }
+
+    /// Each actor's hash counter, by actor number.
+    pub fn hash_counters(&self) -> &[u64] {
+        &self.hash_counts
+    }
+
+    /// Sets the hash counters (a loaded image's).
+    pub fn set_hash_counters(&mut self, counters: Vec<u64>) {
+        self.hash_counts = counters;
     }
 
     /// Whether `v` is a value by its flag (immediates are).
@@ -655,32 +882,23 @@ impl Heap {
         }
     }
 
-    /// Adds an object read from a snapshot, with its own sequence number,
-    /// which must exceed every one before it.
+    /// Adds an object read from a snapshot, with its own hash word. Objects
+    /// lie in the arena in the order they are added.
     pub fn insert_loaded(
         &mut self,
-        seq: u64,
+        hash: u64,
         class: Value,
         flags: u8,
         space: Space,
         body: Body,
-    ) -> Result<Value, HeapError> {
-        if self.count > 0 && seq < self.next_seq {
-            return Err(HeapError::SequenceNotIncreasing { seq });
-        }
-        self.next_seq = seq + 1;
-        Ok(self.push(seq, class, flags, space, body))
+    ) -> Value {
+        self.next_seq += 1;
+        self.push(hash, class, flags, space, body)
     }
 
-    /// Sets the allocation counter, which must exceed every sequence number.
-    pub fn set_allocation_counter(&mut self, counter: u64) -> Result<(), HeapError> {
-        if self.count > 0 && counter < self.next_seq {
-            return Err(HeapError::SequenceBeyondCounter {
-                seq: self.next_seq - 1,
-            });
-        }
+    /// Sets the allocation counter (a loaded image's).
+    pub fn set_allocation_counter(&mut self, counter: u64) {
         self.next_seq = counter;
-        Ok(())
     }
 
     /// The words an object described by `body` takes in the arena.
@@ -700,13 +918,13 @@ impl Heap {
             }
     }
 
-    fn push(&mut self, seq: u64, class: Value, flags: u8, space: Space, body: Body) -> Value {
+    fn push(&mut self, hash: u64, class: Value, flags: u8, space: Space, body: Body) -> Value {
         let o = self.words.len();
         let v = Value::reference(o as u64).expect("arena offset in the reference range");
         // The header, with the size patched in once the contents are known;
         // the contents go straight into the arena.
         self.words.push(class);
-        self.words.push(Value::from_bits(seq));
+        self.words.push(Value::from_bits(hash));
         self.words.push(Value::from_bits(0));
         let z = small(0);
         let (code, size) = match body {
@@ -842,11 +1060,10 @@ impl Heap {
         num_args: u32,
         copied: &[Value],
     ) -> Value {
-        let seq = self.next_seq;
         self.next_seq += 1;
         let o = self.words.len();
         self.words.push(class);
-        self.words.push(Value::from_bits(seq));
+        self.words.push(Value::from_bits(0));
         self.words
             .push(meta(Code::Closure, 0, space, C_COPIED + copied.len()));
         self.words.extend_from_slice(&[
@@ -895,7 +1112,12 @@ impl Heap {
         fill: Value,
     ) -> Value {
         let code = if weak { Code::WeakArray } else { Code::Array };
-        self.allocate_filled(class, space, code, n, |w| w.resize(w.len() + n, fill))
+        let v = self.allocate_filled(class, space, code, n, |w| w.resize(w.len() + n, fill));
+        if weak {
+            let o = self.start(v).expect("just allocated");
+            self.words[o + 1] = Value::from_bits(self.fresh_hash_word(weak_actor(space)));
+        }
+        v
     }
 
     /// Allocates a Regular object of `n` slots, all `fill` (`basicNew`).
@@ -913,11 +1135,10 @@ impl Heap {
         n: usize,
         fill: impl FnOnce(&mut Vec<Value>),
     ) -> Value {
-        let seq = self.next_seq;
         self.next_seq += 1;
         let o = self.words.len();
         self.words.push(class);
-        self.words.push(Value::from_bits(seq));
+        self.words.push(Value::from_bits(0));
         self.words.push(meta(code, 0, space, n));
         fill(&mut self.words);
         self.count += 1;
@@ -1018,6 +1239,87 @@ impl Heap {
         all.into_iter()
     }
 
+    /// The objects `roots` reach, in the **canonical order**: the order in
+    /// which a depth-first walk first meets them, the roots in the order
+    /// given and each object's references in the order of its edge record
+    /// in the snapshot format, its class first ([`Object::edges`]). The
+    /// object graph alone determines it, so every VM computes the same
+    /// order (Eastasia design, sections 3.3 and 3.4). With `strong`, the
+    /// walk does not follow a WeakArray's elements or an ephemeron's key.
+    pub fn canonical_order(&self, roots: &[Value], strong: bool) -> Vec<Value> {
+        let mut seen = alloc::vec![0u64; self.words.len().div_ceil(64)];
+        let mut order = Vec::new();
+        // Preorder: the first of an object's references is on top.
+        let mut work: Vec<Value> = roots.iter().rev().copied().collect();
+        while let Some(v) = work.pop() {
+            let Some(o) = self.start(v) else { continue };
+            if seen[o / 64] & (1 << (o % 64)) != 0 {
+                continue;
+            }
+            seen[o / 64] |= 1 << (o % 64);
+            order.push(v);
+            match self.code_at(o) {
+                // The common shapes, straight from the arena.
+                Code::Regular | Code::Array => {
+                    work.extend(
+                        self.contents(o)
+                            .iter()
+                            .rev()
+                            .filter(|x| !x.is_small_integer()),
+                    );
+                    work.push(self.words[o]);
+                }
+                // Bytes refer to their class alone.
+                Code::Bytes
+                | Code::String
+                | Code::Float
+                | Code::LargePositive
+                | Code::LargeNegative => work.push(self.words[o]),
+                // A closure: its class, what defined it, what it copied.
+                Code::Closure => {
+                    let c = self.contents(o);
+                    work.extend(c[C_COPIED..].iter().rev().filter(|x| !x.is_small_integer()));
+                    work.push(c[0]);
+                    work.push(self.words[o]);
+                }
+                // A WeakArray: its elements only in the walk that
+                // follows weak references.
+                Code::WeakArray => {
+                    if !strong {
+                        work.extend(
+                            self.contents(o)
+                                .iter()
+                                .rev()
+                                .filter(|x| !x.is_small_integer()),
+                        );
+                    }
+                    work.push(self.words[o]);
+                }
+                code => {
+                    let c = self.contents(o);
+                    let detached = code == Code::Activation && c[A_DETACHED] == small(1);
+                    debug_assert_eq!(
+                        edge_fields(code, strong, detached)
+                            .iter()
+                            .map(|&i| c[i])
+                            .collect::<Vec<_>>(),
+                        self.object(v).expect("an object").edges(strong)[1..],
+                        "the edges of a {code:?}"
+                    );
+                    work.extend(
+                        edge_fields(code, strong, detached)
+                            .iter()
+                            .rev()
+                            .map(|&i| c[i])
+                            .filter(|x| !x.is_small_integer()),
+                    );
+                    work.push(self.words[o]);
+                }
+            }
+        }
+        order
+    }
+
     /// A description of object `v` (the snapshot writer's, and tests').
     pub fn object(&self, v: Value) -> Option<Object> {
         let o = self.start(v)?;
@@ -1098,7 +1400,7 @@ impl Heap {
         };
         Some(Object {
             header: Header {
-                seq: self.words[o + 1].to_bits(),
+                hash: self.words[o + 1].to_bits(),
                 class: self.words[o],
                 flags: meta_flags(m),
                 space: meta_space(m),
@@ -1199,17 +1501,10 @@ impl Heap {
         Some(meta_space(self.words[self.start(v)? + 2]))
     }
 
-    /// The allocation sequence number of object `v`.
-    pub fn seq(&self, v: Value) -> Option<u64> {
-        Some(self.words[self.start(v)? + 1].to_bits())
-    }
-
-    /// Exchanges the sequence numbers, and so the identity hashes, of
-    /// objects `a` and `b` (`vm commit:`: a new program object takes the
-    /// identity of the old one it replaces). Sequence numbers stay unique;
-    /// arena order need not follow them (a reshaped object that moves keeps
-    /// its own), and a snapshot sorts by them.
-    pub(crate) fn exchange_seqs(&mut self, a: Value, b: Value) {
+    /// Exchanges the hash words, and so the identity hashes, of objects `a`
+    /// and `b` (`vm commit:`: a new program object takes the identity of
+    /// the old one it replaces).
+    pub(crate) fn exchange_hashes(&mut self, a: Value, b: Value) {
         let (Some(i), Some(j)) = (self.start(a), self.start(b)) else {
             return;
         };
@@ -1700,7 +1995,7 @@ impl Heap {
     }
 
     /// Gives Regular object `v` class `class` and these slots (commit's
-    /// reshape), keeping its sequence number, flags and space. With as many
+    /// reshape), keeping its hash word, flags and space. With as many
     /// slots as before, it stays where it is; otherwise it moves to the end
     /// of the arena, its old place becomes filler, and the answer is where
     /// it is now: the caller forwards every reference to it.
@@ -1713,13 +2008,13 @@ impl Heap {
             self.contents_mut(o).copy_from_slice(&slots);
             return v;
         }
-        let seq = self.words[o + 1];
+        let hash = self.words[o + 1];
         let (flags, space) = (meta_flags(m), meta_space(m));
         self.words[o + 2] = meta(Code::Filler, 0, Space::Actor(0), meta_size(m));
         let n = self.words.len();
         let moved = Value::reference(n as u64).expect("in range");
         self.words.push(class);
-        self.words.push(seq);
+        self.words.push(hash);
         self.words
             .push(meta(Code::Regular, flags, space, slots.len()));
         self.words.extend(slots);
@@ -1974,35 +2269,56 @@ mod tests {
     }
 
     #[test]
-    fn allocation_assigns_increasing_sequence_numbers() {
+    fn an_object_has_no_hash_number_until_one_is_asked_for() {
         let mut h = Heap::new();
         let a = h.allocate(nil(), Space::Actor(0), Body::Regular(Vec::new()));
         let b = h.allocate(nil(), Space::Actor(0), Body::Bytes(Vec::new()));
-        assert_eq!(h.seq(a).unwrap(), 0);
-        assert_eq!(h.seq(b).unwrap(), 1);
         assert_eq!(h.allocation_counter(), 2);
+        assert_eq!((h.hash_word(a), h.hash_word(b)), (Some(0), Some(0)));
+        // The order of first requests, not of allocation, numbers them, and
+        // each actor counts for itself.
+        let nb = h.hash_number(b, 0).unwrap();
+        let na = h.hash_number(a, 0).unwrap();
+        assert_eq!(na, nb + 1);
+        assert_eq!(h.hash_number(b, 2), Some(nb));
+        let c = h.allocate(nil(), Space::Actor(2), Body::Regular(Vec::new()));
+        let nc = h.hash_number(c, 2).unwrap();
+        assert_ne!(nc, nb);
+        assert_eq!(h.hash_counters(), &[2, 0, 1]);
+        assert_eq!(h.allocation_counter(), 3);
     }
 
     #[test]
-    fn loaded_objects_keep_their_sequence_numbers_and_gaps() {
+    fn a_class_is_numbered_when_it_is_made() {
         let mut h = Heap::new();
-        let a = h
-            .insert_loaded(5, nil(), 0, Space::Program, Body::Regular(Vec::new()))
-            .unwrap();
-        let b = h
-            .insert_loaded(9, nil(), FROZEN, Space::Program, Body::Regular(Vec::new()))
-            .unwrap();
-        assert_eq!(h.seq(a).unwrap(), 5);
+        let behavior = || Behavior {
+            mixin: nil(),
+            superclass: nil(),
+            enclosing_object: nil(),
+            name: nil(),
+            this_class: nil(),
+            library: nil(),
+        };
+        let a = h.allocate(nil(), Space::Actor(0), Body::Class(behavior()));
+        let x = h.allocate(nil(), Space::Actor(0), Body::Regular(Vec::new()));
+        h.hash_number(x, 0);
+        let b = h.allocate(nil(), Space::Actor(0), Body::Class(behavior()));
+        assert!(h.creation_number(a) < h.creation_number(b));
+        assert_eq!(h.hash_counters(), &[3]);
+    }
+
+    #[test]
+    fn loaded_objects_keep_their_hash_words() {
+        let mut h = Heap::new();
+        let a = h.insert_loaded(6, nil(), 0, Space::Program, Body::Regular(Vec::new()));
+        let b = h.insert_loaded(0, nil(), FROZEN, Space::Program, Body::Regular(Vec::new()));
+        assert_eq!(h.hash_word(a), Some(6));
+        assert_eq!(h.hash_number(a, 0), Some(5));
+        assert_eq!(h.hash_word(b), Some(0));
         assert_eq!(h.flags(b), FROZEN);
-        assert_eq!(
-            h.insert_loaded(9, nil(), 0, Space::Program, Body::Regular(Vec::new()))
-                .unwrap_err(),
-            HeapError::SequenceNotIncreasing { seq: 9 }
-        );
-        h.set_allocation_counter(20).unwrap();
-        let c = h.allocate(nil(), Space::Actor(0), Body::Regular(Vec::new()));
-        assert_eq!(h.seq(c).unwrap(), 20);
-        assert!(h.set_allocation_counter(20).is_err());
+        h.set_allocation_counter(20);
+        h.allocate(nil(), Space::Actor(0), Body::Regular(Vec::new()));
+        assert_eq!(h.allocation_counter(), 21);
     }
 
     #[test]
@@ -2013,13 +2329,13 @@ mod tests {
         let a = h.allocate(nil(), Space::Actor(3), Body::Regular(alloc::vec![one]));
         h.add_flags(a, FROZEN);
         let after = h.allocate(nil(), Space::Actor(0), Body::Regular(alloc::vec![a]));
-        let seq = h.seq(a);
+        let seq = h.hash_number(a, 0);
         // Same size: in place.
         assert_eq!(h.reshape(a, n, alloc::vec![one]), a);
-        // Larger: moved, with the same sequence number, flags and space.
+        // Larger: moved, with the same hash number, flags and space.
         let moved = h.reshape(a, n, alloc::vec![one, one, one]);
         assert_ne!(moved, a);
-        assert_eq!(h.seq(moved), seq);
+        assert_eq!(h.hash_number(moved, 0), seq);
         assert_eq!(h.flags(moved), FROZEN);
         assert_eq!(h.space(moved), Some(Space::Actor(3)));
         assert_eq!(h.regular_slots(moved).unwrap().len(), 3);
@@ -2032,7 +2348,7 @@ mod tests {
         assert_eq!((stats.before, stats.after), (3, 3));
         let after = fwd.forward(after);
         let moved = h.regular_slots(after).unwrap()[0];
-        assert_eq!(h.seq(moved), seq);
+        assert_eq!(h.hash_number(moved, 0), seq);
         assert_eq!(h.regular_slots(moved).unwrap(), &[one, one, one]);
     }
 

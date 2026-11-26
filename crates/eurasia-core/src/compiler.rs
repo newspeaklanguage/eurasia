@@ -154,9 +154,8 @@ pub struct Regs {
     pub words_len: u32,
     /// See `words_len`.
     pub words_cap: u32,
-    /// The next object sequence number (the allocation counter), and the
-    /// count at which a safepoint is due: compiled code allocates only
-    /// below it, and takes the numbers here.
+    /// The allocation counter, and the count at which a safepoint is due:
+    /// compiled code allocates only below it, and counts here.
     pub seq: u64,
     /// See `seq`.
     pub safepoint_at: u64,
@@ -2090,7 +2089,8 @@ impl Func {
         self.set_reg32(R_WORDS_LEN, |f| {
             f.get(L_INDEX).get(L_R).add();
         });
-        self.get(L_ADDR).reg64(R_SEQ).st64(8);
+        // no hash yet: the hash word is 0 (the allocation still counts)
+        self.get(L_ADDR).i64c(0).st64(8);
         self.set_reg64(R_SEQ, |f| {
             f.reg64(R_SEQ).i64c(1).op(0x7c);
         });

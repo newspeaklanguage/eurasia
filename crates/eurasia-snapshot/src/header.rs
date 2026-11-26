@@ -3,6 +3,7 @@
 
 //! The snapshot header (format section 2).
 
+use alloc::vec::Vec;
 use core::fmt;
 
 use eurasia_core::{BYTECODE_VERSION, KERNEL_VERSION};
@@ -12,7 +13,10 @@ use crate::encoding::{DecodeError, Reader, Writer};
 /// The four magic bytes, `EURA`.
 pub const MAGIC: [u8; 4] = *b"EURA";
 /// The version of `docs/SNAPSHOT_FORMAT.md` this crate implements.
-pub const FORMAT_VERSION: u16 = 8;
+pub const FORMAT_VERSION: u16 = 9;
+/// The oldest version this crate still reads: objects carry sequence
+/// numbers, which become their hash numbers.
+pub const OLDEST_FORMAT_VERSION: u16 = 8;
 /// The word size of every snapshot, on every target.
 pub const WORD_SIZE: u8 = 64;
 
@@ -29,8 +33,10 @@ pub struct Header {
     pub word_size: u8,
     /// Reserved flags; 0.
     pub flags: u8,
-    /// The allocation counter `n_α`: the next sequence number to allocate.
+    /// The allocation counter `n_α`.
     pub allocation_counter: u64,
+    /// Each actor's hash counter, by actor number (none before version 9).
+    pub hash_counters: Vec<u64>,
     /// The number of nodes in the file.
     pub node_count: u64,
     /// The number of sections.
@@ -84,7 +90,12 @@ impl fmt::Display for HeaderError {
 
 impl Header {
     /// A header for this VM's versions.
-    pub fn current(allocation_counter: u64, node_count: u64, section_count: u64) -> Header {
+    pub fn current(
+        allocation_counter: u64,
+        hash_counters: Vec<u64>,
+        node_count: u64,
+        section_count: u64,
+    ) -> Header {
         Header {
             format_version: FORMAT_VERSION,
             kernel_version: KERNEL_VERSION,
@@ -92,6 +103,7 @@ impl Header {
             word_size: WORD_SIZE,
             flags: 0,
             allocation_counter,
+            hash_counters,
             node_count,
             section_count,
         }
@@ -106,6 +118,10 @@ impl Header {
         w.u8(self.word_size);
         w.u8(self.flags);
         w.uv(self.allocation_counter);
+        if self.format_version >= 9 {
+            w.uv(self.hash_counters.len() as u64);
+            self.hash_counters.iter().for_each(|&n| w.uv(n));
+        }
         w.uv(self.node_count);
         w.uv(self.section_count);
     }
@@ -119,13 +135,26 @@ impl Header {
         if r.bytes(4)? != MAGIC {
             return Err(HeaderError::BadMagic);
         }
+        let format_version = r.u16()?;
+        let kernel_version = r.u16()?;
+        let bytecode_version = r.u16()?;
+        let word_size = r.u8()?;
+        let flags = r.u8()?;
+        let allocation_counter = r.uv()?;
+        let mut hash_counters = Vec::new();
+        if format_version >= 9 {
+            for _ in 0..r.uv()? {
+                hash_counters.push(r.uv()?);
+            }
+        }
         let header = Header {
-            format_version: r.u16()?,
-            kernel_version: r.u16()?,
-            bytecode_version: r.u16()?,
-            word_size: r.u8()?,
-            flags: r.u8()?,
-            allocation_counter: r.uv()?,
+            format_version,
+            kernel_version,
+            bytecode_version,
+            word_size,
+            flags,
+            allocation_counter,
+            hash_counters,
             node_count: r.uv()?,
             section_count: r.uv()?,
         };
@@ -148,7 +177,10 @@ impl Header {
             ("word size", header.word_size.into(), WORD_SIZE.into()),
         ];
         for (field, snapshot, vm) in checks {
-            if snapshot != vm {
+            // An older format version this crate still reads is no mismatch.
+            let older = field == "format version"
+                && (u64::from(OLDEST_FORMAT_VERSION)..vm).contains(&snapshot);
+            if snapshot != vm && !older {
                 return Err(HeaderError::Mismatch {
                     field,
                     snapshot,
@@ -166,7 +198,6 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
 
     fn bytes_of(h: &Header) -> Vec<u8> {
         let mut w = Writer::new();
@@ -176,7 +207,7 @@ mod tests {
 
     #[test]
     fn header_round_trips() {
-        let h = Header::current(1234, 1000, 3);
+        let h = Header::current(1234, alloc::vec![7, 0, 2], 1000, 3);
         let bytes = bytes_of(&h);
         assert_eq!(&bytes[..4], b"EURA");
         let mut r = Reader::new(&bytes);
@@ -187,13 +218,13 @@ mod tests {
     #[test]
     fn interpreter_line_is_skipped() {
         let mut bytes = b"#!/usr/bin/env eurasia\n".to_vec();
-        bytes.extend(bytes_of(&Header::current(1, 0, 1)));
+        bytes.extend(bytes_of(&Header::current(1, Vec::new(), 0, 1)));
         assert!(Header::read(&mut Reader::new(&bytes)).is_ok());
     }
 
     #[test]
     fn bad_magic_is_refused() {
-        let mut bytes = bytes_of(&Header::current(1, 0, 1));
+        let mut bytes = bytes_of(&Header::current(1, Vec::new(), 0, 1));
         bytes[0] = b'X';
         assert_eq!(
             Header::read(&mut Reader::new(&bytes)),
@@ -203,7 +234,7 @@ mod tests {
 
     #[test]
     fn a_newer_kernel_is_refused_by_name() {
-        let mut h = Header::current(1, 0, 1);
+        let mut h = Header::current(1, Vec::new(), 0, 1);
         h.kernel_version = KERNEL_VERSION + 1;
         let err = Header::read(&mut Reader::new(&bytes_of(&h))).unwrap_err();
         assert_eq!(
@@ -225,8 +256,25 @@ mod tests {
     }
 
     #[test]
+    fn version_8_is_read_and_older_or_newer_ones_refused() {
+        let mut h = Header::current(5, Vec::new(), 0, 1);
+        h.format_version = 8;
+        assert_eq!(Header::read(&mut Reader::new(&bytes_of(&h))), Ok(h.clone()));
+        for v in [7, FORMAT_VERSION + 1] {
+            h.format_version = v;
+            assert!(matches!(
+                Header::read(&mut Reader::new(&bytes_of(&h))),
+                Err(HeaderError::Mismatch {
+                    field: "format version",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn a_32_bit_snapshot_is_refused() {
-        let mut h = Header::current(1, 0, 1);
+        let mut h = Header::current(1, Vec::new(), 0, 1);
         h.word_size = 32;
         assert!(matches!(
             Header::read(&mut Reader::new(&bytes_of(&h))),
@@ -239,7 +287,7 @@ mod tests {
 
     #[test]
     fn truncated_header_is_a_decode_error() {
-        let bytes = bytes_of(&Header::current(1, 0, 1));
+        let bytes = bytes_of(&Header::current(1, Vec::new(), 0, 1));
         assert!(matches!(
             Header::read(&mut Reader::new(&bytes[..7])),
             Err(HeaderError::Decode(DecodeError::UnexpectedEnd { .. }))

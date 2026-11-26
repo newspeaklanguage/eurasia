@@ -745,6 +745,22 @@ impl Vm {
     /// at once (implementation plan, M3). `None` is normal scheduling.
     pub fn set_gc_stress(&mut self, interval: Option<u64>) {
         self.gc_stress = interval.map(|n| n.max(1));
+        if let Some(n) = self.gc_stress {
+            self.gc_budget = n;
+        }
+        self.safepoint_at = 0;
+    }
+
+    /// The allocations from the last clearing point to the next scheduled
+    /// one (Eastasia design, section 3.2).
+    pub fn clearing_budget(&self) -> u64 {
+        self.gc_budget
+    }
+
+    /// Sets [`Vm::clearing_budget`]: a replay from a log's start sets what
+    /// the recording began with.
+    pub fn set_clearing_budget(&mut self, allocations: u64) {
+        self.gc_budget = allocations.max(1);
         self.safepoint_at = 0;
     }
 
@@ -755,7 +771,7 @@ impl Vm {
 
     fn gc_due(&self) -> bool {
         let allocated = self.heap.allocation_counter() - self.gc_counter;
-        allocated >= self.gc_stress.unwrap_or(self.gc_budget)
+        allocated >= self.gc_budget
     }
 
     /// A full collection at a safepoint. The roots are the roles, the
@@ -763,21 +779,111 @@ impl Vm {
     /// reference the VM holds is rewritten. The next scheduled collection
     /// comes after as many allocations as there are live objects (at least
     /// [`MIN_GC_BUDGET`]), so the heap stays within about twice its live size.
+    ///
+    /// This is the embedder's collection: it clears weak references and
+    /// tells no host, so a recorded run must not use it. The program's
+    /// collections are clearing points ([`Vm::clearing_point`]).
     pub fn collect_garbage(&mut self) -> gc::Statistics {
-        self.collect(Collection::Full)
+        let statistics = self.collect(Collection::Full);
+        self.heap.take_cleared();
+        self.clearing_point_passed(statistics);
+        statistics
+    }
+
+    /// The clearing clock after a clearing point at which the VM's own
+    /// collector decided: the next scheduled one comes after as many
+    /// allocations as the VM likes (here: its stress interval, else as
+    /// many as there are objects, [`MIN_GC_BUDGET`] at least). Only a
+    /// clearing point moves the clock: a checkpoint's collection, or any
+    /// other the VM makes for itself, does not.
+    fn clearing_point_passed(&mut self, statistics: gc::Statistics) {
+        self.gc_counter = self.heap.allocation_counter();
+        self.gc_budget = self
+            .gc_stress
+            .unwrap_or(MIN_GC_BUDGET.max(statistics.after as u64));
+        self.safepoint_at = 0;
+    }
+
+    /// A **clearing point** (Eastasia design, section 3.2): the only place
+    /// weak references clear and ephemerons are mourned. If the host says
+    /// what to clear (a replay), that is cleared, and the collection that
+    /// follows clears nothing more. Otherwise the collector decides (a
+    /// full collection with `full`, else a minor one), and the host is
+    /// told what it cleared (a recording logs it). Either way the host
+    /// and the VM agree on when the next scheduled clearing point is.
+    fn clearing_point(&mut self, full: bool, host: &mut dyn Host) -> gc::Statistics {
+        match host.weak_clearing() {
+            Some(clearing) => {
+                self.apply_clearing(&clearing.cleared);
+                let statistics = self.collect(Collection::KeepingWeak);
+                self.gc_counter = self.heap.allocation_counter();
+                self.gc_budget = clearing.next.max(1);
+                self.safepoint_at = 0;
+                statistics
+            }
+            None => {
+                let statistics = self.collect(if full {
+                    Collection::Full
+                } else {
+                    Collection::Minor
+                });
+                self.clearing_point_passed(statistics);
+                host.weak_cleared(&crate::host::Clearing {
+                    cleared: self.heap.take_cleared(),
+                    next: self.gc_budget,
+                });
+                statistics
+            }
+        }
+    }
+
+    /// Clears what a log says was cleared: elements of WeakArrays, and
+    /// Ephemerons, named by their hash numbers ([`crate::host::Clearing`]).
+    fn apply_clearing(&mut self, cleared: &[(u64, u32)]) {
+        if cleared.is_empty() {
+            return;
+        }
+        let nil = self.nil();
+        let mut wanted: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        for &(number, index) in cleared {
+            wanted.entry(number).or_default().push(index);
+        }
+        for v in self.heap.objects() {
+            if !matches!(
+                self.heap.format(v),
+                Some(Format::WeakArray | Format::Ephemeron)
+            ) {
+                continue;
+            }
+            let Some(number) = self.heap.hash_word(v).and_then(|w| w.checked_sub(1)) else {
+                continue;
+            };
+            let Some(indices) = wanted.get(&number) else {
+                continue;
+            };
+            for &index in indices {
+                if index == crate::host::MOURNED {
+                    for i in 0..3 {
+                        self.heap.set_ephemeron_field(v, i, nil);
+                    }
+                } else if let Some(e) = self
+                    .heap
+                    .fields_mut(v)
+                    .and_then(|f| f.get_mut(index as usize))
+                {
+                    *e = nil;
+                }
+            }
+        }
     }
 
     /// A collection the allocation budget schedules: minor, unless a full
     /// one is due (EURASIA_NURSERY_DESIGN_2026-11-19.md section 2). Under
     /// stress, every fourth is full, so that both kinds run.
-    fn scheduled_collection(&mut self) -> gc::Statistics {
+    fn scheduled_collection(&mut self, host: &mut dyn Host) -> gc::Statistics {
         let full = self.heap.full_collection_due()
             || (self.gc_stress.is_some() && self.collections % 4 == 3);
-        self.collect(if full {
-            Collection::Full
-        } else {
-            Collection::Minor
-        })
+        self.clearing_point(full, host)
     }
 
     fn collect(&mut self, kind: Collection) -> gc::Statistics {
@@ -818,8 +924,6 @@ impl Vm {
             self.pinned_codes.clear();
         }
         self.flush_lookup_cache();
-        self.gc_counter = self.heap.allocation_counter();
-        self.gc_budget = MIN_GC_BUDGET.max(statistics.after as u64);
         self.safepoint_at = 0;
         self.collections += 1;
         statistics
@@ -922,6 +1026,8 @@ impl Vm {
 
     /// Every value the VM holds outside the heap: the roots of a collection.
     fn roots(&self) -> Vec<Value> {
+        // The order is that of the canonical walk (`allInstancesOf:`): the
+        // roles, then the machine state as a checkpoint writes it.
         let mut roots: Vec<Value> = self.roles.pairs().map(|(_, v)| v).collect();
         roots.extend(self.stack.iter().copied());
         for f in &self.frames {
@@ -929,12 +1035,12 @@ impl Vm {
             roots.extend(f.activation);
             roots.extend(f.closure);
         }
-        roots.extend(self.symbols.values().copied());
         for a in &self.actors {
             roots.push(a.message_loop);
             roots.extend(a.mailbox.iter().copied());
         }
         roots.extend(self.expats.iter().map(|&(c, _)| c));
+        roots.extend(self.symbols.values().copied());
         roots
     }
 
@@ -1084,9 +1190,7 @@ impl Vm {
         if self.checkpoint_pending {
             return 0;
         }
-        let gc = self
-            .gc_counter
-            .saturating_add(self.gc_stress.unwrap_or(self.gc_budget));
+        let gc = self.gc_counter.saturating_add(self.gc_budget);
         let checkpoint = if self.checkpoint_every == 0 {
             u64::MAX
         } else {
@@ -1379,7 +1483,7 @@ impl Vm {
             // host operation is under way.
             if self.heap.allocation_counter() >= self.safepoint_at {
                 if self.gc_due() {
-                    self.scheduled_collection();
+                    self.scheduled_collection(host);
                 }
                 if self.checkpoint_due() {
                     self.take_checkpoint(host);
@@ -1425,12 +1529,23 @@ impl Vm {
         )
     }
 
+    /// A String of the VM's own (a selector it sends itself, the name an
+    /// alien send calls), off the allocation clock: whether and when the VM
+    /// makes one depends on its caches, which no program may observe, and
+    /// the clock is the program's (Eastasia design, section 3.4).
+    fn private_string(&mut self, s: &str) -> Value {
+        let clock = self.heap.allocation_counter();
+        let v = self.new_string(s);
+        self.heap.set_allocation_counter(clock);
+        v
+    }
+
     /// A String for a selector the VM sends itself, allocated once.
     fn symbol(&mut self, s: &'static str) -> Value {
         if let Some(&v) = self.symbols.get(s) {
             return v;
         }
-        let v = self.new_string(s);
+        let v = self.private_string(s);
         self.symbols.insert(s, v);
         v
     }
@@ -2039,7 +2154,7 @@ impl Vm {
                 core::str::from_utf8(first)
                     .map_err(|_| VmError::Malformed("a selector must be UTF-8"))?,
             );
-            self.new_string(&first)
+            self.private_string(&first)
         };
         Ok(Some((AlienSend::Call(name), perform)))
     }
@@ -2614,16 +2729,18 @@ impl Vm {
                 }
             },
             Outcome::ClassQuery { target, by_mixin } => {
-                // Only live classes: a collection first, with the target
-                // rooted on the stack. Classes only, as psoup's weak sets
+                // Only the classes the roots strongly reach (Eastasia
+                // design, section 3.3): found by a walk, with no
+                // collection, so that the answer does not depend on what a
+                // collector has cleared. Classes only, as psoup's weak sets
                 // hold: every metaclass's superclass is Class, which is not
                 // a subclass relation.
-                self.stack.push(target);
-                self.collect_garbage();
-                let target = self.stack.pop().expect("pushed");
+                let mut roots = self.roots();
+                roots.push(target);
                 let found: Vec<Value> = self
                     .heap
-                    .objects()
+                    .canonical_order(&roots, true)
+                    .into_iter()
                     .filter(|&v| {
                         self.heap.format(v) == Some(Format::Class)
                             && self.heap.behavior(v).is_some_and(|b| {
@@ -2635,9 +2752,10 @@ impl Vm {
                             })
                     })
                     .collect();
-                // In allocation order, which the arena's order need not be.
+                // In the order the classes were made: each was numbered
+                // then (Eastasia design, section 3.3).
                 let mut found = found;
-                found.sort_by_key(|&v| self.heap.seq(v));
+                found.sort_by_key(|&v| self.heap.creation_number(v));
                 let array_class = self.roles.get(Role::ArrayClass);
                 let answer = self.heap.allocate(
                     array_class,
@@ -2648,19 +2766,18 @@ impl Vm {
                 Ok(None)
             }
             Outcome::AllInstances(class) => {
-                // Only live instances: a collection first, at this safepoint,
-                // with the class rooted on the stack.
-                self.stack.push(class);
-                self.collect_garbage();
-                let class = self.stack.pop().expect("pushed");
+                // Only the instances the roots strongly reach, in the
+                // canonical order (Eastasia design, section 3.3): the
+                // order a walk from the roots reaches them, which the
+                // object graph determines, whatever the VM. No collection:
+                // the answer does not depend on what a collector has
+                // cleared.
                 let instances: Vec<Value> = self
                     .heap
-                    .objects()
+                    .canonical_order(&self.roots(), true)
+                    .into_iter()
                     .filter(|&v| self.heap.class(v) == Some(class))
                     .collect();
-                // In allocation order, which the arena's order need not be.
-                let mut instances = instances;
-                instances.sort_by_key(|&v| self.heap.seq(v));
                 let array_class = self.roles.get(Role::ArrayClass);
                 let answer = self.heap.allocate(
                     array_class,
@@ -2671,9 +2788,10 @@ impl Vm {
                 Ok(None)
             }
             Outcome::Collect => {
-                // A safepoint: the receiver is back on the stack first.
+                // A safepoint, and a clearing point: the receiver is back
+                // on the stack first.
                 self.stack.push(receiver);
-                self.collect_garbage();
+                self.clearing_point(true, host);
                 Ok(None)
             }
             Outcome::Snapshot => match self.snapshot_writer {
@@ -3714,7 +3832,7 @@ impl Vm {
         for (o, n) in olds.iter().zip(news.iter()) {
             let Some(r) = n.as_reference() else { continue };
             if o != n && renumbered.insert(r) {
-                self.heap.exchange_seqs(*o, *n);
+                self.heap.exchange_hashes(*o, *n);
             }
         }
         // Forward identities, in the heap and in every root the VM holds.
@@ -3953,7 +4071,7 @@ impl Vm {
         while self.frames.len() > base {
             if !idle {
                 if self.gc_due() {
-                    self.scheduled_collection();
+                    self.scheduled_collection(host);
                 }
                 if let Step::Done(_) = self.step(host)? {
                     return Err(VmError::Malformed("a callback exited"));
@@ -3963,7 +4081,7 @@ impl Vm {
             // The event loop's checks (no checkpoint inside a callback).
             if self.heap.allocation_counter() >= self.safepoint_at {
                 if self.gc_due() {
-                    self.scheduled_collection();
+                    self.scheduled_collection(host);
                 }
                 self.safepoint_at = self.next_safepoint();
             }

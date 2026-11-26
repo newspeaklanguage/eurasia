@@ -14,5 +14,5 @@ pub mod header;
 pub mod image;
 
 pub use encoding::{DecodeError, Reader, Writer};
-pub use header::{FORMAT_VERSION, Header, HeaderError, MAGIC, WORD_SIZE};
-pub use image::{LoadError, read_checkpoint, read_image, write_image};
+pub use header::{FORMAT_VERSION, Header, HeaderError, MAGIC, OLDEST_FORMAT_VERSION, WORD_SIZE};
+pub use image::{LoadError, read_checkpoint, read_image, write_image, write_image_with};

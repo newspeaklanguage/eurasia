@@ -163,7 +163,7 @@ natives! {
     VmIsCanonical = 117 / 1: "`vm isCanonical:`: whether the object is frozen.",
     VmSetCanonical = 118 / 1: "`vm setCanonical:`: freeze the object.",
     VmPerformWith = 119 / 3: "`vm object:perform:with:`: an ordinary send, whatever the receiver overrides.",
-    VmGarbageCollect = 120 / 0: "`vm garbageCollect`: a full collection; answers the receiver.",
+    VmGarbageCollect = 120 / 0: "`vm garbageCollect`: a collection, and a clearing point for weak references; answers the receiver.",
     VmMonotonicNanos = 121 / 0: "`vm monotonicNanos` (input).",
     VmClone = 126 / 1: "`vm clone: root`: a copy of the mutable graph reachable from root (values, program objects, shared objects and their classes are not copied).",
     VmNewActor = 127 / 0: "`vm newActor`: a new actor running a clone of the platform template; answers a far reference to nil in it, its handle.",
@@ -190,14 +190,14 @@ natives! {
     MethodHeaderPut = 150 / 1: "`Method>>header:` on an unfrozen method: sets its kind, access, argument and local counts from psoup's header word (see `Method>>header`).",
     MethodBytecode = 151 / 0: "`Method>>bytecode`: a copy of its V5 bytecode, a ByteArray.",
     MethodBytecodePut = 152 / 1: "`Method>>bytecode:` on an unfrozen method: a ByteArray of well-formed V5 instructions.",
-    VmAllInstancesOf = 153 / 1: "`vm allInstancesOf: c`: an Array of the live instances of exactly `c`, cohort-wide, in allocation order (after a full collection).",
+    VmAllInstancesOf = 153 / 1: "`vm allInstancesOf: c`: an Array of the instances of exactly `c` that the roots strongly reach, cohort-wide, in the canonical order. It does not collect.",
     ClosureCopiedAt = 154 / 2: "`copiedOf: closure at: i`: its ith copied value, from 1.",
     ClosureCopiedAtPut = 155 / 3: "`copiedOf: closure at: i put: v`.",
     ClosureInitialPc = 156 / 1: "`initialBCIOf: closure`: the bytecode position of its body, from 1.",
     ClosureNumCopied = 157 / 1: "`numCopiedOf: closure`: the number of its copied values.",
     VmCommit = 158 / 1: "`vm commit: {old objects. new objects. layout maps}`: installs a change set atomically. Each old program object's references go to its new one, which is frozen with what it reaches of the program; each layout map {old class. new class. for each new slot, the old slot index or 0} reshapes every instance of the old class in place. Answers the new program version.",
-    VmMixinApplicationsOf = 159 / 1: "`vm mixinApplicationsOf: m`: an Array of the live classes whose mixin is `m`, cohort-wide, in allocation order (after a full collection).",
-    VmSubclassesOf = 160 / 1: "`vm subclassesOf: c`: an Array of the live classes whose superclass is `c`, cohort-wide, in allocation order (after a full collection).",
+    VmMixinApplicationsOf = 159 / 1: "`vm mixinApplicationsOf: m`: an Array of the classes whose mixin is `m` that the roots strongly reach, cohort-wide, in the order they were made. It does not collect.",
+    VmSubclassesOf = 160 / 1: "`vm subclassesOf: c`: an Array of the classes whose superclass is `c` that the roots strongly reach, cohort-wide, in the order they were made. It does not collect.",
     VmProgramVersion = 161 / 0: "`vm programVersion`: the number of commits so far.",
     ActivationNew = 162 / 0: "`Activation class>>new`: a detached activation (M6 design 4.4), with nil method, receiver, closure, sender and bci, and no temps.",
     ActivationMethodPut = 163 / 1: "`Activation>>method:`, on a detached activation.",
@@ -685,12 +685,13 @@ pub enum Outcome {
     /// `vm spawn:`: the interpreter creates the actor and applies the mixin
     /// in its heap.
     Spawn(Value),
-    /// `vm allInstancesOf:`: the interpreter collects, then answers them.
+    /// `vm allInstancesOf:`: the interpreter walks from the roots and
+    /// answers them.
     AllInstances(Value),
     /// `vm commit:`: the interpreter applies the change set.
     Commit(Value),
     /// `vm mixinApplicationsOf:` (by mixin) or `vm subclassesOf:`: the
-    /// interpreter collects, so that no dead class answers, then scans.
+    /// interpreter walks from the roots, so that no dead class answers.
     ClassQuery {
         /// The mixin or the superclass.
         target: Value,
@@ -790,6 +791,15 @@ pub struct NativeContext<'a> {
 }
 
 impl NativeContext<'_> {
+    /// The running actor's number, whose hash counter numbers the objects
+    /// it is first to ask the identity hash of.
+    fn actor(&self) -> u32 {
+        match self.space {
+            Space::Actor(n) => n,
+            Space::Program => 0,
+        }
+    }
+
     /// Allocates a String.
     pub fn new_string(&mut self, s: &str) -> Value {
         self.new_bytes_object(Role::StringClass, Body::String(s.as_bytes().to_vec()))
@@ -1327,12 +1337,14 @@ fn instance_slots(heap: &Heap, roles: &Roles, class: Value) -> Option<usize> {
     None
 }
 
-/// The identity hash of the object with sequence number `seq` (the
-/// function h of kernel-semantics.tex's eq:kernel-identity-hash): a
-/// bijection on 62-bit numbers that spreads the sequence number's high bits
-/// into the low ones (splitmix64's finalizer, modulo 2^62), so that hash
-/// tables masking the low bits do not cluster objects allocated in a
-/// regular rhythm. Distinct objects keep distinct hashes.
+/// The identity hash of the object with hash number `seq` (the function h
+/// of kernel-semantics.tex's eq:kernel-identity-hash): a bijection on 62-bit
+/// numbers that spreads the number's high bits into the low ones
+/// (splitmix64's finalizer, modulo 2^62), so that hash tables masking the
+/// low bits do not cluster objects numbered in a regular rhythm. Distinct
+/// objects keep distinct hashes. An object's hash number is given at the
+/// first request ([`Heap::hash_number`]); in an image older than format
+/// version 9 it is the allocation sequence number.
 pub fn identity_hash(seq: u64) -> i64 {
     const MASK: u64 = (1 << 62) - 1;
     let mut x = seq & MASK;
@@ -1480,7 +1492,7 @@ pub fn invoke(
                 .class(receiver)
                 .unwrap_or_else(|| ctx.roles.get(Role::SmallIntegerClass)),
         ),
-        Native::ObjectIdentityHash => match ctx.heap.seq(receiver) {
+        Native::ObjectIdentityHash => match ctx.heap.hash_number(receiver, ctx.actor()) {
             // eq:kernel-identity-hash, h being identity_hash; SmallIntegers
             // are their own.
             Some(seq) => Outcome::Answer(small(identity_hash(seq))),
@@ -2224,7 +2236,7 @@ pub fn invoke(
                 .unwrap_or_else(|| ctx.roles.get(Role::SmallIntegerClass)),
         ),
         Native::VmIsIdenticalTo => Outcome::Answer(ctx.boolean(arg(0) == arg(1))),
-        Native::VmIdentityHashOf => match ctx.heap.seq(arg(0)) {
+        Native::VmIdentityHashOf => match ctx.heap.hash_number(arg(0), ctx.actor()) {
             Some(seq) => Outcome::Answer(small(identity_hash(seq))),
             None => Outcome::Answer(arg(0)),
         },

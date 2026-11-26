@@ -1,17 +1,24 @@
 # Eurasia snapshot format
 
-**Status:** Draft, format version 8. Written before the code (implementation
+**Status:** Draft, format version 9. Written before the code (implementation
 plan M0); the packager (Newspeak) and `eurasia-snapshot` (Rust) are tested
 against each other.
 
 Eurasia snapshots replace psoup's vfuels. The structure follows psoup's
-PrimordialFuel (a graph written as nodes, then edges), with one essential
-difference: **every object is written with its allocation sequence number**,
-and objects are written in sequence order within each section. Allocation order is the identity order of the formal
-semantics, and an object's sequence number is its identity hash
-(`kernel-semantics.tex`, equations `eq:kernel-fresh` and
-`eq:kernel-identity-hash`), so both must survive a save and restore exactly.
-psoup groups objects by class instead, which loses that order.
+PrimordialFuel (a graph written as nodes, then edges), with two differences.
+**An object that has been asked its identity hash is written with its hash
+number**, so hashes survive a save and restore exactly
+(`kernel-semantics.tex`, `eq:kernel-identity-hash`, as revised: an object is
+numbered at the first request, not at allocation). And **the nodes of a
+section are in a canonical order** that the object graph determines (section
+3), so a heap has one image, whichever VM writes it. psoup groups objects by
+class.
+
+Version 9 (2026-11-23) is the contract revision of
+`EASTASIA_DESIGN_2026-11-23.md`, section 3, which lets a second VM share the
+format. Up to version 8 every object was written with its allocation
+sequence number, which was its hash number, and nodes were in sequence
+order. A version 9 reader still reads version 8 (section 9).
 
 ## 1. Encoding conventions
 
@@ -32,17 +39,20 @@ psoup groups objects by class instead, which loses that order.
 | Field | Type | Meaning |
 |---|---|---|
 | magic | `bytes(4)` | `EURA` (0x45 0x55 0x52 0x41) |
-| format version | `u16` | This document: 8 (2026-11-19: version 8 a promise record's waiters and queue, and a detached activation's temps, as Arrays, for the arena heap; 2026-11-17: version 2 gave mixins the class-side mixin field, version 3 the value flag bits and the Value role; 2026-11-18: version 4 far references, promise records, the shared bit and roles 35–37; version 5 the simulation-root bit and roles 38–39; version 6 checkpoints: the machine section, live and detached activations, and role 40; version 7 roles 41 and 42, incarnation and lineage) |
+| format version | `u16` | This document: 9 (2026-11-23: version 9 hash numbers in place of sequence numbers, the hash counters, canonical node order and optional sections; 2026-11-19: version 8 a promise record's waiters and queue, and a detached activation's temps, as Arrays, for the arena heap; 2026-11-17: version 2 gave mixins the class-side mixin field, version 3 the value flag bits and the Value role; 2026-11-18: version 4 far references, promise records, the shared bit and roles 35–37; version 5 the simulation-root bit and roles 38–39; version 6 checkpoints: the machine section, live and detached activations, and role 40; version 7 roles 41 and 42, incarnation and lineage) |
 | kernel version | `u16` | Must equal the VM's `KERNEL_VERSION` |
 | bytecode version | `u16` | Must equal the VM's `BYTECODE_VERSION` |
 | word size | `u8` | Always 64 |
 | flags | `u8` | Reserved, 0 |
-| allocation counter | `uv` | `n_α`: the next sequence number to allocate |
+| allocation counter | `uv` | `n_α`: how many objects have been allocated. The clock of safepoints, collections and checkpoints; objects do not carry their numbers. A String the VM makes for itself (a selector it sends, the name an alien send calls) is not counted: whether it is made depends on the VM's caches. |
+| hash counter count | `uv` | How many hash counters follow |
+| hash counters | `uv` each | Each actor's hash counter, by actor number from 0: how many hash numbers it has given out |
 | node count | `uv` | Number of nodes in the file |
 | section count | `uv` | Number of sections |
 
 A VM refuses a snapshot whose magic, format version, kernel version,
-bytecode version or word size differs from its own, and says which. (psoup
+bytecode version or word size differs from its own (but for an older format
+version it still reads), and says which. (psoup
 dies with "unimplemented code" when given a snapshot that is too new.)
 
 An optional `#!` interpreter line before the magic is skipped, as in psoup.
@@ -50,10 +60,22 @@ An optional `#!` interpreter line before the magic is skipped, as in psoup.
 ## 3. Nodes and references
 
 Nodes are numbered from 1 in file order across all sections; 0 is not a
-node. A value's reference field names a node number. Within a section,
-sequence numbers strictly increase. Sections hold different spaces, whose
-objects interleave in allocation order, so the loader orders all objects by
-sequence number; sequence numbers are unique across the file.
+node. A value's reference field names a node number.
+
+**The canonical order.** A VM writes the nodes of each section in the order
+in which a depth-first walk first meets them. The walk starts from the
+roles, in role id order, then (in a checkpoint) from the values of the
+machine section in the order they are written there. At a node it follows
+the values of the node's edge record in order, the class first. A weak
+array's elements and an ephemeron's fields are followed like any others:
+the order is a property of the file's own edges. A section holds the nodes
+of its space in that order. Nodes the walk does not reach (a writer given a
+heap it has not collected) follow in each section.
+
+The order is what a VM writes, not a condition a reader checks: an image in
+another order is valid, and a VM that loads and saves it writes it in the
+canonical one. A loader lays objects out in file order, so the file's order
+is the loaded heap's.
 
 ## 4. Sections
 
@@ -75,6 +97,7 @@ Section kinds:
 | 2 | program | Installed methods and mixins: frozen, shared by every actor of the cohort. |
 | 3 | actor heap | One actor's objects, including its class objects. |
 | 4 | machine | A checkpoint's machine state (M7, below). No nodes; its body follows the node count. At most one, before the roles section. |
+| 128–255 | optional | Not nodes: the owner is 0, and the node count field holds a **byte length**, followed by that many bytes. A reader that does not know the kind skips them. For what one VM saves for itself and another may ignore (Eastasia's inlining feedback). Before the roles section. |
 
 A file with a machine section is a **checkpoint**: restoring it continues
 where it was taken (`Vm::restore`, then `Vm::continue_run`). A file without
@@ -96,15 +119,26 @@ edges; a flag is a `u8` 0 or 1, and an optional value is a flag then, if
 - the VM's selector strings: `uv` count, then each name (`uv` length and
   UTF-8 bytes) and its String;
 - seven `uv` counters: the next frame serial number, the allocation counter
-  after the last collection, the collection budget, the collections so far,
-  the program version, the checkpoint policy (allocations, 0 for none) and
-  the allocation counter at the last checkpoint;
+  at the last clearing point, the allocations from it to the next scheduled
+  one, the clearing points and checkpoints so far, the program version, the
+  checkpoint policy (allocations, 0 for none) and the allocation counter at
+  the last checkpoint;
 - the timer a turn ended with (optional `uv`), and whether the image runs a
   message loop (flag).
 
 A checkpoint's heap holds everything the VM's roots reach weakly or
-strongly, so that weak references clear at the same collections in a
-restored VM as in the running one (M7 design, section 3.2).
+strongly: a weak reference is cleared only at a **clearing point**
+(`EASTASIA_DESIGN_2026-11-23.md`, section 3.2), so until then the object it
+refers to is part of the state. Clearing points are explicit collections
+(`vm garbageCollect`) and the first safepoint at which the allocation
+counter has advanced by the budget the last one announced; what is cleared
+at each is the collector's choice, and a recording logs it. The collection
+a checkpoint makes is not a clearing point and does not move this clock.
+
+A WeakArray or Ephemeron always has a hash number, given when it is made:
+the log names it by that number. A reader numbers those that have none (in
+an image written before this), in file order, after it has read the hash
+counters.
 
 Two-phase loading, as in psoup: all nodes of all sections are allocated
 first (their sizes are in the node records), then edges are filled, so
@@ -114,10 +148,19 @@ cycles need no special handling.
 
 | Field | Type | Meaning |
 |---|---|---|
-| sequence delta | `uv` | Sequence number minus the previous node's in the same section (the section's first node's is absolute). Gaps are objects in other spaces, or collected before the save. |
+| hash | `uv`, then perhaps a `uv` | 0: the object has never been asked its identity hash. Odd, `2c + 1`: it was the `c`-th object (from 0) that an actor numbered; that actor's number follows as a `uv`. Even and not 0, `2s + 2`: its hash number is `s`, the sequence number it had in an image older than version 9. Below. |
 | kind | `u8` | Below |
 | flags | `u8` | Bit 0: frozen (installed or canonical). Bit 1: a value (deeply immutable; actors may share it). Bit 2: on a class, a value class (its instances are values). Bit 3: shared by every actor though mutable (the kernel module, the VM mirror): cloning a platform does not copy it. Bit 4: on a method, a simulation root (psoup's primitive 142): a non-local return stops at it, and an exception in a simulated thread is routed to it. Others reserved. |
 | shape | depends on kind | Below |
+
+**Hash numbers.** An object's identity hash is `h` of its hash number
+(`eurasia-core`'s `identity_hash`). An object has no number until its hash
+is first asked for; the actor that asks takes the next value `c` of its own
+hash counter, and the number is `2^61 + actor · 2^40 + c`. A sequence number
+kept from an older image is below `2^61`, so the two never meet. **A class
+(kind 11) is numbered when it is made**, by the actor that makes it:
+`mixinApplicationsOf:` and `subclassesOf:` answer classes in the order of
+their numbers. A writer must give every class a number.
 
 | Kind | Name | Shape in the node record | Edge record |
 |---|---|---|---|
@@ -216,8 +259,19 @@ Every role must be present. Unknown role ids are an error.
 ## 8. Validation at load
 
 The loader checks, and refuses the snapshot with a message naming the node if
-any fails: the header; strictly increasing sequence numbers within each
-section, unique across the file, and below the allocation counter; every reference names an existing node; node counts match;
+any fails: the header; every hash number in range; every reference names an existing node; node counts match;
 every kind and flag is known; method headers are consistent with their kind;
 every role is present. Bytecode is checked when a method is first run, not at
 load.
+
+## 9. Reading version 8
+
+A version 8 file has no hash counters in its header and no optional
+sections, and each node record starts with a **sequence delta** in place of
+the hash field: the sequence number minus the previous node's in the same
+section (the section's first node's is absolute). Within a section sequence
+numbers strictly increase. The reader lays the objects out in sequence
+order across all sections, and each object's sequence number becomes its
+hash number, so identity hashes, and the collections built on them, are
+unchanged. The Newspeak packager (`EurasiaPackager.ns`) still writes
+version 8.

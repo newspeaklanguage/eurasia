@@ -87,6 +87,32 @@ pub enum HostError {
     Dead,
 }
 
+/// What happened to weak references at a **clearing point** (Eastasia
+/// design, section 3.2): an input, because what a collector finds
+/// unreachable, and when, is its own business.
+///
+/// Weak references clear and ephemerons are mourned only at clearing
+/// points: an explicit collection (`vm garbageCollect`), and the first
+/// safepoint at which the allocation counter has advanced by the budget
+/// the clearing point before announced (`next`). Where the points are is
+/// therefore the same in a recording and its replay; what is cleared at
+/// each is in the log. Between them a VM may collect as it likes, clearing
+/// nothing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Clearing {
+    /// What was cleared: the hash number of a WeakArray and the index of an
+    /// element that became nil, or the hash number of an Ephemeron and
+    /// [`MOURNED`] (its key, value and finalizer became nil). WeakArrays
+    /// and Ephemerons are numbered when they are made.
+    pub cleared: alloc::vec::Vec<(u64, u32)>,
+    /// The allocations from this clearing point to the next scheduled one.
+    pub next: u64,
+}
+
+/// In [`Clearing::cleared`], in place of an index: the ephemeron was
+/// mourned.
+pub const MOURNED: u32 = u32::MAX;
+
 /// The services a host provides to the VM.
 pub trait Host {
     /// Output (`vm print:`): send a line of text to the host's console.
@@ -163,6 +189,19 @@ pub trait Host {
     /// that the image was handed over; the default keeps nothing.
     fn deliver_image(&mut self, name: &str, bytes: &[u8]) {
         let _ = (name, bytes);
+    }
+
+    /// Asked at every clearing point: what to clear there, if this host
+    /// says ([`Clearing`]). A replaying host answers from its log; any
+    /// other host leaves it to the VM's collector (the default).
+    fn weak_clearing(&mut self) -> Option<Clearing> {
+        None
+    }
+
+    /// Told at every clearing point at which the VM's collector decided:
+    /// what it cleared. A recording host logs it; the default ignores it.
+    fn weak_cleared(&mut self, clearing: &Clearing) {
+        let _ = clearing;
     }
 
     /// Whether this host keeps checkpoints (a recording or replaying host).

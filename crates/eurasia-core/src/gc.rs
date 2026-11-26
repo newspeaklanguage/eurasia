@@ -276,10 +276,21 @@ impl Heap {
         }
         // Ephemerons whose key died are mourned; weak references to dead
         // young objects become nil, to surviving ones are rewritten.
+        // What is cleared is noted, by the weak object's hash number, for
+        // the log (`Heap::take_cleared`).
+        let number = |c: &Copier, heap: &Heap, place: Place| {
+            match place {
+                Place::Old(o) => heap.words[o + 1].to_bits(),
+                Place::Copy(p) => c.to[p + 1].to_bits(),
+            }
+            .wrapping_sub(1)
+        };
         for place in pending {
             for i in 0..3 {
                 c.set(self, place, i, nil);
             }
+            let cleared = (number(&c, self, place), crate::host::MOURNED);
+            self.cleared.push(cleared);
         }
         for place in weak {
             let n = c.len(self, place);
@@ -288,6 +299,8 @@ impl Heap {
                 let v = if c.survives(self, v) {
                     c.evacuate(self, v)
                 } else {
+                    let cleared = (number(&c, self, place), i as u32);
+                    self.cleared.push(cleared);
                     nil
                 };
                 c.set(self, place, i, v);
@@ -381,18 +394,28 @@ impl Heap {
             enabled.into_iter().for_each(|v| m.mark(self, v));
         }
 
-        // Clear weak observations of collected objects.
+        // Clear weak observations of collected objects. What is cleared
+        // is noted, by the weak object's hash number, for the log
+        // (`Heap::take_cleared`).
+        let mut cleared = Vec::new();
         for &o in &pending {
             self.contents_mut(o).fill(nil);
+            cleared.push((
+                self.words[o + 1].to_bits().wrapping_sub(1),
+                crate::host::MOURNED,
+            ));
         }
         for &o in &weak {
             let n = self.object_words(o);
-            for w in &mut self.words[o + HEADER..o + n] {
+            let number = self.words[o + 1].to_bits().wrapping_sub(1);
+            for (i, w) in self.words[o + HEADER..o + n].iter_mut().enumerate() {
                 if !m.is_marked(*w) {
                     *w = nil;
+                    cleared.push((number, i as u32));
                 }
             }
         }
+        self.cleared.append(&mut cleared);
 
         // The live words: every word of every marked object.
         let mut live = vec![0u64; blocks];
@@ -798,8 +821,8 @@ mod tests {
         h.allocate(class, Space::Actor(0), Body::Regular(slots))
     }
 
-    fn seq(h: &Heap, v: Value) -> u64 {
-        h.seq(v).unwrap()
+    fn seq(h: &mut Heap, v: Value) -> u64 {
+        h.hash_number(v, 0).unwrap()
     }
 
     #[test]
@@ -810,17 +833,17 @@ mod tests {
         let b = object(&mut h, class, alloc::vec![a]);
         h.regular_slots_mut(a).unwrap()[0] = b; // a cycle with no root
         let root = object(&mut h, class, alloc::vec![kept]);
-        let (root_seq, kept_seq) = (seq(&h, root), seq(&h, kept));
+        let (root_seq, kept_seq) = (seq(&mut h, root), seq(&mut h, kept));
         let (fwd, stats) = h.collect(&[class, root], nil);
         assert_eq!((stats.before, stats.after), (6, 4));
         assert!(!fwd.survived(a) && !fwd.survived(b));
         let root = fwd.forward(root);
-        assert_eq!(seq(&h, root), root_seq);
-        let s = h.regular_slots(root).unwrap();
-        assert_eq!(seq(&h, s[0]), kept_seq);
-        // Allocation continues after the highest sequence number ever used.
-        let fresh = object(&mut h, class, Vec::new());
-        assert_eq!(seq(&h, fresh), 6);
+        assert_eq!(seq(&mut h, root), root_seq);
+        let kept = h.regular_slots(root).unwrap()[0];
+        assert_eq!(seq(&mut h, kept), kept_seq);
+        // The allocation counter is unaffected by a collection.
+        object(&mut h, class, Vec::new());
+        assert_eq!(h.allocation_counter(), 7);
     }
 
     #[test]
@@ -839,7 +862,7 @@ mod tests {
         let kept = object(&mut h, class, alloc::vec![s]);
         // The barrier: writing the old holder remembers it.
         h.regular_slots_mut(holder).unwrap()[0] = young;
-        let young_seq = seq(&h, young);
+        let young_seq = seq(&mut h, young);
         let (fwd, stats) = h.collect_minor(&[class, holder, kept], nil);
         // Old garbage survives a minor collection; young garbage does not.
         assert!(fwd.survived(old_garbage));
@@ -848,7 +871,7 @@ mod tests {
         // Old objects do not move.
         assert_eq!(fwd.forward(holder), holder);
         let young = h.regular_slots(holder).unwrap()[0];
-        assert_eq!(seq(&h, young), young_seq);
+        assert_eq!(seq(&mut h, young), young_seq);
         let s = h.regular_slots(fwd.forward(kept)).unwrap()[0];
         assert_eq!(h.string_bytes(s), Some(&b"young bytes"[..]));
         // Survivors are old: a full collection then drops the old garbage.

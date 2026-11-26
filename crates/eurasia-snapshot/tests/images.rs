@@ -6,7 +6,7 @@
 use eurasia_core::builder::first_light_image;
 use eurasia_core::host::Host;
 use eurasia_core::roles::Role;
-use eurasia_core::{Completion, Vm};
+use eurasia_core::{Completion, Value, Vm};
 use eurasia_snapshot::{LoadError, read_image, write_image};
 
 #[derive(Default)]
@@ -52,20 +52,56 @@ fn a_loaded_image_runs() {
 }
 
 #[test]
-fn loading_preserves_sequence_numbers_and_the_allocation_counter() {
-    let (heap, roles) = first_light_image();
+fn loading_preserves_hash_numbers_and_the_counters() {
+    let (mut heap, roles) = first_light_image();
+    // Some objects have been asked their hash, by two actors.
+    let all: Vec<Value> = heap.objects().collect();
+    heap.hash_number(all[3], 0);
+    heap.hash_number(all[1], 2);
     let bytes = write_image(&heap, &roles, None);
     let (loaded, loaded_roles) = read_image(&bytes).expect("loads");
     assert_eq!(loaded.allocation_counter(), heap.allocation_counter());
-    let original: Vec<u64> = heap.objects().map(|v| heap.seq(v).unwrap()).collect();
-    let after: Vec<u64> = loaded.objects().map(|v| loaded.seq(v).unwrap()).collect();
-    assert_eq!(original, after);
-    // Same objects in the same places, so roles map to the same sequence numbers.
+    assert_eq!(loaded.hash_counters(), heap.hash_counters());
+    assert_eq!(loaded.len(), heap.len());
+    let hashes = |h: &eurasia_core::object::Heap| -> Vec<u64> {
+        let mut all: Vec<u64> = h.objects().map(|v| h.hash_word(v).unwrap()).collect();
+        all.sort_unstable();
+        all
+    };
+    assert_eq!(hashes(&heap), hashes(&loaded));
     for &role in Role::ALL {
-        let a = heap.seq(roles.get(role));
-        let b = loaded.seq(loaded_roles.get(role));
+        let a = heap.hash_word(roles.get(role));
+        let b = loaded.hash_word(loaded_roles.get(role));
         assert_eq!(a, b, "{role:?}");
     }
+}
+
+#[test]
+fn an_image_is_canonical_whatever_order_the_heap_lies_in() {
+    // The loaded heap lies in file order, not in the order the builder
+    // allocated; writing it again gives the same bytes.
+    let (heap, roles) = first_light_image();
+    let bytes = write_image(&heap, &roles, None);
+    let (loaded, loaded_roles) = read_image(&bytes).expect("loads");
+    assert_eq!(write_image(&loaded, &loaded_roles, None), bytes);
+    // The walk starts at the first role, nil: it is the first object of
+    // its space.
+    let nil = loaded_roles.get(Role::Nil);
+    let first = loaded
+        .objects()
+        .find(|&v| loaded.space(v) == loaded.space(nil))
+        .unwrap();
+    assert_eq!(first, nil);
+}
+
+#[test]
+fn an_optional_section_is_skipped() {
+    let (heap, roles) = first_light_image();
+    let plain = write_image(&heap, &roles, None);
+    let bytes = eurasia_snapshot::write_image_with(&heap, &roles, None, &[(200, b"feedback")]);
+    assert!(bytes.len() > plain.len());
+    let (loaded, loaded_roles) = read_image(&bytes).expect("loads");
+    assert_eq!(write_image(&loaded, &loaded_roles, None), plain);
 }
 
 #[test]
@@ -240,6 +276,20 @@ fn checkpoints_keep_frames_and_detached_activations() {
         last_checkpoint: 50,
     };
     let bytes = write_image(&heap, &roles, Some(&state));
+    // Loading lays the heap out in the image's canonical order, so the
+    // loaded state names the objects by their new places; from then on a
+    // round trip changes nothing.
+    let (heap, roles, state) = {
+        let (h, r, m) = read_checkpoint(&bytes).expect("loads");
+        (h, r, m.expect("a checkpoint"))
+    };
+    let (nil, live, detached) = (
+        roles.get(Role::Nil),
+        state.frames[0].activation.unwrap(),
+        state.stack[2],
+    );
+    assert_eq!(state.stack, [nil, seven, detached]);
+    assert_eq!(write_image(&heap, &roles, Some(&state)), bytes);
     let (loaded, roles2, machine) = read_checkpoint(&bytes).expect("loads");
     assert_eq!(machine.as_ref(), Some(&state));
     assert_eq!(write_image(&loaded, &roles2, machine.as_ref()), bytes);

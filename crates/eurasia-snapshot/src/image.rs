@@ -11,7 +11,7 @@ use eurasia_core::Value;
 use eurasia_core::machine::{ActorState, FrameState, MachineState};
 use eurasia_core::object::Detached;
 use eurasia_core::object::{
-    Access, Activation, Behavior, Body, Closure, FLAGS, Format, Heap, HeapError, Method,
+    Access, Activation, Behavior, Body, Closure, FLAGS, Format, HashWord, Heap, Method,
     MethodHeader, MethodKind, Mixin, Object, PromiseRecord, Space,
 };
 use eurasia_core::roles::{Role, Roles, RolesError};
@@ -23,6 +23,9 @@ const SECTION_ROLES: u8 = 1;
 const SECTION_PROGRAM: u8 = 2;
 const SECTION_ACTOR: u8 = 3;
 const SECTION_MACHINE: u8 = 4;
+/// Section kinds from here on are optional: a reader that does not know
+/// one skips it (its byte length follows its owner).
+const SECTION_OPTIONAL: u8 = 128;
 
 const KIND_REGULAR: u8 = 1;
 const KIND_BYTES: u8 = 2;
@@ -78,8 +81,8 @@ pub enum LoadError {
         /// The referenced node number.
         target: u64,
     },
-    /// Sequence numbers are not increasing within a section, not unique, or
-    /// not below the allocation counter.
+    /// A version 8 node's sequence number does not exceed the one before
+    /// it, or a node's hash number is out of range.
     BadSequence {
         /// The node number.
         node: u64,
@@ -123,7 +126,9 @@ impl fmt::Display for LoadError {
             LoadError::DanglingReference { node, target } => {
                 write!(f, "node {node}: reference to missing node {target}")
             }
-            LoadError::BadSequence { node } => write!(f, "node {node}: bad sequence number"),
+            LoadError::BadSequence { node } => {
+                write!(f, "node {node}: bad sequence or hash number")
+            }
             LoadError::CountMismatch => {
                 write!(f, "node or section count does not match the header")
             }
@@ -136,24 +141,45 @@ impl fmt::Display for LoadError {
 
 // ----- Writing -----
 
-/// Writes an image. Objects keep their sequence numbers; the program space
-/// is written first, then each actor heap in actor order, then the machine
-/// state of a checkpoint, then the roles. Without a machine state, live
-/// activations are saved dead (a snapshot starts afresh).
+/// Writes an image: the program space first, then each actor heap in actor
+/// order, then the machine state of a checkpoint, then the roles. Within a
+/// section the nodes are in the canonical order (format section 3), so a
+/// heap has one image, whichever VM writes it. Without a machine state,
+/// live activations are saved dead (a snapshot starts afresh).
 pub fn write_image(heap: &Heap, roles: &Roles, machine: Option<&MachineState>) -> Vec<u8> {
-    // Group objects by space, each group in allocation order (sequence
-    // order: a reshaped object can sit later in the arena than its number).
+    write_image_with(heap, roles, machine, &[])
+}
+
+/// As [`write_image`], with optional sections (kind, at least 128, and
+/// body) before the roles: a reader that does not know a kind skips it.
+pub fn write_image_with(
+    heap: &Heap,
+    roles: &Roles,
+    machine: Option<&MachineState>,
+    optional: &[(u8, &[u8])],
+) -> Vec<u8> {
+    // The canonical order: a depth-first walk from the roles, then from a
+    // checkpoint's machine state in the order it is written. What the walk
+    // does not reach (in a heap not collected first) follows, as it lies.
+    let mut roots: Vec<Value> = roles.pairs().map(|(_, v)| v).collect();
+    if let Some(m) = machine {
+        roots.extend(machine_values(m));
+    }
+    let mut order = heap.canonical_order(&roots, false);
+    if order.len() < heap.len() {
+        let reached: alloc::collections::BTreeSet<u64> =
+            order.iter().map(|v| v.to_bits()).collect();
+        order.extend(heap.objects().filter(|v| !reached.contains(&v.to_bits())));
+    }
+    // Group objects by space, each group in that order.
     let mut groups: BTreeMap<(u8, u32), Vec<(Value, Object)>> = BTreeMap::new();
-    for v in heap.objects() {
+    for v in order {
         let o = heap.object(v).expect("an object");
         let key = match o.header.space {
             Space::Program => (0, 0),
             Space::Actor(n) => (1, n),
         };
         groups.entry(key).or_default().push((v, o));
-    }
-    for objects in groups.values_mut() {
-        objects.sort_by_key(|(_, o)| o.header.seq);
     }
     // Node numbers in file order.
     let mut node_of: BTreeMap<u64, u64> = BTreeMap::new();
@@ -172,8 +198,14 @@ pub fn write_image(heap: &Heap, roles: &Roles, machine: Option<&MachineState>) -
     };
 
     let mut w = Writer::new();
-    let sections = groups.len() as u64 + 1 + u64::from(machine.is_some());
-    Header::current(heap.allocation_counter(), next - 1, sections).write(&mut w);
+    let sections = groups.len() as u64 + 1 + u64::from(machine.is_some()) + optional.len() as u64;
+    Header::current(
+        heap.allocation_counter(),
+        heap.hash_counters().to_vec(),
+        next - 1,
+        sections,
+    )
+    .write(&mut w);
     for (&(space_kind, actor), objects) in &groups {
         w.u8(if space_kind == 0 {
             SECTION_PROGRAM
@@ -182,13 +214,15 @@ pub fn write_image(heap: &Heap, roles: &Roles, machine: Option<&MachineState>) -
         });
         w.uv(u64::from(actor));
         w.uv(objects.len() as u64);
-        let mut previous = None;
         for (_, o) in objects {
-            w.uv(match previous {
-                None => o.header.seq,
-                Some(p) => o.header.seq - p,
-            });
-            previous = Some(o.header.seq);
+            match HashWord::of(o.header.hash) {
+                HashWord::None => w.uv(0),
+                HashWord::Sequence(n) => w.uv(2 * n + 2),
+                HashWord::Fresh { actor, count } => {
+                    w.uv(2 * count + 1);
+                    w.uv(actor.into());
+                }
+            }
             write_node(&mut w, o, machine.is_some());
         }
         for (_, o) in objects {
@@ -201,6 +235,13 @@ pub fn write_image(heap: &Heap, roles: &Roles, machine: Option<&MachineState>) -
         w.uv(0);
         write_machine(&mut w, m, &to_node);
     }
+    for &(kind, body) in optional {
+        assert!(kind >= SECTION_OPTIONAL, "an optional section kind");
+        w.u8(kind);
+        w.uv(0);
+        w.uv(body.len() as u64);
+        w.bytes(body);
+    }
     w.u8(SECTION_ROLES);
     w.uv(0);
     w.uv(0);
@@ -210,6 +251,24 @@ pub fn write_image(heap: &Heap, roles: &Roles, machine: Option<&MachineState>) -
         w.value(to_node(value));
     }
     w.into_bytes()
+}
+
+/// The values of a machine state, in the order [`write_machine`] writes
+/// them: after the roles, the roots of the canonical order.
+fn machine_values(m: &MachineState) -> Vec<Value> {
+    let mut all = m.stack.clone();
+    for f in &m.frames {
+        all.extend([f.method, f.receiver]);
+        all.extend(f.activation);
+        all.extend(f.closure);
+    }
+    for a in &m.actors {
+        all.push(a.message_loop);
+        all.extend(a.mailbox.iter().copied());
+    }
+    all.extend(m.expats.iter().map(|&(c, _)| c));
+    all.extend(m.symbols.iter().map(|(_, v)| *v));
+    all
 }
 
 fn write_machine(w: &mut Writer, m: &MachineState, to_node: &dyn Fn(Value) -> Value) {
@@ -503,70 +562,16 @@ fn write_node(w: &mut Writer, o: &Object, keep_frames: bool) {
 }
 
 fn write_edges(w: &mut Writer, o: &Object, to_node: &dyn Fn(Value) -> Value) {
-    let mut v = |x: Value| w.value(to_node(x));
-    v(o.header.class);
-    match &o.body {
-        Body::Regular(e) | Body::Array(e) | Body::WeakArray(e) => e.iter().for_each(|&x| v(x)),
-        Body::Ephemeron {
-            key,
-            value,
-            finalizer,
-        } => {
-            v(*key);
-            v(*value);
-            v(*finalizer);
-        }
-        Body::Method(m) => [m.literals, m.mixin, m.selector, m.source, m.library]
-            .into_iter()
-            .for_each(v),
-        Body::Mixin(m) => [
-            m.name,
-            m.methods,
-            m.enclosing_mixin,
-            m.slot_names,
-            m.class_mixin,
-            m.library,
-        ]
-        .into_iter()
-        .for_each(v),
-        Body::Class(b) => [b.mixin, b.superclass, b.enclosing_object, b.name, b.library]
-            .into_iter()
-            .for_each(v),
-        Body::Metaclass(b) => [
-            b.mixin,
-            b.superclass,
-            b.enclosing_object,
-            b.this_class,
-            b.library,
-        ]
-        .into_iter()
-        .for_each(v),
-        Body::Closure(c) => {
-            v(c.defining);
-            c.copied.iter().for_each(|&x| v(x));
-        }
-        Body::Activation(a) => {
-            [a.method, a.receiver, a.closure]
-                .into_iter()
-                .for_each(&mut v);
-            if let Some(d) = &a.detached {
-                v(d.sender);
-                v(d.bci);
-                v(d.temps);
-            }
-        }
-        Body::FarRef { target, .. } => v(*target),
-        Body::Promise(p) => [p.value, p.owner, p.waiters, p.queue]
-            .into_iter()
-            .for_each(v),
-        Body::Bytes(_) | Body::String(_) | Body::Float(_) | Body::LargeInteger { .. } => {}
-    }
+    o.edges(false).into_iter().for_each(|x| w.value(to_node(x)));
 }
 
 // ----- Reading -----
 
 struct Pending {
     node: u64,
+    /// The hash word.
+    hash: u64,
+    /// A version 8 node's sequence number: its place in the arena.
     seq: u64,
     flags: u8,
     space: Space,
@@ -590,6 +595,7 @@ pub fn read_checkpoint(bytes: &[u8]) -> Result<(Heap, Roles, Option<MachineState
     let mut edges: Vec<Vec<Value>> = Vec::new();
     let mut role_pairs: Option<Vec<(u64, Value)>> = None;
     let mut machine: Option<MachineState> = None;
+    let v8 = header.format_version < 9;
     for _ in 0..header.section_count {
         if role_pairs.is_some() {
             return Err(LoadError::RolesNotLast);
@@ -621,27 +627,47 @@ pub fn read_checkpoint(bytes: &[u8]) -> Result<(Heap, Roles, Option<MachineState
             SECTION_ACTOR => {
                 Space::Actor(u32::try_from(owner).map_err(|_| LoadError::UnknownSection(kind))?)
             }
+            other if other >= SECTION_OPTIONAL && !v8 => {
+                // Not for this VM: skipped.
+                let n = usize::try_from(count).map_err(|_| LoadError::CountMismatch)?;
+                r.bytes(n)?;
+                continue;
+            }
             other => return Err(LoadError::UnknownSection(other)),
         };
         let first = nodes.len();
         let mut previous: Option<u64> = None;
         for _ in 0..count {
             let node = nodes.len() as u64 + 1;
-            let delta = r.uv()?;
-            let seq = match previous {
-                None => delta,
-                Some(p) => {
-                    if delta == 0 {
-                        return Err(LoadError::BadSequence { node });
+            let field = r.uv()?;
+            let (hash, seq) = if v8 {
+                // A sequence delta; the sequence number is the hash number.
+                let seq = match previous {
+                    None => field,
+                    Some(p) => {
+                        if field == 0 {
+                            return Err(LoadError::BadSequence { node });
+                        }
+                        p.checked_add(field)
+                            .ok_or(LoadError::BadSequence { node })?
                     }
-                    p.checked_add(delta)
-                        .ok_or(LoadError::BadSequence { node })?
-                }
+                };
+                previous = Some(seq);
+                (HashWord::Sequence(seq), seq)
+            } else if field == 0 {
+                (HashWord::None, 0)
+            } else if field % 2 == 0 {
+                (HashWord::Sequence(field / 2 - 1), 0)
+            } else {
+                let actor = u32::try_from(r.uv()?).map_err(|_| LoadError::BadSequence { node })?;
+                let count = field / 2;
+                (HashWord::Fresh { actor, count }, 0)
             };
-            previous = Some(seq);
+            let hash = hash.word().ok_or(LoadError::BadSequence { node })?;
             let (flags, body) = read_node(&mut r, node, placeholder)?;
             nodes.push(Pending {
                 node,
+                hash,
                 seq,
                 flags,
                 space,
@@ -660,10 +686,13 @@ pub fn read_checkpoint(bytes: &[u8]) -> Result<(Heap, Roles, Option<MachineState
         return Err(LoadError::TrailingBytes);
     }
 
-    // Allocation order: sort by sequence number, then map node numbers to
-    // the arena offsets the objects will have, in that order.
+    // The arena holds the objects in file order (version 8: in sequence
+    // order, as its sections interleave); map node numbers to the arena
+    // offsets the objects will have, in that order.
     let mut order: Vec<usize> = (0..nodes.len()).collect();
-    order.sort_by_key(|&i| nodes[i].seq);
+    if v8 {
+        order.sort_by_key(|&i| nodes[i].seq);
+    }
     let mut index_of_node = alloc::vec![0u64; nodes.len()];
     let mut offset = 0u64;
     for &i in &order {
@@ -689,11 +718,12 @@ pub fn read_checkpoint(bytes: &[u8]) -> Result<(Heap, Roles, Option<MachineState
         let e = &edges[i];
         let class = resolve(p.node, e[0])?;
         let body = fill_body(p.body, &e[1..], &|v| resolve(p.node, v))?;
-        heap.insert_loaded(p.seq, class, p.flags, p.space, body)
-            .map_err(|_: HeapError| LoadError::BadSequence { node: p.node })?;
+        heap.insert_loaded(p.hash, class, p.flags, p.space, body);
     }
-    heap.set_allocation_counter(header.allocation_counter)
-        .map_err(|_| LoadError::BadSequence { node: 0 })?;
+    heap.set_allocation_counter(header.allocation_counter);
+    heap.set_hash_counters(header.hash_counters);
+    // An image written before weak objects were numbered when made.
+    heap.number_weak_objects();
 
     let mut pairs = Vec::new();
     for (id, v) in role_pairs {
