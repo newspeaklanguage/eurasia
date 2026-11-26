@@ -54,7 +54,7 @@ goes away then.
 | `scripts/check.sh` | The VM's checks: formatting, clippy, the tests, the wasm32 build. |
 | `scripts/build.sh [NAME ...]` | The applications of `newspeak/EurasiaBuildList.ns` (or the named ones), each as `target/build/NAME/base.eus`, with its entry, module list (`NAME.modules.txt`) and image resources (`NAME.images.txt`). |
 | `scripts/ide.sh` | The IDE and the viewer, staged for a browser in `target/web` (and in `newspeak/out/`, unless `EURASIA_NO_OUT=1`). |
-| `scripts/site-runtime.sh OUTDIR` | The site runtime: what a site of Newspeak documents serves besides its documents. |
+| `scripts/site-runtime.sh [--with-ide] OUTDIR` | The site runtime: what a site of Newspeak documents serves besides its documents; with `--with-ide`, the IDE as well (`ide/base.eus`, `eurasia-ide.html`, `app.html`). |
 
 The build is deterministic: the same checkouts give the same images, but for
 the build stamp (BuildInfo). `eurasia --methods IMAGE` and
